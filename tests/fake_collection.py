@@ -103,6 +103,10 @@ class FakeModels:
         for card in self.col.cards:
             if card["nid"] in set(request.note_ids):
                 card["mid"] = request.new_notetype_id
+        # Real Anki: bulk-changing which notetype notes use is itself notetype/schema-
+        # level, same as add_dict/update_dict -- it invalidates outstanding undo markers
+        # too. See docs/api-notes.md and TestUndoEntryNeverSpansASchemaChange.
+        self.col._bump_schema_generation()
 
 
 class FakeDecks:
