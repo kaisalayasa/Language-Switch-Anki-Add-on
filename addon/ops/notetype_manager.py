@@ -17,10 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ..core.conversion import ConversionMode, ConversionPlan
 
-__all__ = [
-    "ConversionResult", "ApiMismatch", "apply_plan", "probe_api",
-    "build_preview_note", "ensure_preview_scaffold", "write_preview_note",
-]
+__all__ = ["ConversionResult", "ApiMismatch", "apply_plan", "probe_api"]
 
 
 class ApiMismatch(RuntimeError):
@@ -152,11 +149,7 @@ def _unique_notetype_name(col: Any, desired: str) -> str:
 
 def _shape_notetype(source: Dict[str, Any], *, name: str, front: str, back: str,
                     css: str, template_name: str) -> Dict[str, Any]:
-    """Build the notetype dict a clone or preview should be saved as.
-
-    Shared by :func:`build_clone` (a fresh clone) and :func:`build_preview_note` (a
-    reused, in-place-updated scratch notetype) so both write templates the same way.
-    """
+    """Build the notetype dict a clone should be saved as."""
     shaped = copy.deepcopy(source)
     shaped["id"] = 0
     shaped["name"] = name
@@ -204,97 +197,6 @@ def build_clone(col: Any, plan: ConversionPlan, front: str, back: str, css: str,
     if saved is None:
         raise ApiMismatch("clone %r was not saved" % clone["name"])
     return saved
-
-
-def ensure_preview_scaffold(
-    col: Any, plan: ConversionPlan, *, front: str, back: str, css: str, template_name: str,
-) -> "tuple[Dict[str, Any], int]":
-    """Create or update the dedicated scratch notetype/deck used for previews.
-
-    Uses a deterministically-named scratch notetype/deck (suffixed ``" (Preview)"``) so it
-    can never collide with what the real conversion creates.
-
-    **Both of these are schema-level changes** (a new/changed notetype, a new deck), and
-    Anki clears/invalidates its outstanding custom undo markers when a notetype's schema
-    changes. Concretely: if code sets a marker with ``col.add_custom_undo_entry(...)``,
-    then calls ``col.models.add_dict``/``update_dict``, the earlier marker no longer
-    exists by the time ``col.merge_undo_entries(...)`` looks for it -- which fails with
-    Anki's own ``"target undo op not found"``. That is exactly the bug this function's
-    separation from :func:`write_preview_note` exists to prevent: **never wrap this call
-    in the same undo-entry span as anything else.** Only the pure data write in
-    ``write_preview_note`` is safe to group that way.
-    """
-    source = col.models.by_name(plan.source_notetype)
-    if source is None:
-        raise ApiMismatch("notetype %r not found" % plan.source_notetype)
-
-    preview_name = "%s (Preview)" % plan.clone_notetype
-    notetype = col.models.by_name(preview_name)
-    shaped = _shape_notetype(source, name=preview_name, front=front, back=back, css=css,
-                             template_name=template_name)
-    if notetype is None:
-        added = _call_checked(col.models.add_dict, "col.models.add_dict", notetype=shaped)
-        _extract_id(added, "col.models.add_dict")
-        notetype = col.models.by_name(preview_name)
-        if notetype is None:
-            raise ApiMismatch("preview notetype %r was not saved" % preview_name)
-    else:
-        notetype["tmpls"] = shaped["tmpls"]
-        notetype["css"] = shaped["css"]
-        _call_checked(col.models.update_dict, "col.models.update_dict", notetype=notetype)
-
-    deck_id = _resolve_deck(col, preview_name)
-    return notetype, deck_id
-
-
-def write_preview_note(col: Any, notetype: Dict[str, Any], deck_id: int, *, sample_note_id: int) -> Any:
-    """Create or update the single scratch note that previews ``notetype``.
-
-    A pure data write -- no schema change -- so, unlike :func:`ensure_preview_scaffold`,
-    this *is* safe to wrap in a single ``add_custom_undo_entry``/``merge_undo_entries``
-    span.
-
-    Repeated calls **find and update** that scratch note in place rather than creating a
-    new one each time, so previewing repeatedly does not accumulate debris -- and,
-    notably, this function never deletes anything, so a preview note the user has started
-    tinkering with inside Anki's own Card Types editor is never silently destroyed.
-
-    Returns the live ``Note``; the caller is responsible for rendering it (see
-    ``addon/ui/preview.py``).
-    """
-    preview_name = notetype["name"]
-    source_note = col.get_note(sample_note_id)
-    field_names = [f["name"] for f in notetype["flds"]]
-
-    existing_ids = col.find_notes('note:"%s"' % preview_name.replace('"', '\\"'))
-    if existing_ids:
-        preview_note = col.get_note(existing_ids[0])
-        _copy_fields_by_name(source_note, preview_note, field_names)
-        col.update_note(preview_note)
-    else:
-        preview_note = col.new_note(notetype)
-        _copy_fields_by_name(source_note, preview_note, field_names)
-        col.add_note(preview_note, deck_id)
-
-    return preview_note
-
-
-def build_preview_note(
-    col: Any, plan: ConversionPlan, *, front: str, back: str, css: str,
-    template_name: str, sample_note_id: int,
-) -> Any:
-    """Convenience wrapper: prepare the scratch notetype/deck, then write the note.
-
-    For callers (including the tests) that don't need control over where the undo
-    boundary sits. ``ConvertDialog._preview`` calls :func:`ensure_preview_scaffold` and
-    :func:`write_preview_note` separately instead, precisely so it can place a custom
-    undo entry *after* the schema change rather than around it -- see
-    :func:`ensure_preview_scaffold`'s docstring for why that ordering matters.
-    """
-    notetype, deck_id = ensure_preview_scaffold(
-        col, plan, front=front, back=back, css=css, template_name=template_name
-    )
-    return write_preview_note(col, notetype, deck_id, sample_note_id=sample_note_id)
 
 
 # ---------------------------------------------------------------------------

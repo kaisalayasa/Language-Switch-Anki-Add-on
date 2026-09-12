@@ -5,8 +5,13 @@ becomes *Language B front / Language A back* — and (from M2) generates natural
 the newly-fronted language using [Piper](https://github.com/rhasspy/piper), locally and
 offline.
 
-**Status: M1** — hardcoded proof of concept. Template generation, the clone-notetype flow
-and both conversion modes work. No audio yet.
+**Status: M1 and M2 done, M3 in progress.** Template generation, the clone-notetype flow and
+both conversion modes work end-to-end in real Anki. M2 added a local, offline Piper TTS
+pipeline (binary manager, voice manager, subprocess synthesis, text sanitizer) with a
+standalone "Test Piper voice…" dev dialog — it does not yet write audio into real notes; that
+lands in M5 once batch-apply exists. M3 replaces M1's hardcoded Core-2000-only mapping with a
+real "Map fields…" dialog (one dropdown per field, live card preview) — known decks are still
+pre-filled from a shipped profile, but any notetype can now be mapped by hand.
 
 ## The two modes
 
@@ -23,8 +28,9 @@ The original **notetype object** is never modified in either mode.
 
 ## Design rules
 
-- **`addon/core/` is pure.** No `anki`, no `aqt`, no language name, no script name, no
-  deck-specific field name. Enforced by `tests/test_purity.py`, not by convention.
+- **`addon/core/` and `addon/tts/` are pure.** No `anki`, no `aqt`, no language name, no
+  script name, no deck-specific field name in `core/`. Enforced by `tests/test_purity.py`,
+  not by convention.
 - **Field names are untrusted.** Most decks are `Front`/`Back` or `Field 1`. Even
   descriptive names lie: the real Core 2000 notetype has a field called `Notes` holding
   `"Core 2000 Step 01 - 001"` and one called `Core-Index` holding an integer. Roles are the
@@ -39,6 +45,7 @@ The original **notetype object** is never modified in either mode.
 ```
 addon/
   core/        pure logic — role_schema, template_generator, conversion, profiles
+  tts/         pure logic — Piper binary/voice managers, subprocess provider, sanitizer
   ops/         everything that imports anki/aqt
   ui/          Qt dialogs
   profiles/    field mappings, one JSON per known deck
@@ -50,12 +57,14 @@ docs/          deck-facts.md (verified ground truth), api-notes.md
 ## Development
 
 ```bash
-python -m unittest discover -s tests -t .   # 83 tests, no Anki needed
+python -m unittest discover -s tests -t .   # 131 tests, no Anki needed, no network needed
 python tools/preview_templates.py core2000  # see the generated templates
 python tools/install_dev.py --link          # install into Anki (close Anki first)
 ```
 
-Then in Anki: **Tools → Convert deck language direction…**
+Then in Anki: **Tools → Convert deck language direction…** or **Tools → Test Piper voice… (M2)**.
+The first "Speak" click downloads the Piper binary (~20MB) and voice model (~60MB) into
+`addon/user_files/` (gitignored, never wiped by an addon update); later clicks are cached.
 
 Develop against a scratch profile, not your real collection. Every operation is scoped to a
 single (deck, notetype) pair, but in-development code writes to the same `collection.anki2`

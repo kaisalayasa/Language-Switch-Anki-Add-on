@@ -1,8 +1,11 @@
-"""Enforce the two structural promises made in claude.md.
+"""Enforce the structural promises made in claude.md.
 
 1. ``addon/core/`` never imports anki or aqt, so it stays unit-testable with stock Python.
 2. ``role_schema`` and ``template_generator`` contain no language name, no script name and
    no deck-specific field name -- all of that belongs in profile JSON.
+3. ``addon/tts/`` never imports anki or aqt either (M2) -- same reasoning as ``core/``: the
+   binary/voice managers and the sanitizer should be testable without a running Anki process,
+   and the only Anki-facing bridge is ``addon/ui/piper_test_dialog.py``.
 
 These are asserted rather than left to discipline, because they are exactly the properties
 that quietly rot once a second deck shows up.
@@ -14,17 +17,21 @@ import os
 import re
 import unittest
 
-CORE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "addon", "core"
-)
+_ADDON_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "addon")
+CORE_DIR = os.path.join(_ADDON_DIR, "core")
+TTS_DIR = os.path.join(_ADDON_DIR, "tts")
+
+
+def _sources(directory):
+    for name in sorted(os.listdir(directory)):
+        if name.endswith(".py"):
+            path = os.path.join(directory, name)
+            with open(path, "r", encoding="utf-8") as fh:
+                yield name, fh.read()
 
 
 def _core_sources():
-    for name in sorted(os.listdir(CORE_DIR)):
-        if name.endswith(".py"):
-            path = os.path.join(CORE_DIR, name)
-            with open(path, "r", encoding="utf-8") as fh:
-                yield name, fh.read()
+    return _sources(CORE_DIR)
 
 
 class TestNoAnkiImports(unittest.TestCase):
@@ -35,6 +42,16 @@ class TestNoAnkiImports(unittest.TestCase):
                 self.assertIsNone(
                     pattern.search(source),
                     "addon/core/%s imports anki/aqt; core must stay Anki-free" % name,
+                )
+
+    def test_tts_never_imports_anki_or_aqt(self):
+        pattern = re.compile(r"^\s*(?:from|import)\s+(anki|aqt)\b", re.MULTILINE)
+        for name, source in _sources(TTS_DIR):
+            with self.subTest(module=name):
+                self.assertIsNone(
+                    pattern.search(source),
+                    "addon/tts/%s imports anki/aqt; tts/ must stay Anki-free like core/, "
+                    "with only addon/ui/piper_test_dialog.py bridging to Anki" % name,
                 )
 
 
