@@ -12,7 +12,15 @@ from addon.core.profiles import (
     load_profiles,
     match_profile,
 )
-from addon.core.role_schema import FieldBinding, Role, RoleMapping, Side
+from addon.core.role_schema import (
+    FieldAssignment,
+    FieldBinding,
+    Role,
+    RoleMapping,
+    Side,
+    assignments_from_mapping,
+    mapping_from_assignments,
+)
 
 CORE2000_JSON = os.path.join(BUILTIN_PROFILE_DIR, "core2000.json")
 
@@ -129,6 +137,65 @@ class TestUnmapped(unittest.TestCase):
         self.assertNotIn("Vocabulary-English", names)   # assigned
         self.assertNotIn("Frequency", names)            # hidden
         self.assertIn("Frequency", [b.name for b in mapping.unmapped(include_hidden=True)])
+
+
+class TestAssignmentRoundTrip(unittest.TestCase):
+    """The pure helpers M3's RoleMapperDialog is built on: flat UI rows <-> RoleMapping."""
+
+    def test_round_trips_the_core2000_profile_through_the_table_shape(self):
+        original = load_profile_file(CORE2000_JSON).to_mapping(live_fields=LIVE)
+        rebuilt = mapping_from_assignments(
+            original.notetype_name,
+            assignments_from_mapping(original),
+            target_language=original.target_language,
+            native_language=original.native_language,
+        )
+        self.assertEqual(rebuilt.to_profile(), original.to_profile())
+        self.assertTrue(rebuilt.validate_against(LIVE).ok)
+
+    def test_blank_assignments_produce_an_all_unassigned_mapping(self):
+        assignments = [FieldAssignment(name=n, ord=o) for o, n in LIVE]
+        mapping = mapping_from_assignments("T", assignments)
+        self.assertEqual(mapping.assignments, {})
+        self.assertEqual(len(mapping.unmapped(include_hidden=True)), len(LIVE))
+
+    def test_assigning_a_role_makes_the_field_show_up_under_that_role(self):
+        assignments = [
+            FieldAssignment(name="Front", ord=0, role=Role.TARGET_TERM),
+            FieldAssignment(name="Back", ord=1, role=Role.NATIVE_TERM),
+        ]
+        mapping = mapping_from_assignments("Basic", assignments)
+        self.assertEqual(mapping.first(Role.TARGET_TERM).name, "Front")
+        self.assertEqual(mapping.first(Role.NATIVE_TERM).name, "Back")
+        self.assertTrue(mapping.validate().ok)
+
+    def test_hidden_and_passthrough_fields_survive_the_round_trip(self):
+        assignments = [
+            FieldAssignment(name="Front", ord=0, role=Role.TARGET_TERM),
+            FieldAssignment(name="Junk", ord=1, hidden=True),
+            FieldAssignment(name="Reading", ord=2, role=Role.NATIVE_TERM,
+                             filter="furigana", css_class="japanese"),
+        ]
+        mapping = mapping_from_assignments("T", assignments)
+        junk = next(f for f in mapping.fields if f.name == "Junk")
+        self.assertTrue(junk.hidden)
+        self.assertNotIn("Junk", [b.name for b in mapping.unmapped()])
+        reading = mapping.first(Role.NATIVE_TERM)
+        self.assertEqual(reading.filter, "furigana")
+        self.assertEqual(reading.css_class, "japanese")
+
+    def test_multi_role_field_keeps_first_role_only_when_flattened(self):
+        """Documented v1 limitation: the table shows one role per field, so flattening a
+        (data-model-legal but currently unused) multi-role field picks one deterministically
+        rather than silently dropping the field or crashing.
+        """
+        mapping = RoleMapping(notetype_name="T", fields=[FieldBinding("A", 0)])
+        binding = FieldBinding("A", 0)
+        mapping.bind(Role.TARGET_TERM, binding)
+        mapping.bind(Role.TARGET_SENTENCE, binding)
+        rows = assignments_from_mapping(mapping)
+        self.assertEqual(len(rows), 1)
+        self.assertIn(rows[0].role, (Role.TARGET_TERM, Role.TARGET_SENTENCE))
 
 
 class TestProfileMatching(unittest.TestCase):

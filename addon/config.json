@@ -8,5 +8,6 @@
   "strip_tags": ["leech"],
   "template_name": "Production",
   "confirm_before_apply": true,
-  "prompt_for_backup": true
+  "prompt_for_backup": true,
+  "tts_voice": "en_US-lessac-medium"
 }

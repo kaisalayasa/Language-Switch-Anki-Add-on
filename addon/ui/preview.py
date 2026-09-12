@@ -1,33 +1,45 @@
-"""Open a real, rendered card preview using Anki's own Card Types editor.
+"""Open a real, rendered card preview using Anki's own Card Types editor -- with zero
+writes to the collection.
 
 ``claude.md`` says to reuse ``aqt.clayout.CardLayout`` for preview rather than building a
-raw renderer -- and that it's real M3 scope, pulled forward here at the user's explicit
-request after M1's plain-text template dump turned out not to answer "what will this
-actually look like".
+raw renderer. An earlier version of this module did that by writing a scratch
+notetype/deck/note via a ``CollectionOp`` and opening ``CardLayout`` on it -- which turned
+out to be the actual bug: ``CollectionOp``'s completion handling fires Anki's
+``state_did_reset`` hook whenever a notetype changes, and opening a modal, WebEngine-backed
+``CardLayout`` right in the middle of that reset cascade produced a real, repeatable hang
+(confirmed by testing -- see ``docs/api-notes.md``) severe enough that it left the whole Anki
+session unresponsive, including features unrelated to this addon.
 
-``CardLayout``'s exact constructor is **not** independently verified the way the rest of
-this addon's Anki calls are (see ``docs/api-notes.md``): its compiled module targets
-Python 3.13 and cannot be introspected from outside a running Anki process. So this module
-does what ``claude.md`` asks for exactly this situation -- it says so explicitly and
-degrades to a clear, actionable message rather than guessing silently. See
-:func:`open_card_layout`.
+The actual fix is architectural, not timing-related: **don't write anything at all.**
+Reading ``CardLayout``'s real source (pulled from the matching ``aqt`` wheel on PyPI, since
+the installed build's compiled module can't be introspected -- see ``docs/api-notes.md`)
+shows it already supports fully in-memory template editing. When a human types into its
+Front/Back/Style boxes, it writes straight into its own private in-memory copy of the
+notetype and re-renders an *ephemeral*, unsaved card -- nothing reaches the collection
+unless the user explicitly clicks its own Save button. So this module opens ``CardLayout``
+on a real, existing note (using its real, current notetype -- exactly like every real call
+site in Anki's own codebase), then drives the same Front/Back/Style boxes a human would, to
+swap in the generated templates. No clone, no scratch notetype, no ``CollectionOp``, nothing
+to undo.
 """
 
 from __future__ import annotations
 
 import inspect
+import sys
 from typing import Any, List, Optional
 
-__all__ = ["open_card_layout", "CardLayoutUnavailable"]
+__all__ = ["open_card_layout", "CardLayoutUnavailable", "open_live_preview"]
 
 
 class CardLayoutUnavailable(RuntimeError):
     """``aqt.clayout.CardLayout`` could not be constructed with any attempted call shape."""
 
 
-# Progressively simpler attempts, most-featured first. Every Anki version examined for
-# this addon (see docs/api-notes.md) has carried this class under this name; what varies
-# release to release is which of these keyword arguments it accepts.
+# The first attempt is CardLayout's real, confirmed signature for this Anki version --
+# def __init__(self, mw, note, ord=0, parent=None, fill_empty=False) -- pulled from the
+# actual aqt==26.8.1 source (see docs/api-notes.md). The remaining entries stay as a
+# fallback for other Anki versions this addon might run against, most-featured first.
 _ATTEMPTS = [
     {"ord": 0, "fill_empty": False},
     {"ord": 0},
@@ -72,3 +84,45 @@ def open_card_layout(mw: Any, note: Any, *, parent: Any = None) -> Any:
         "updated with the exact call shape for your Anki build."
         % (signature, "\n  ".join(errors))
     )
+
+
+def _inject_generated_templates(dialog: Any, *, front: str, back: str, css: str) -> None:
+    """Swap the generated Front/Back/CSS into an already-open ``CardLayout``.
+
+    Drives the same widgets a human editing the card type by hand would use --
+    ``dialog.tform``'s front/back/style buttons and its shared ``edit_area`` text box --
+    rather than reaching into ``CardLayout``'s private model/redraw internals ourselves.
+    Real Anki's own ``fill_fields_from_template``/``write_edits_to_template_and_redraw``
+    (confirmed from source, see docs/api-notes.md) do the actual work in response; this
+    function only simulates the clicks and text changes, so every bit of ``CardLayout``'s
+    own change-tracking and debounced re-render keeps working exactly as designed.
+
+    Right after construction the Front tab is already showing (``current_editor_index``
+    starts at ``0``), so the first edit needs no tab switch.
+    """
+    tform = dialog.tform
+    tform.edit_area.setPlainText(front)
+    tform.back_button.click()
+    tform.edit_area.setPlainText(back)
+    tform.style_button.click()
+    tform.edit_area.setPlainText(css)
+    tform.front_button.click()  # leave the dialog showing the Front tab
+
+
+def open_live_preview(parent: Any, note: Any, *, front: str, back: str, css: str) -> None:
+    """Open Anki's real Card Types editor on ``note``, showing the generated templates.
+
+    ``note`` should be a real, existing note (its own real notetype is what gets opened --
+    this never creates or touches anything). Always opens on template ordinal 0 -- the
+    same one a conversion actually uses (``_shape_notetype`` keeps only the first template
+    of whatever notetype it clones). Raises :class:`CardLayoutUnavailable` if ``CardLayout``
+    itself could not be constructed; the caller decides how to surface that.
+    """
+    from aqt import mw
+
+    dialog = open_card_layout(mw, note, parent=parent)
+    _inject_generated_templates(dialog, front=front, back=back, css=css)
+    if sys.platform.startswith("win"):
+        # Matches a real, documented quirk in Anki's own editor.py (onCardLayout): on
+        # Windows, CardLayout's parent needs to be explicitly re-activated after it opens.
+        parent.activateWindow()

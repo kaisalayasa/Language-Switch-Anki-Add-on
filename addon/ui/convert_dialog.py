@@ -1,8 +1,10 @@
-"""M1 conversion dialog: pick a deck, pick a mode, read the preflight, confirm.
+"""Conversion dialog: pick a deck, pick a mode, map fields, read the preflight, confirm.
 
-Deliberately plain. The real mapping UI arrives in M3; until then the mapping comes from a
-matched profile and this dialog's job is to make absolutely clear what is about to happen
-before anything is written.
+Field mapping (M3) comes from ``_resolve_mapping``: the user's own edit via "Map fields…"
+(``RoleMapperDialog``) if one exists for the currently selected notetype, else a shipped
+profile's exact match, else nothing -- in which case the dialog points at "Map fields…"
+instead of hard-stopping the way M1 did. This dialog's job stays what it was in M1: make
+absolutely clear what is about to happen before anything is written.
 """
 
 from __future__ import annotations
@@ -23,18 +25,33 @@ from aqt.qt import (
     QPushButton,
     QVBoxLayout,
 )
-from aqt.operations import CollectionOp
 from aqt.utils import showWarning, tooltip
 
-from ..core.conversion import ConversionMode, build_plan
+from ..core.conversion import ConversionMode, build_plan, scope_query
 from ..core.profiles import match_profile
-from ..core.role_schema import fields_from_notetype
+from ..core.role_schema import FieldBinding, RoleMapping, fields_from_notetype
 from ..core.template_generator import TemplateOptions, generate_templates
 from ..ops.convert_op import convert_op
-from ..ops.notetype_manager import ensure_preview_scaffold, write_preview_note
-from .preview import CardLayoutUnavailable, open_card_layout
+from ..tts.sanitize import sanitize_text
+from .role_mapper import RoleMapperDialog
 
 __all__ = ["ConvertDialog", "show_convert_dialog"]
+
+
+def addon_config() -> dict:
+    """This addon's user config, as a plain dict. Shared with ``card_preview.py`` so both
+    read the same defaults rather than duplicating the lookup."""
+    return mw.addonManager.getConfig(__name__.split(".")[0]) or {}
+
+
+def template_options_from_config(config: dict) -> TemplateOptions:
+    """Shared with ``card_preview.py`` -- see :func:`addon_config`."""
+    return TemplateOptions(
+        include_unmapped=config.get("include_unmapped", True),
+        include_audio=config.get("include_audio", False),
+        audio_on_front=config.get("audio_on_front", True),
+        template_name=config.get("template_name", "Production"),
+    )
 
 
 def _decks_with_notetypes(col) -> List[Tuple[str, str, int]]:
@@ -61,6 +78,10 @@ class ConvertDialog(QDialog):
         self.setWindowTitle("Convert deck language direction")
         self.resize(640, 560)
         self._pairs = _decks_with_notetypes(mw.col)
+        #: (notetype_name, mapping) from the last "Map fields…" session. Only honoured by
+        #: ``_resolve_mapping`` while the notetype name still matches the current selection
+        #: -- switching the deck/notetype pair naturally drops a stale override.
+        self._override: Optional[Tuple[str, RoleMapping]] = None
 
         layout = QVBoxLayout(self)
 
@@ -84,16 +105,13 @@ class ConvertDialog(QDialog):
         self.dry_run = QCheckBox("Dry run (show what would happen, write nothing)")
         row.addWidget(self.dry_run)
         row.addStretch(1)
-        self.preview_button = QPushButton("Preview card…")
-        self.preview_button.setToolTip(
-            "Opens Anki's own Card Types editor on one real note, rendered with the "
-            "generated template -- an actual preview, not just the template markup.\n\n"
-            "Creates a small scratch notetype/deck named \"<name> (Preview)\" to do this. "
-            "It never touches your original notes, and repeated previews reuse the same "
-            "scratch note instead of piling up."
+        self.map_fields_button = QPushButton("Map fields…")
+        self.map_fields_button.setToolTip(
+            "Review or build the field-to-role mapping for this notetype. Known decks are "
+            "pre-filled from a shipped profile; anything else starts blank."
         )
-        self.preview_button.clicked.connect(self._preview)
-        row.addWidget(self.preview_button)
+        self.map_fields_button.clicked.connect(self._open_mapper)
+        row.addWidget(self.map_fields_button)
         layout.addLayout(row)
 
         preflight_group = QGroupBox("3. Preflight — nothing is written until you press OK")
@@ -124,6 +142,31 @@ class ConvertDialog(QDialog):
         deck, notetype, _ = self._pairs[self.pair_box.currentIndex()]
         return deck, notetype
 
+    def _resolve_mapping(self, notetype_name: str, live_fields) -> Optional[RoleMapping]:
+        """A mapping for ``notetype_name``, or ``None`` if nothing is known yet.
+
+        Priority: (1) the user's own edit from "Map fields…", kept only while it was built
+        for this same notetype -- switching the deck/notetype pair drops a stale override
+        automatically; (2) a shipped profile, but only if it's an exact, validating match
+        (``match.usable``) -- a same-name-but-different-fields profile is never force-fitted.
+        """
+        if self._override is not None and self._override[0] == notetype_name:
+            return self._override[1]
+        match = match_profile(notetype_name, live_fields)
+        if match.usable:
+            return match.profile.to_mapping(live_fields=live_fields)
+        return None
+
+    def _profile_seed(self, notetype_name: str, live_fields) -> Optional[RoleMapping]:
+        """A shipped profile's mapping for ``notetype_name``, ignoring ``self._override`` --
+        used only to feed the mapper dialog's "Reset to shipped profile" button, which must
+        stay offered even after the user has edited the mapping once.
+        """
+        match = match_profile(notetype_name, live_fields)
+        if match.profile is not None and match.usable:
+            return match.profile.to_mapping(live_fields=live_fields)
+        return None
+
     def _build(self):
         """Returns (plan, templates, note_count) or (None, None, reason)."""
         current = self._current()
@@ -134,34 +177,20 @@ class ConvertDialog(QDialog):
         notetype = mw.col.models.by_name(notetype_name)
         live_fields = fields_from_notetype(notetype["flds"])
 
-        match = match_profile(notetype_name, live_fields)
-        if not match.usable:
-            # This is the branch the M3 mapping UI will plug into.
-            if match.profile is None:
-                return None, None, (
-                    "No field mapping is known for the notetype %r yet.\n\n"
-                    "M1 ships one mapping (Core 2000). The role-mapping UI that lets you "
-                    "define your own arrives in M3." % notetype_name
-                )
-            errors = match.validation.errors if match.validation else ["field list differs"]
+        mapping = self._resolve_mapping(notetype_name, live_fields)
+        if mapping is None:
             return None, None, (
-                "A profile named %r exists but does not fit this notetype, so it was "
-                "refused rather than force-fitted:\n\n  - %s"
-                % (match.profile.id, "\n  - ".join(errors))
+                "No field mapping yet for %r.\n\n"
+                "Click \"Map fields…\" below to build one -- known decks are pre-filled "
+                "from a shipped profile; anything else starts blank." % notetype_name
             )
 
-        mapping = match.profile.to_mapping(live_fields=live_fields)
-        config = mw.addonManager.getConfig(__name__.split(".")[0]) or {}
+        config = addon_config()
 
         templates = generate_templates(
             mapping,
             source_css=notetype.get("css", ""),
-            options=TemplateOptions(
-                include_unmapped=config.get("include_unmapped", True),
-                include_audio=config.get("include_audio", False),
-                audio_on_front=config.get("audio_on_front", True),
-                template_name=config.get("template_name", "Production"),
-            ),
+            options=template_options_from_config(config),
         )
 
         plan = build_plan(
@@ -192,12 +221,13 @@ class ConvertDialog(QDialog):
         return text
 
     def _refresh(self):
+        self.map_fields_button.setEnabled(self._current() is not None)
+
         plan, templates, info = self._build()
         ok_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
         if plan is None:
             self.preflight.setPlainText(str(info))
             ok_button.setEnabled(False)
-            self.preview_button.setEnabled(False)
             return
 
         validation = plan.validate()
@@ -206,9 +236,6 @@ class ConvertDialog(QDialog):
             text += "\n\nCannot proceed:\n" + "\n".join("  - %s" % e for e in validation.errors)
         self.preflight.setPlainText(text)
         ok_button.setEnabled(validation.ok)
-        # Previewing only needs *a* note to render, not a fully valid plan -- e.g. it
-        # still works while "new-deck mode must write to a different deck" is unresolved.
-        self.preview_button.setEnabled(bool(plan.note_ids))
 
     # -- apply --------------------------------------------------------------
 
@@ -235,65 +262,65 @@ class ConvertDialog(QDialog):
             mw, plan, templates, expected_note_count=count, on_success=done
         ).run_in_background()
 
-    def _preview(self):
-        """Build the scratch preview note through a proper ``CollectionOp``.
+    # -- field mapping --------------------------------------------------
 
-        Building it, and opening ``CardLayout``, are two different responsibilities that
-        need to run in two different places: the collection write goes through Anki's
-        sanctioned operations path (background thread, then its own undo/UI-refresh
-        bookkeeping), while opening the dialog is a Qt widget construction that must stay
-        on the main thread -- exactly where ``CollectionOp``'s ``.success()`` runs.
-
-        Within the write itself, the undo entry is deliberately created **after**
-        ``ensure_preview_scaffold`` (which may add/update the scratch notetype) rather
-        than wrapped around it: a notetype schema change invalidates Anki's outstanding
-        undo markers, so spanning one produces Anki's own
-        ``"target undo op not found"`` error. See ``ensure_preview_scaffold``'s docstring.
-        """
-        plan, templates, count = self._build()
-        if plan is None:
-            showWarning(str(count), parent=self)
+    def _open_mapper(self):
+        current = self._current()
+        if current is None:
             return
-        if not plan.note_ids:
-            showWarning("No notes are in scope to preview.", parent=self)
-            return
+        deck, notetype_name = current
+        notetype = mw.col.models.by_name(notetype_name)
+        live_fields = fields_from_notetype(notetype["flds"])
 
-        sample_note_id = plan.note_ids[0]
-        holder: dict = {}
-
-        def op(col):
-            notetype, deck_id = ensure_preview_scaffold(
-                col,
-                plan,
-                front=templates.front_html,
-                back=templates.back_html,
-                css=templates.css,
-                template_name=templates.template_name,
+        profile_seed = self._profile_seed(notetype_name, live_fields)
+        seed = self._resolve_mapping(notetype_name, live_fields)
+        if seed is None:
+            seed = RoleMapping(
+                notetype_name=notetype_name,
+                fields=[FieldBinding(name=n, ord=o) for o, n in live_fields],
             )
-            undo_entry = col.add_custom_undo_entry("Build preview card")
-            holder["note"] = write_preview_note(
-                col, notetype, deck_id, sample_note_id=sample_note_id
-            )
-            return col.merge_undo_entries(undo_entry)
 
-        def on_success(_changes):
-            note = holder.get("note")
-            if note is None:
-                return
-            try:
-                dialog = open_card_layout(mw, note, parent=self)
-            except CardLayoutUnavailable as exc:
-                showWarning(str(exc), parent=self)
-                return
-            dialog.exec()
+        note_ids = mw.col.find_notes(scope_query(notetype_name, deck))
+        samples = _collect_samples(note_ids[:3])
 
-        CollectionOp(parent=self, op=op).success(on_success).run_in_background()
+        dialog = RoleMapperDialog(
+            self,
+            notetype_name=notetype_name,
+            live_fields=live_fields,
+            samples=samples,
+            initial_mapping=seed,
+            profile_mapping=profile_seed,
+        )
+        if dialog.exec():
+            self._override = (notetype_name, dialog.result_mapping())
+            self._refresh()
 
 
 def _dry_run(plan, templates):
     from ..ops.convert_op import run_conversion
 
     return run_conversion(mw.col, plan, templates)
+
+
+def _collect_samples(note_ids, *, limit_per_field: int = 3, max_len: int = 60):
+    """A few real, HTML-stripped sample values per field, for the mapper's Sample column.
+
+    Field names lie (see claude.md / docs/deck-facts.md), so showing what a field actually
+    *contains* is the only way a human can map it sensibly. Reuses M2's sanitizer in
+    strip-markup-only mode (``allowed_ranges=()``) rather than writing a second HTML
+    stripper for display purposes.
+    """
+    samples: dict = {}
+    for nid in note_ids:
+        note = mw.col.get_note(nid)
+        for name in note.keys():
+            bucket = samples.setdefault(name, [])
+            if len(bucket) >= limit_per_field:
+                continue
+            value = sanitize_text(note[name], allowed_ranges=())[:max_len]
+            if value:
+                bucket.append(value)
+    return samples
 
 
 def _on_windows() -> bool:

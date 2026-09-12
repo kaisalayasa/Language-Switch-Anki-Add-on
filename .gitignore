@@ -7,6 +7,9 @@ venv/
 # Anki writes this into an installed addon folder
 meta.json
 
+# Downloaded Piper binary + voice models (M2) -- large, per-machine, re-downloadable
+addon/user_files/
+
 # Local Claude Code settings
 .claude/settings.local.json
 

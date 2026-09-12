@@ -22,6 +22,50 @@ Verified by string-inspecting the compiled modules under
 | GUI | `gui_hooks.main_window_did_init` · `profile_did_open` · `browser_menus_did_init`; `mw.form.menuTools`; `mw.progress.{start, update, finish, want_cancel, set_title}` |
 | Later milestones | `aqt.clayout.CardLayout` (M3 preview) · `aqt/import_export/import_dialog` (M3 prior art) · `aqt.import_export.exporting.ApkgExporter` with `with_media` / `with_scheduling` |
 
+## Piper facts (M2) — verified against the real GitHub/HuggingFace APIs, 2026-09-12
+
+Not Anki APIs, but the same "never guess" discipline applies: getting a download URL or
+archive layout wrong wastes a build cycle the same way a wrong Anki signature does.
+
+**GitHub releases** (`GET api.github.com/repos/rhasspy/piper/releases/latest`):
+
+- Tag **`2023.11.14-2`** is genuinely the newest release — Piper is lightly maintained, this
+  is not a fetch failure.
+- Complete asset list (confirmed, not partial):
+  `piper_windows_amd64.zip` · `piper_linux_x86_64.tar.gz` · `piper_linux_aarch64.tar.gz` ·
+  `piper_linux_armv7l.tar.gz` · `piper_macos_x64.tar.gz` · `piper_macos_aarch64.tar.gz`.
+- **No native Windows ARM64 asset exists.** `piper_binary_manager.resolve_asset_name` raises
+  `UnsupportedPlatform` on that combination rather than falling back to the amd64 build.
+
+**HuggingFace voice repo** (`rhasspy/piper-voices`):
+
+- Path/filename convention confirmed by listing a real folder and file:
+  `en/en_US/lessac/medium/en_US-lessac-medium.onnx` genuinely exists (63,201,294 bytes),
+  alongside `en_US-lessac-medium.onnx.json` (4,885 bytes). General pattern:
+  `en/{locale}/{voice}/{quality}/{locale}-{voice}-{quality}.onnx{,.json}`.
+- Download via `https://huggingface.co/rhasspy/piper-voices/resolve/main/<path>`.
+- `en_GB/alba` folder confirmed to exist as a locale/voice pairing; its `medium` quality
+  subfolder was not independently re-checked byte-for-byte the way `lessac/medium` was — if
+  `piper_test_dialog.py`'s "Speak" button fails to download it, that's the first thing to
+  check, and this note should be updated with the real result either way.
+
+**Still unverified (signature/behavioural level, not presence)**:
+
+- `aqt.sound.av_player.play_file(path)` — long-standing, widely-used Anki addon sound API,
+  but not independently confirmed against this 26.08.1 build. `addon/ui/piper_test_dialog.py`
+  degrades to an actionable `showWarning` (not a crash) if the call shape has changed —
+  mirrors `preview.py`'s handling of the unverified `CardLayout` constructor.
+- The exact Piper CLI invocation shape. `piper_provider.py` currently assumes: text on
+  **stdin**, `--model <path to .onnx>`, `--output_file <path>` (Piper's documented usage as of
+  the `2023.11.14-2` release notes). Confirm for real once the binary is actually downloaded,
+  by running `piper --help` in a terminal, and record the real output here.
+
+### Piper CLI `--help` output
+
+_(not yet run — see `docs/api-notes.md`'s probe instructions above for the Anki-side
+equivalent; this one just needs the extracted `piper`/`piper.exe` run directly, no Anki
+required)_
+
 ## ⚠️ The traps (found by actually running M1)
 
 **`col.sched.forget_cards` does not exist.** The obvious guess fails.
@@ -139,35 +183,164 @@ Paste the output below this line.
 
 _(not yet run)_
 
-## `aqt.clayout.CardLayout` — pulled forward from M3
+## `aqt.clayout.CardLayout` — pulled forward from M3, now verified against real source
+
+**RESOLVED. Current architecture (read this first): `addon/ui/preview.py`'s
+`open_live_preview()` opens `CardLayout` directly on a real, existing note (its own real,
+current notetype) and injects the generated Front/Back/CSS by driving `CardLayout`'s own
+live-editing widgets (`tform.front_button`/`back_button`/`style_button` + `tform.edit_area`)
+exactly as a human typing into it would. Confirmed from real source: this never writes
+anything to the collection -- `CardLayout._renderPreview()` always renders an *ephemeral*
+card from its own in-memory model, and nothing reaches the collection unless the user
+explicitly clicks the dialog's own Save button. There is no scratch notetype, no
+`CollectionOp`, no undo entry, nothing to reset. `addon/ui/card_preview.py` is the Tools-menu
+entry point (`show_card_preview`) that picks a note and calls this.**
+
+The section below is the investigation trail that got here, kept because it explains *why*
+this design was chosen over the much more elaborate one that preceded it (a scratch
+notetype/deck/note built via `CollectionOp`, in `notetype_manager.py`'s now-deleted
+`ensure_preview_scaffold`/`write_preview_note`/`build_preview_note`). That approach caused a
+real, repeatedly-reproduced Anki hang -- bad enough that it once left even Anki's own native
+`Ctrl+L` shortcut unresponsive until restart -- across five separate attempts to fix it in
+place. It was never a timing bug to patch; the fix was removing the collection write
+entirely, which the paragraph above describes.
 
 `claude.md` schedules the live-preview pane for M3 ("investigate reusing/subclassing
-`aqt.clayout.CardLayout`"). At the user's explicit request, M1 now has one "Preview card…"
-button that opens it early, against one real note — see `addon/ui/preview.py`.
+`aqt.clayout.CardLayout`"). At the user's explicit request, M1 pulled it forward early.
 
-Its constructor is the **one call in this addon not behaviourally verified** the way the
-rest of M1 is: byte-scanning confirmed the class exists, but its `__init__` could not be
-introspected ahead of time (the compiled module targets Python 3.13, and this repo's tooling
-runs 3.11 — `inspect.signature` needs a live, matching interpreter, which only exists
-inside a running Anki process).
+The installed build's compiled module targets Python 3.13 and can't be introspected from
+this repo's Python 3.11 tooling, so byte-scanning could only confirm the class *exists*, not
+its calling convention — the same gap that caused the `ensure_name_unique` trap earlier.
+**Fixed properly this time**: rather than guess, the actual `aqt` package for this exact
+Anki version was pulled from PyPI (`pip download aqt==26.8.1 --no-deps`, a real published
+Anki wheel — matches the installed `26.08.1`) and its source read directly.
 
-Rather than guess one call shape and let a mismatch crash the dialog, `open_card_layout()`
-tries progressively simpler keyword sets (`{ord, fill_empty}` → `{ord}` → `{}`) and, if none
-of those match, raises with the *installed* signature (introspected live, since by then
-we're inside real Anki) plus every attempt that failed — actionable, not a guess. If you
-hit that error, paste it here.
-
-To confirm ahead of time instead of waiting for a failure, run in the debug console:
+### Confirmed real signature (`aqt/clayout.py`, `aqt==26.8.1`)
 
 ```python
-import inspect
-from aqt.clayout import CardLayout
-print(inspect.signature(CardLayout.__init__))
+class CardLayout(QDialog):
+    def __init__(
+        self,
+        mw: AnkiQt,
+        note: Note,
+        ord: int = 0,
+        parent: QWidget | None = None,
+        fill_empty: bool = False,
+    ) -> None:
+        QDialog.__init__(self, parent or mw, Qt.WindowType.Window)
+        mw.garbage_collect_on_dialog_finish(self)
+        ...
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.show()
+        self.setFocus()
 ```
 
-### CardLayout signature
+`open_card_layout()`'s first (now-confirmed, not just first-guessed) attempt in `_ATTEMPTS`
+already matches this exactly. The fallback attempts stay in place for resilience against
+other Anki versions this addon might run against, not because this one is still in doubt.
 
-_(not yet run)_
+### ⚠️ Trap: calling `.exec()` / `.show()` on the returned dialog hangs Anki with nothing visible
+
+Hit **twice** during testing, with two different "fixes" that both produced the identical
+symptom — nothing else in Anki could be clicked, every click outside produced Windows' "an
+action requires a modal dialog to be closed first" sound, and no window was visible to
+close or interact with:
+
+1. First attempt: `dialog.exec()`.
+2. Second attempt (reasoned to be a fix, but wasn't): `dialog.show()` + `dialog.raise_()` +
+   `dialog.activateWindow()`.
+
+Both were wrong for the same underlying reason, now confirmed from the real source above:
+**`CardLayout.__init__` already calls `self.show()` and sets
+`Qt.WindowModality.ApplicationModal` itself**, before returning. Grepping every real call
+site in Anki's own codebase confirms this is the intended usage — none of them do anything
+with the constructor's return value at all:
+
+```python
+# aqt/editor.py, onCardLayout
+CardLayout(self.mw, note, ord=ord, parent=self.parentWindow, fill_empty=False)
+if is_win:
+    self.parentWindow.activateWindow()   # note: the PARENT, not the CardLayout dialog
+
+# aqt/models.py
+CardLayout(self.mw, n, ord=0, parent=self, fill_empty=True)
+
+# aqt/browser/sidebar/tree.py
+CardLayout(self.mw, note, ord=item.id, parent=self, fill_empty=True)
+```
+
+Calling `.exec()` on an already-shown, already-application-modal `QDialog` starts a second,
+redundant nested Qt event loop for the same widget — a known Qt anti-pattern, and the actual
+cause of attempt 1's hang. Attempt 2's extra `.show()`/`.raise_()`/`.activateWindow()` calls
+were likely harmless individually, but still deviated from real Anki's own usage, and in
+particular **called `.activateWindow()` on the wrong object** — Anki's own `editor.py` calls
+it on the *parent* window, on Windows specifically, as a documented post-construction step.
+
+**Fix**: `preview_plan()`'s `on_success` (in `addon/ui/preview.py`, the single shared
+implementation both `ConvertDialog` and `RoleMapperDialog` call) now does exactly what real
+Anki does — construct `CardLayout` as a bare statement, touch nothing on the return value,
+and on Windows only, call `parent.activateWindow()` (the caller's own window, e.g. the
+`ConvertDialog`/`RoleMapperDialog` instance) afterward, mirroring `editor.py`'s `is_win`
+branch verbatim. `mw.garbage_collect_on_dialog_finish(self)` inside `CardLayout.__init__`
+means this addon doesn't need to hold its own reference for GC safety either — an earlier
+`_open_windows` list serving that purpose was removed as unnecessary once this was clear.
+
+**This fix (attempt 3) still did not resolve it.** Reported symptom this time: clicking
+Preview visibly took focus away from the calling dialog (described as looking like Alt-Tab),
+then the same "everything blocked, nothing visible, Windows plays its can't-click sound"
+state as before — despite this now matching real Anki's own usage exactly.
+
+Traced the full call chain against real source (`aqt.operations.CollectionOp`,
+`aqt.taskman.TaskManager`, `aqt.progress.ProgressManager`, `anki.notes.Note`) to rule out
+several plausible theories:
+- **Threading**: `CollectionOp`'s `success()` callback is confirmed to run on the main GUI
+  thread (`taskman.py`'s `run_on_main` marshals it via a queued Qt signal), not the
+  background worker thread. Not the cause.
+- **Stale collection reference**: `Note.col` (`anki/notes.py`) is a `weakref` to whatever
+  `col` it was constructed with; `CollectionOp` always passes the real `mw.col`
+  (`operations/__init__.py`: `self._op(mw.col)`), which stays alive for Anki's whole
+  session. Not stale by the time `on_success` runs.
+- **Progress-dialog race**: Anki's own `ProgressManager.start()` schedules its "please wait"
+  window to actually become visible only after a 600ms `_show_timer` (`progress.py`), to
+  avoid flicker on fast ops — but `finish()` explicitly stops that timer before our
+  `on_success` runs if the op already completed (which a tiny scratch-note write does well
+  under 600ms). Anki's own code already guards against this race. Not the cause.
+
+Working theory, not yet confirmed: `CardLayout` embeds a Chromium-based `AnkiWebView` for
+its live preview pane. Constructing that specific kind of widget *synchronously inside*
+`CollectionOp`'s still-unwinding future-done callback chain (rather than as a fresh
+top-level event-loop tick, which is how every direct-button-click call site in real Anki
+invokes it) is a plausible, known class of Qt/WebEngine flakiness. **Attempt 4**: defer the
+construction with `QTimer.singleShot(0, show_card_layout)` from inside `on_success`, so it
+runs on a clean event-loop iteration instead. Not yet confirmed against a real run.
+
+**Diagnostic result (confirmed by the user)**: Anki's own native Card Types editor
+(Browser → select a card → `Ctrl+L`) opens fine with this addon not involved. This rules out
+graphics driver / QtWebEngine-on-this-machine as the cause, and rules out "any CardLayout
+anywhere freezes" — it's specific to opening one via this addon's call path. **Attempt 4
+(the 0ms `QTimer.singleShot` deferral above) still did not fix it either**, same symptom.
+
+**Attempt 5, current**: the one thing genuinely different between our path and every real
+Anki call site (`editor.py`, `models.py`, `browser/sidebar/tree.py`) is that ours opens
+`CardLayout` immediately after a `CollectionOp` that just created/updated a **notetype**.
+`CollectionOp`'s completion handler (`on_op_finished` in `aqt/operations/__init__.py`) fires
+Anki's `state_did_reset` hook whenever `mw.col.op_made_changes(changes)` says the change was
+broad enough — a notetype change qualifies. That hook can trigger a wider main-window UI
+reset, plausibly colliding with a freshly-opening modal `CardLayout` (which itself evicts
+the notetype from Anki's model cache in its own `__init__`, another point of contact with
+the same reset). A same-tick `QTimer.singleShot(0, ...)` apparently wasn't enough separation
+from that cascade.
+
+Anki's own source hits this same category of problem elsewhere and has a real, concrete fix
+for it: `aqt/taskman.py`'s `with_backend_progress` schedules its own `on_done` via
+`self.mw.progress.single_shot(100, lambda: on_done(fut), ...)`, commented **"allow the event
+loop to close the window before we proceed."** Applied the same real value as attempt 5 —
+`QTimer.singleShot(100, show_card_layout)` instead of `0`. **This also did not fix it**
+(confirmed by the user). At that point the timing-delay direction was abandoned as a dead
+end: every attempt shared the same root cause (a real collection write triggering
+`state_did_reset` right as a new modal dialog opens), and no amount of delay tuning is a
+structural fix for that -- only removing the write is. See the resolution banner at the top
+of this section for what actually shipped.
 
 ## Design notes
 
@@ -181,7 +354,6 @@ _(not yet run)_
   maps only become relevant if we add or remove fields on the clone.
 - **`trash_files` vs delete**: trashing is recoverable, which is why the (M5) media cleanup
   uses it.
-- **Preview never deletes**: `build_preview_note()` only adds or updates a dedicated,
-  deterministically-named scratch notetype/deck/note (suffixed `" (Preview)"`). Repeated
-  previews reuse the same note rather than accumulating, and nothing is ever deleted — so a
-  preview the user starts tinkering with inside Card Types is never silently destroyed.
+- **Preview writes nothing at all**: see the `aqt.clayout.CardLayout` section above --
+  `open_live_preview()` opens a real note's real notetype and injects generated templates
+  via `CardLayout`'s own in-memory live-editing mechanism, never touching the collection.

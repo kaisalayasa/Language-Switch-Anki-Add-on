@@ -31,6 +31,9 @@ __all__ = [
     "RoleMapping",
     "ValidationError",
     "ValidationResult",
+    "FieldAssignment",
+    "mapping_from_assignments",
+    "assignments_from_mapping",
 ]
 
 
@@ -437,3 +440,80 @@ def fields_from_notetype(flds: Iterable[dict]) -> List[Tuple[int, str]]:
     plain list without importing anki themselves. Takes dicts, not Anki objects.
     """
     return sorted((int(f["ord"]), str(f["name"])) for f in flds)
+
+
+@dataclass(frozen=True)
+class FieldAssignment:
+    """One row of a manual, one-role-per-field mapping UI (M3's ``RoleMapperDialog``).
+
+    A flatter, UI-shaped view of a mapping than :class:`RoleMapping` itself: at most one
+    ``role`` per field, rather than the data model's full many-to-many. ``filter`` and
+    ``css_class`` are carried through unedited from wherever the row was seeded (a shipped
+    profile, typically) -- M3's UI has no control that sets them, only ones that might
+    preserve or drop them.
+    """
+
+    name: str
+    ord: int
+    role: Optional[Role] = None
+    hidden: bool = False
+    filter: Optional[str] = None
+    css_class: Optional[str] = None
+
+
+def mapping_from_assignments(
+    notetype_name: str,
+    assignments: Sequence[FieldAssignment],
+    *,
+    target_language: Optional[str] = None,
+    native_language: Optional[str] = None,
+) -> RoleMapping:
+    """Rebuild a :class:`RoleMapping` from flat UI rows.
+
+    Builds fresh rather than mutating an existing mapping's bindings in place --
+    :class:`FieldBinding` is ``frozen`` on purpose, and rebuilding from what the table
+    actually shows is simpler than trying to patch a mapping incrementally as checkboxes
+    and dropdowns change.
+    """
+    fields = [
+        FieldBinding(
+            name=a.name, ord=a.ord, filter=a.filter, hidden=a.hidden, css_class=a.css_class
+        )
+        for a in assignments
+    ]
+    mapping = RoleMapping(
+        notetype_name=notetype_name,
+        fields=fields,
+        target_language=target_language,
+        native_language=native_language,
+    )
+    by_name = {f.name: f for f in fields}
+    for a in assignments:
+        if a.role is not None:
+            mapping.bind(a.role, by_name[a.name])
+    return mapping
+
+
+def assignments_from_mapping(mapping: RoleMapping) -> List[FieldAssignment]:
+    """The reverse of :func:`mapping_from_assignments` -- seeds a UI table from a mapping.
+
+    If a field genuinely carries more than one role (the data model allows it; no shipped
+    profile currently uses it), the first one wins here -- a documented limitation of the
+    one-role-per-field UI, not data loss, since a mapping built from the table is always
+    rebuilt from what the table shows, never patched onto the original.
+    """
+    role_for: Dict[str, Role] = {}
+    for role, bindings in mapping.assignments.items():
+        for b in bindings:
+            role_for.setdefault(b.name, role)
+    return [
+        FieldAssignment(
+            name=f.name,
+            ord=f.ord,
+            role=role_for.get(f.name),
+            hidden=f.hidden,
+            filter=f.filter,
+            css_class=f.css_class,
+        )
+        for f in sorted(mapping.fields, key=lambda f: f.ord)
+    ]

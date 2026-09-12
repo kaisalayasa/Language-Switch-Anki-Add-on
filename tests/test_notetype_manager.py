@@ -11,7 +11,7 @@ import unittest
 
 from addon.core.conversion import ConversionMode, build_plan
 from addon.core.role_schema import FieldBinding, Role, RoleMapping
-from addon.ops.notetype_manager import ApiMismatch, apply_plan, build_preview_note
+from addon.ops.notetype_manager import ApiMismatch, apply_plan
 
 from tests.fake_collection import FakeCollection
 
@@ -191,81 +191,6 @@ class TestTheOriginalNotetypeIsNeverMutated(unittest.TestCase):
         clone = col.notetypes[result.clone_notetype_id]
         self.assertEqual(clone["tmpls"][0]["qfmt"], "{{Word}}")
         self.assertEqual(len(clone["tmpls"]), 1, "extra templates would make extra cards")
-
-
-class TestBuildPreviewNote(unittest.TestCase):
-    """A real note on a real notetype, so Anki's own renderer can show it -- without
-    touching the source deck, the real clone, or any of the user's notes.
-    """
-
-    def _preview(self, col, plan, sample_nid, front="{{Word}}", back="{{FrontSide}}{{Meaning}}"):
-        return build_preview_note(
-            col, plan, front=front, back=back, css=".card{}", template_name="Production",
-            sample_note_id=sample_nid,
-        )
-
-    def test_creates_a_dedicated_scratch_notetype_and_deck(self):
-        col, src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK)
-        self._preview(col, plan, plan.note_ids[0])
-        preview_name = "%s (Preview)" % plan.clone_notetype
-        self.assertIsNotNone(col.models.by_name(preview_name))
-        self.assertIsNotNone(col.decks.by_name(preview_name))
-
-    def test_preview_name_never_collides_with_the_real_conversion(self):
-        col, src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK)
-        self._preview(col, plan, plan.note_ids[0])
-        result = run(col, plan)  # the real, non-preview conversion
-        self.assertNotEqual(result.clone_notetype_name, "%s (Preview)" % plan.clone_notetype)
-
-    def test_source_note_and_deck_are_untouched(self):
-        col, src, deck = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK)
-        sample_nid = plan.note_ids[0]
-        before = list(col.notes[sample_nid].fields), col.notes[sample_nid].mid
-        self._preview(col, plan, sample_nid)
-        after = list(col.notes[sample_nid].fields), col.notes[sample_nid].mid
-        self.assertEqual(before, after)
-        self.assertEqual(len(col.find_notes('note:"Starter" deck:"Starter"')), 5)
-
-    def test_field_values_come_from_the_chosen_sample_note(self):
-        col, src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK)
-        sample_nid = plan.note_ids[2]
-        note = self._preview(col, plan, sample_nid)
-        self.assertEqual(note["Word"], col.notes[sample_nid]["Word"])
-
-    def test_repeated_previews_reuse_the_same_note_rather_than_accumulating(self):
-        col, src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK)
-        first = self._preview(col, plan, plan.note_ids[0])
-        second = self._preview(col, plan, plan.note_ids[1])
-        preview_name = "%s (Preview)" % plan.clone_notetype
-        self.assertEqual(len(col.find_notes('note:"%s"' % preview_name)), 1)
-        self.assertEqual(first.id, second.id)
-        self.assertEqual(second["Word"], col.notes[plan.note_ids[1]]["Word"])
-
-    def test_repeated_previews_pick_up_updated_templates(self):
-        col, src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK)
-        self._preview(col, plan, plan.note_ids[0], front="{{Word}}")
-        self._preview(col, plan, plan.note_ids[0], front="{{Meaning}}")
-        preview_name = "%s (Preview)" % plan.clone_notetype
-        self.assertEqual(col.models.by_name(preview_name)["tmpls"][0]["qfmt"], "{{Meaning}}")
-
-    def test_preview_never_deletes_anything(self):
-        """Even repeated calls only add or update -- see build_preview_note's docstring."""
-        col, src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK)
-        before_notetypes = set(col.notetypes)
-        before_notes = set(col.notes)
-        self._preview(col, plan, plan.note_ids[0])
-        self._preview(col, plan, plan.note_ids[1])
-        after_notetypes = set(col.notetypes)
-        after_notes = set(col.notes)
-        self.assertTrue(before_notetypes <= after_notetypes)
-        self.assertTrue(before_notes <= after_notes)
 
 
 class TestGuardrails(unittest.TestCase):
