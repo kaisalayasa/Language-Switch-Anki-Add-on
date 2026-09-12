@@ -50,16 +50,50 @@ match the real (dict-in, mutate-in-place) contract, with a regression test
 (`TestNotetypeNaming` in `tests/test_notetype_manager.py`) asserting production code never
 calls it with anything but a dict.
 
-**Calling `col.add_custom_undo_entry`/`merge_undo_entries` directly on the main thread,
-outside a `CollectionOp`, produced a small "undo op"-related message** in the "Preview
-card…" flow, though it did not stop the preview from working. The exact wording wasn't
-captured, so this is an architectural fix rather than a confirmed root-cause one: every
-other collection-mutating call in this addon (the real Apply flow, in `convert_op.py`)
-already goes through `CollectionOp`, and it has produced no such message. `ConvertDialog._preview`
-now wraps its collection write in a `CollectionOp` the same way — the undo entry is
-created and merged on the op's background thread, and `CardLayout` (a Qt widget) is opened
-from `.success()`, which runs back on the main thread. If a message with this wording
-reappears, capture its exact text here.
+**`col.merge_undo_entries(target)` raises `"target undo op not found"` if a notetype
+schema change happens between `add_custom_undo_entry(...)` and the merge.** Confirmed
+against a real collection, exact wording captured. Root cause: creating or modifying a
+notetype (`col.models.add_dict`/`update_dict`) — and, it turns out,
+`change_notetype_of_notes` too — bumps Anki's schema modification time, which invalidates
+*any* outstanding custom undo marker, not just the one that triggered the change. A marker
+set before such a call can never be merged afterward, no matter what runs in between.
+
+This was first noticed via the "Preview card…" flow (an earlier fix moved that call into a
+`CollectionOp`, which was a real improvement on its own merits but **did not address this**
+— the marker was still being set before the notetype write). Investigating properly turned
+up that the **exact same bug was latent in the real Apply flow** (`apply_plan` in
+`notetype_manager.py`), in both conversion modes, via `run_conversion` in
+`convert_op.py` — it had simply not been exercised by a real (non-dry) run yet.
+`tests/test_convert_op.py` (previously nonexistent — only the inner `apply_plan` was
+tested, which bypasses the undo wrapping entirely) now covers `run_conversion` directly
+in both modes.
+
+**The fix, applied everywhere `add_custom_undo_entry`/`merge_undo_entries` is used in this
+addon:** the marker may only span calls that are *not* notetype-schema-level.
+- `col.models.add_dict` / `update_dict` / `change_notetype_of_notes` — schema-level, never
+  wrap.
+- `col.decks.add_normal_deck_with_name`, `col.new_note`/`add_note`/`update_note`,
+  `col.sched.schedule_cards_as_new` — not schema-level (deck creation has never required a
+  full resync, unlike notetype changes), safe to wrap.
+
+Concretely: `apply_plan` now creates the clone (schema change) *before* setting the marker,
+and for Flip-in-place also runs `change_notetype_of_notes` (also schema change) *before*
+setting the marker; only the scheduling reset (and, in New-deck mode, the note
+duplication) sit inside the wrapped span. `ConvertDialog._preview` was restructured the
+same way: `ensure_preview_scaffold` (schema change) runs unwrapped, then the marker is set,
+then `write_preview_note` (pure data) is wrapped.
+
+**Consequence for the UI:** a conversion is no longer a single undo step. It's two (New
+deck) or three (Flip in place) separate ones — see `apply_plan`'s comments for exactly
+where the boundaries fall. `claude.md` §8 has been corrected to state this rather than
+promise single-keystroke undo.
+
+`tests/fake_collection.py` now simulates this: `add_dict`/`update_dict`/
+`change_notetype_of_notes` bump a `_schema_generation` counter, and
+`merge_undo_entries` raises `RuntimeError("target undo op not found")` if the generation
+has moved since the matching `add_custom_undo_entry` call — reproducing the real bug
+faithfully enough that both the original failure and the fix are now provable in the pure
+test suite, without needing a real Anki collection to notice a regression.
 
 ## Still to confirm (exact signatures, not just presence)
 

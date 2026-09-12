@@ -250,9 +250,18 @@ Mode B is the default.
    is an identity map, because cloning preserves the schema.
 5. **Reset scheduling unconditionally**, both modes, via
    `col.sched.schedule_cards_as_new(...)` with `reset_counts=True`.
-6. Wrap everything in one `CollectionOp` with
-   `add_custom_undo_entry`/`merge_undo_entries` so a single Ctrl+Z reverts the
-   whole conversion. Still prompt for a manual backup/export before starting.
+6. Wrap everything in one `CollectionOp`. **A single custom undo entry cannot
+   span the whole conversion**: creating the clone notetype (and, in Mode A,
+   `change_notetype_of_notes`) is a notetype *schema* change, and Anki
+   invalidates any `add_custom_undo_entry` marker set before a schema change —
+   confirmed against a real collection as `"target undo op not found"` when
+   this was gotten wrong. `add_custom_undo_entry`/`merge_undo_entries` may
+   only ever span what comes *after* the last schema-changing call (the
+   scheduling reset, and in Mode B the note duplication) — never wrap it
+   around a notetype-level call. In practice a conversion is therefore two or
+   three separate undo steps, not one; see `notetype_manager.py`'s
+   `apply_plan` for exactly where the boundaries fall. Still prompt for a
+   manual backup/export before starting, regardless.
 
 ### Audio is a replacement, not an addition
 
