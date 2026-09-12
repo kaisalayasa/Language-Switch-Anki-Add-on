@@ -1,0 +1,86 @@
+{
+  "id": "core2000",
+  "title": "Core 2000 (iKnow! optimized) — Japanese front → English front",
+  "description": "Field list verified by reading the notetype straight out of collection.anki2, not from the deck export (Anki exports omit field names). See docs/deck-facts.md.",
+  "version": 1,
+
+  "target_language": "en",
+  "native_language": "ja",
+
+  "notetype": "Core 2000",
+
+  "binds_to": {
+    "notetype_names": ["Core 2000"],
+    "field_fingerprint": [
+      "Optimized-Voc-Index", "Vocabulary-Kanji", "Vocabulary-Furigana", "Vocabulary-Kana",
+      "Vocabulary-English", "Vocabulary-Audio", "Vocabulary-Pos", "Caution",
+      "Expression", "Reading", "Sentence-Kana", "Sentence-English", "Sentence-Clozed",
+      "Sentence-Audio", "Notes", "Core-Index", "Optimized-Sent-Index", "Frequency"
+    ]
+  },
+
+  "fields": [
+    { "name": "Optimized-Voc-Index", "ord": 0, "hidden": true,
+      "hidden_reason": "bookkeeping integer" },
+
+    { "name": "Vocabulary-Kanji", "ord": 1, "hidden": true,
+      "hidden_reason": "fully contained in Vocabulary-Furigana, which is what we display" },
+
+    { "name": "Vocabulary-Furigana", "ord": 2, "filter": "furigana", "css_class": "japanese" },
+
+    { "name": "Vocabulary-Kana", "ord": 3, "hidden": true,
+      "hidden_reason": "the furigana filter already renders the reading as ruby" },
+
+    { "name": "Vocabulary-English", "ord": 4 },
+
+    { "name": "Vocabulary-Audio", "ord": 5,
+      "note": "holds Japanese audio today; repurposed to hold English TTS in M5" },
+
+    { "name": "Vocabulary-Pos", "ord": 6 },
+
+    { "name": "Caution", "ord": 7,
+      "note": "empty on 1980 of 1983 notes — must stay inside a conditional section" },
+
+    { "name": "Expression", "ord": 8, "hidden": true,
+      "hidden_reason": "fully contained in Reading, which is what we display" },
+
+    { "name": "Reading", "ord": 9, "filter": "furigana", "css_class": "japanese",
+      "note": "despite the name, this is the example sentence with ruby annotations" },
+
+    { "name": "Sentence-Kana", "ord": 10, "hidden": true,
+      "hidden_reason": "the furigana filter already renders the reading as ruby" },
+
+    { "name": "Sentence-English", "ord": 11 },
+
+    { "name": "Sentence-Clozed", "ord": 12 },
+
+    { "name": "Sentence-Audio", "ord": 13,
+      "note": "holds Japanese audio today; repurposed to hold English TTS in M5" },
+
+    { "name": "Notes", "ord": 14, "hidden": true,
+      "hidden_reason": "MISLABELLED — actually holds the Core index string, e.g. 'Core 2000 Step 01 - 001'" },
+
+    { "name": "Core-Index", "ord": 15, "hidden": true,
+      "hidden_reason": "MISLABELLED — actually holds a plain integer" },
+
+    { "name": "Optimized-Sent-Index", "ord": 16, "hidden": true,
+      "hidden_reason": "bookkeeping integer" },
+
+    { "name": "Frequency", "ord": 17, "hidden": true,
+      "hidden_reason": "bookkeeping integer" }
+  ],
+
+  "roles": {
+    "TargetTerm":          ["Vocabulary-English"],
+    "TargetSentence":      ["Sentence-English"],
+    "TargetAudio":         ["Vocabulary-Audio"],
+    "TargetSentenceAudio": ["Sentence-Audio"],
+
+    "NativeTerm":          ["Vocabulary-Furigana"],
+    "NativeSentence":      ["Reading"],
+
+    "Pos":                 ["Vocabulary-Pos"],
+    "Notes":               ["Caution"],
+    "ClozeText":           ["Sentence-Clozed"]
+  }
+}

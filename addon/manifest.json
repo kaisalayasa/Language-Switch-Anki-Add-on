@@ -1,0 +1,8 @@
+{
+  "package": "deck_direction_converter",
+  "name": "Deck Direction Converter",
+  "human_version": "0.1.0",
+  "homepage": "",
+  "conflicts": [],
+  "min_point_version": 50
+}
