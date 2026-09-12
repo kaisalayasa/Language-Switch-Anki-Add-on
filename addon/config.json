@@ -1,0 +1,12 @@
+{
+  "mode": "new_deck",
+  "name_suffix": "English Front",
+  "reset_scheduling": true,
+  "include_audio": false,
+  "audio_on_front": true,
+  "include_unmapped": true,
+  "strip_tags": ["leech"],
+  "template_name": "Production",
+  "confirm_before_apply": true,
+  "prompt_for_backup": true
+}

@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Anki writes this into an installed addon folder
+meta.json
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# Build output
+build/
+dist/
+*.ankiaddon
+*.apkg
+*.colpkg
