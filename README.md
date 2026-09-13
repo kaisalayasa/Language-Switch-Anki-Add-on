@@ -5,13 +5,14 @@ becomes *Language B front / Language A back* — and (from M2) generates natural
 the newly-fronted language using [Piper](https://github.com/rhasspy/piper), locally and
 offline.
 
-**Status: M1 and M2 done, M3 in progress.** Template generation, the clone-notetype flow and
-both conversion modes work end-to-end in real Anki. M2 added a local, offline Piper TTS
-pipeline (binary manager, voice manager, subprocess synthesis, text sanitizer) with a
-standalone "Test Piper voice…" dev dialog — it does not yet write audio into real notes; that
-lands in M5 once batch-apply exists. M3 replaces M1's hardcoded Core-2000-only mapping with a
-real "Map fields…" dialog (one dropdown per field, live card preview) — known decks are still
-pre-filled from a shipped profile, but any notetype can now be mapped by hand.
+**Status: M1-M3 done, M5 in progress** (M4, language-detection-seeded mapping suggestions,
+deferred in favor of M5 — see `docs/api-notes.md`). Template generation, the clone-notetype
+flow, both conversion modes, a real "Map fields…" mapper UI, and live card preview all work
+end-to-end in real Anki. M5 connects M2's standalone Piper TTS pipeline to real notes for the
+first time: **Tools → Generate TTS audio…** batch-synthesizes and writes audio into a
+converted deck's notes, with progress, cancellation, and resumability (a re-run only
+processes notes that don't already have generated audio, tracked via the `ddc-tts-generated`
+tag), then flips the notetype's template on to actually reference the new audio.
 
 ## The two modes
 
@@ -57,14 +58,17 @@ docs/          deck-facts.md (verified ground truth), api-notes.md
 ## Development
 
 ```bash
-python -m unittest discover -s tests -t .   # 131 tests, no Anki needed, no network needed
+python -m unittest discover -s tests -t .   # 139 tests, no Anki needed, no network needed
 python tools/preview_templates.py core2000  # see the generated templates
 python tools/install_dev.py --link          # install into Anki (close Anki first)
 ```
 
-Then in Anki: **Tools → Convert deck language direction…** or **Tools → Test Piper voice… (M2)**.
-The first "Speak" click downloads the Piper binary (~20MB) and voice model (~60MB) into
-`addon/user_files/` (gitignored, never wiped by an addon update); later clicks are cached.
+Then in Anki's Tools menu: **Convert deck language direction…** (map fields, convert),
+**Preview converted card…** (live preview, no writes), **Test Piper voice… (M2)** (standalone
+synthesis check), or **Generate TTS audio… (M5)** (batch-writes audio into a converted
+deck's notes). The first synthesis of any kind downloads the Piper binary (~20MB) and voice
+model (~60MB) into `addon/user_files/` (gitignored, never wiped by an addon update); later
+runs are cached.
 
 Develop against a scratch profile, not your real collection. Every operation is scoped to a
 single (deck, notetype) pair, but in-development code writes to the same `collection.anki2`

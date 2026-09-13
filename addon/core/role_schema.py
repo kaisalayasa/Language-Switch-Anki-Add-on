@@ -34,6 +34,7 @@ __all__ = [
     "FieldAssignment",
     "mapping_from_assignments",
     "assignments_from_mapping",
+    "AUDIO_SOURCE_ROLES",
 ]
 
 
@@ -133,6 +134,15 @@ class Role(Enum):
     def key(self) -> str:
         """The CamelCase key used in profile JSON."""
         return "".join(part.capitalize() for part in self.name.split("_"))
+
+
+#: Which content role each audio role's speech should be synthesized from (M5). Only the
+#: target side gets TTS -- per claude.md's "audio is a replacement, not an addition", the
+#: native side's audio field is either left alone or dropped, never (re)synthesized here.
+AUDIO_SOURCE_ROLES: Dict[Role, Role] = {
+    Role.TARGET_AUDIO: Role.TARGET_TERM,
+    Role.TARGET_SENTENCE_AUDIO: Role.TARGET_SENTENCE,
+}
 
 
 @dataclass(frozen=True)

@@ -11,6 +11,7 @@ __all__ = ["setup"]
 _ACTION_TEXT = "Convert deck language direction…"
 _PIPER_ACTION_TEXT = "Test Piper voice… (M2)"
 _PREVIEW_ACTION_TEXT = "Preview converted card…"
+_TTS_BATCH_ACTION_TEXT = "Generate TTS audio… (M5)"
 _installed = False
 
 
@@ -41,6 +42,10 @@ def _add_menu_actions() -> None:
     preview_action = QAction(_PREVIEW_ACTION_TEXT, mw)
     preview_action.triggered.connect(_launch_card_preview)
     mw.form.menuTools.addAction(preview_action)
+
+    tts_batch_action = QAction(_TTS_BATCH_ACTION_TEXT, mw)
+    tts_batch_action.triggered.connect(_launch_tts_batch)
+    mw.form.menuTools.addAction(tts_batch_action)
 
 
 def _launch_convert() -> None:
@@ -74,3 +79,14 @@ def _launch_card_preview() -> None:
         showWarning("Card preview failed to load:\n\n%r" % (exc,))
         return
     show_card_preview()
+
+
+def _launch_tts_batch() -> None:
+    from aqt.utils import showWarning
+
+    try:
+        from .ui.tts_batch_dialog import show_tts_batch_dialog
+    except Exception as exc:  # pragma: no cover - surfaced in the GUI
+        showWarning("TTS batch dialog failed to load:\n\n%r" % (exc,))
+        return
+    show_tts_batch_dialog()
