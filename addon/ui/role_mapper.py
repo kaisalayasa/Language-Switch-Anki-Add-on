@@ -29,6 +29,7 @@ from aqt.qt import (
     QDialogButtonBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QPushButton,
@@ -37,7 +38,10 @@ from aqt.qt import (
     QTableWidgetItem,
     QVBoxLayout,
 )
+from aqt.utils import askUser, showInfo, showWarning
 
+from ..core.language_detect import LanguageGuess, detect_field_language
+from ..core.profiles import USER_PROFILE_DIR, load_profiles, save_profile, slugify
 from ..core.role_schema import (
     FieldAssignment,
     Role,
@@ -49,7 +53,7 @@ from ..core.role_schema import (
 __all__ = ["RoleMapperDialog"]
 
 _UNMAPPED = "(unmapped)"
-_COLUMNS = ["Ord", "Field", "Sample", "Role", "Hide"]
+_COLUMNS = ["Ord", "Field", "Sample", "Detected", "Role", "Hide"]
 
 
 class RoleMapperDialog(QDialog):
@@ -75,6 +79,12 @@ class RoleMapperDialog(QDialog):
         self._role_combos: Dict[int, QComboBox] = {}
         self._hide_checks: Dict[int, QCheckBox] = {}
         self._passthrough: Dict[str, FieldAssignment] = {}
+        #: Per-field language guess (M4) -- informational only. Computed once from the same
+        #: samples the Sample column already shows; never written into target_language /
+        #: native_language or a Role combo automatically. See core/language_detect.py.
+        self._detected: Dict[str, LanguageGuess] = {
+            name: detect_field_language(samples.get(name, [])) for _, name in self._live_fields
+        }
 
         layout = QVBoxLayout(self)
 
@@ -86,6 +96,15 @@ class RoleMapperDialog(QDialog):
         self.native_language = QLineEdit(initial_mapping.native_language or "")
         lang_row.addWidget(self.native_language)
         layout.addLayout(lang_row)
+
+        detected_label = QLabel(self._detected_summary_text())
+        detected_label.setWordWrap(True)
+        detected_label.setToolTip(
+            "A guess per field, from Unicode script and (for Latin-script text) statistical "
+            "detection -- shown for reference only. It never sets the language boxes above "
+            "or the Role column below; type/choose those yourself."
+        )
+        layout.addWidget(detected_label)
 
         self.table = QTableWidget(len(self._live_fields), len(_COLUMNS))
         self.table.setHorizontalHeaderLabels(_COLUMNS)
@@ -111,6 +130,14 @@ class RoleMapperDialog(QDialog):
         self.reset_button.clicked.connect(self._on_reset)
         button_row.addWidget(self.reset_button)
         button_row.addStretch(1)
+        self.save_button = QPushButton("Save as profile…")
+        self.save_button.setToolTip(
+            "Save the current mapping as a reusable JSON profile, so it's remembered next "
+            "time this notetype is opened here -- instead of being lost when this dialog "
+            "closes."
+        )
+        self.save_button.clicked.connect(self._on_save_profile)
+        button_row.addWidget(self.save_button)
         layout.addLayout(button_row)
 
         self.buttons = QDialogButtonBox(
@@ -123,6 +150,18 @@ class RoleMapperDialog(QDialog):
         self.target_language.textChanged.connect(self._revalidate)
         self.native_language.textChanged.connect(self._revalidate)
         self._revalidate()
+
+    def _detected_summary_text(self) -> str:
+        counts: Dict[str, int] = {}
+        for guess in self._detected.values():
+            if guess.is_confident:
+                counts[guess.code] = counts.get(guess.code, 0) + 1
+        if not counts:
+            return "Detected: no confident guess for any field."
+        parts = ", ".join(
+            "%s (%d)" % (code, n) for code, n in sorted(counts.items(), key=lambda kv: -kv[1])
+        )
+        return "Detected in these fields: %s" % parts
 
     # -- table <-> data -------------------------------------------------
 
@@ -148,6 +187,20 @@ class RoleMapperDialog(QDialog):
             sample_item.setFlags(sample_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table.setItem(row, 2, sample_item)
 
+            guess = self._detected.get(name, LanguageGuess(None, "unknown"))
+            detected_item = QTableWidgetItem(guess.code or "")
+            detected_item.setFlags(detected_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if guess.is_confident:
+                detected_item.setToolTip(
+                    "Guessed %r via %s%s -- informational only, not applied anywhere."
+                    % (
+                        guess.code,
+                        guess.confidence,
+                        "" if guess.probability is None else " (%.0f%%)" % (guess.probability * 100),
+                    )
+                )
+            self.table.setItem(row, 3, detected_item)
+
             combo = QComboBox()
             combo.addItem(_UNMAPPED, None)
             for role in Role:
@@ -157,13 +210,13 @@ class RoleMapperDialog(QDialog):
                 if index != -1:
                     combo.setCurrentIndex(index)
             combo.currentIndexChanged.connect(self._revalidate)
-            self.table.setCellWidget(row, 3, combo)
+            self.table.setCellWidget(row, 4, combo)
             self._role_combos[row] = combo
 
             check = QCheckBox()
             check.setChecked(a.hidden)
             check.stateChanged.connect(self._revalidate)
-            self.table.setCellWidget(row, 4, check)
+            self.table.setCellWidget(row, 5, check)
             self._hide_checks[row] = check
 
     def _current_assignments(self) -> List[FieldAssignment]:
@@ -204,6 +257,8 @@ class RoleMapperDialog(QDialog):
             text = "Cannot proceed:\n" + "\n".join("  - %s" % e for e in result.errors)
         self.status_label.setText(text)
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(result.ok)
+        if hasattr(self, "save_button"):
+            self.save_button.setEnabled(result.ok)
 
     def _on_reset(self) -> None:
         if self._profile_mapping is None:
@@ -212,6 +267,32 @@ class RoleMapperDialog(QDialog):
         self.native_language.setText(self._profile_mapping.native_language or "")
         self._populate(assignments_from_mapping(self._profile_mapping))
         self._revalidate()
+
+    def _on_save_profile(self) -> None:
+        mapping = self._current_mapping()
+        if not mapping.validate().ok:
+            showWarning("Fix the mapping errors above before saving it as a profile.", parent=self)
+            return
+
+        name, ok = QInputDialog.getText(
+            self, "Save as profile", "Profile name:", QLineEdit.EchoMode.Normal, self._notetype_name
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        profile_id = slugify(name)
+
+        existing = {p.id for p in load_profiles([USER_PROFILE_DIR])}
+        if profile_id in existing:
+            if not askUser(
+                "A saved profile named %r already exists. Overwrite it?" % name,
+                parent=self,
+                defaultno=True,
+            ):
+                return
+
+        path = save_profile(mapping, id=profile_id, title=name)
+        showInfo("Saved profile to:\n\n%s" % path, parent=self)
 
     def _on_accept(self) -> None:
         self._result_mapping = self._current_mapping()
