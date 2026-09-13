@@ -13,6 +13,7 @@ from addon.core.template_generator import (
     GENERATED_CSS_MARKER,
     TemplateOptions,
     generate_templates,
+    split_render_order,
 )
 
 CORE2000_JSON = os.path.join(BUILTIN_PROFILE_DIR, "core2000.json")
@@ -335,6 +336,124 @@ class TestProfileRoundTrip(unittest.TestCase):
             generate_templates(original).back_html,
             generate_templates(round_tripped).back_html,
         )
+
+
+class TestCustomOrder(unittest.TestCase):
+    """front_order/back_order (the single-screen redesign's drag-reorderable field list)."""
+
+    def _rich_mapping(self):
+        return simple_mapping(
+            ["Word", "Kana", "Type", "Sentence", "Meaning", "MeaningReading", "MeaningSentence", "Pic", "Extra"],
+            {
+                Role.TARGET_TERM: "Word",
+                Role.TARGET_READING: "Kana",
+                Role.POS: "Type",
+                Role.TARGET_SENTENCE: "Sentence",
+                Role.NATIVE_TERM: "Meaning",
+                Role.NATIVE_READING: "MeaningReading",
+                Role.NATIVE_SENTENCE: "MeaningSentence",
+                Role.IMAGE: "Pic",
+                Role.NOTES: "Extra",
+            },
+        )
+
+    def test_default_order_is_unchanged_when_no_custom_order_given(self):
+        mapping = self._rich_mapping()
+        default = generate_templates(mapping)
+        explicit_none = generate_templates(
+            mapping, options=TemplateOptions(front_order=None, back_order=None)
+        )
+        self.assertEqual(default.front_html, explicit_none.front_html)
+        self.assertEqual(default.back_html, explicit_none.back_html)
+
+    def test_front_blocks_follow_a_custom_order(self):
+        mapping = self._rich_mapping()
+        result = generate_templates(
+            mapping,
+            options=TemplateOptions(
+                front_order=[Role.POS, Role.TARGET_SENTENCE, Role.TARGET_TERM, Role.TARGET_READING]
+            ),
+        )
+        front = result.front_html
+        self.assertLess(front.index("Type"), front.index("Sentence"))
+        self.assertLess(front.index("Sentence"), front.index("{{Word}}"))
+        self.assertLess(front.index("{{Word}}"), front.index("Kana"))
+
+    def test_back_blocks_follow_a_custom_order(self):
+        mapping = self._rich_mapping()
+        result = generate_templates(
+            mapping,
+            options=TemplateOptions(
+                back_order=[Role.NOTES, Role.NATIVE_TERM, Role.IMAGE, Role.NATIVE_SENTENCE, Role.NATIVE_READING]
+            ),
+        )
+        back = result.back_html
+        self.assertLess(back.index("Extra"), back.index("{{Meaning}}"))
+        self.assertLess(back.index("{{Meaning}}"), back.index("Pic"))
+        self.assertLess(back.index("Pic"), back.index("MeaningSentence"))
+
+    def test_a_role_missing_from_a_partial_order_still_renders(self):
+        """A partial custom order can reorder blocks but must never drop one."""
+        mapping = self._rich_mapping()
+        result = generate_templates(
+            mapping, options=TemplateOptions(front_order=[Role.TARGET_SENTENCE])
+        )
+        front = result.front_html
+        # Sentence was pulled to the front of the order, but Term/Reading/Pos still appear.
+        self.assertIn("{{Word}}", front)
+        self.assertIn("Kana", front)
+        self.assertIn("Type", front)
+        self.assertLess(front.index("Sentence"), front.index("{{Word}}"))
+
+    def test_primary_prompt_stays_unconditional_regardless_of_position(self):
+        """The front must never be able to render fully empty, no matter the order."""
+        mapping = self._rich_mapping()
+        result = generate_templates(
+            mapping, options=TemplateOptions(front_order=[Role.POS, Role.TARGET_TERM])
+        )
+        self.assertNotIn("{{#Word}}", result.front_html)
+        self.assertIn("{{Word}}</div>", result.front_html)
+
+    def test_custom_order_cannot_move_a_role_to_the_other_side(self):
+        mapping = self._rich_mapping()
+        result = generate_templates(
+            mapping, options=TemplateOptions(front_order=[Role.NATIVE_TERM, Role.TARGET_TERM])
+        )
+        # NATIVE_TERM isn't a valid front role, so it's ignored there, not relocated.
+        self.assertNotIn("{{Meaning}}", result.front_html)
+        self.assertIn("{{Meaning}}", result.back_html)
+
+
+class TestSplitRenderOrder(unittest.TestCase):
+    def test_none_round_trips_to_none(self):
+        self.assertEqual(split_render_order(None), (None, None))
+
+    def test_splits_by_side(self):
+        order = [Role.NOTES, Role.TARGET_SENTENCE, Role.NATIVE_TERM, Role.POS]
+        front, back = split_render_order(order)
+        self.assertEqual(front, [Role.TARGET_SENTENCE, Role.POS])
+        self.assertEqual(back, [Role.NOTES, Role.NATIVE_TERM])
+
+    def test_audio_roles_follow_audio_on_front(self):
+        order = [Role.TARGET_AUDIO, Role.TARGET_TERM, Role.TARGET_SENTENCE_AUDIO]
+        front, back = split_render_order(order, audio_on_front=True)
+        self.assertEqual(front, [Role.TARGET_AUDIO, Role.TARGET_TERM, Role.TARGET_SENTENCE_AUDIO])
+        self.assertEqual(back, [])
+
+        front, back = split_render_order(order, audio_on_front=False)
+        self.assertEqual(front, [Role.TARGET_TERM])
+        self.assertEqual(back, [Role.TARGET_AUDIO, Role.TARGET_SENTENCE_AUDIO])
+
+    def test_result_feeds_generate_templates_directly(self):
+        mapping = simple_mapping(
+            ["Word", "Type", "Meaning"],
+            {Role.TARGET_TERM: "Word", Role.POS: "Type", Role.NATIVE_TERM: "Meaning"},
+        )
+        front_order, back_order = split_render_order([Role.POS, Role.TARGET_TERM])
+        result = generate_templates(
+            mapping, options=TemplateOptions(front_order=front_order, back_order=back_order)
+        )
+        self.assertLess(result.front_html.index("Type"), result.front_html.index("{{Word}}"))
 
 
 if __name__ == "__main__":

@@ -12,9 +12,11 @@ from addon.core.role_schema import FieldBinding, Role, RoleMapping
 from addon.core.template_generator import TemplateOptions
 from addon.ops.tts_batch import (
     AUDIO_DONE_TAG,
+    apply_note_audio,
     finish_audio_batch,
     generate_note_audio,
     notes_needing_audio,
+    plan_note_audio,
 )
 from addon.tts.piper_provider import EmptyTextError
 
@@ -113,6 +115,105 @@ class TestGenerateNoteAudio(unittest.TestCase):
         self.assertEqual(result.fields_written, [])
         self.assertFalse(result.changed)
         self.assertNotIn(AUDIO_DONE_TAG, note.tags)
+
+
+def _synth_all(pending, provider, voice_id):
+    """Stands in for ``ops.tts_runner._synth_one`` -- the bit of the parallel path that
+    would otherwise run on a worker thread -- so these tests can exercise the plan/apply
+    split without spinning up real threads."""
+    synthesized = []
+    for item in pending:
+        try:
+            wav_path = provider.synthesize(item.text, voice_id=voice_id)
+        except EmptyTextError:
+            continue
+        except Exception as exc:  # noqa: BLE001 -- mirrors the real runner's handling
+            return None, "%s: %s" % (type(exc).__name__, exc)
+        synthesized.append((item.audio_field, wav_path))
+    return synthesized, None
+
+
+class TestPlanAndApplyNoteAudio(unittest.TestCase):
+    """The split-out read/write halves that let a batch runner parallelize synthesis
+    (only ``provider.synthesize`` -- pure, no ``col``) while keeping every ``col``/``note``
+    call on one thread. Composing them must reproduce ``generate_note_audio`` exactly."""
+
+    def test_plan_lists_every_bound_audio_role_with_its_raw_source_text(self):
+        col, nt, deck = make_collection()
+        note = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
+
+        pending = plan_note_audio(note, make_mapping())
+
+        self.assertEqual(
+            sorted((p.audio_field, p.text) for p in pending),
+            sorted([("Audio", "hello"), ("SentenceAudio", "hello there")]),
+        )
+
+    def test_plan_includes_empty_source_text_unfiltered(self):
+        """Skipping empty text is the provider's job (``EmptyTextError``), not the plan's --
+        the plan is purely descriptive of what's bound."""
+        col, nt, deck = make_collection()
+        note = col.seed_note(nt, deck, ["hello", "bonjour", "", "", ""])
+
+        pending = plan_note_audio(note, make_mapping())
+
+        self.assertIn(("SentenceAudio", ""), [(p.audio_field, p.text) for p in pending])
+
+    def test_apply_writes_fields_and_tags_like_generate_note_audio(self):
+        col, nt, deck = make_collection()
+        note = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
+
+        result = apply_note_audio(
+            col, note, [("Audio", Path("/tmp/a.wav")), ("SentenceAudio", Path("/tmp/b.wav"))]
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(set(result.fields_written), {"Audio", "SentenceAudio"})
+        self.assertTrue(note["Audio"].startswith("[sound:"))
+        self.assertIn(AUDIO_DONE_TAG, note.tags)
+
+    def test_apply_with_error_writes_nothing_and_leaves_note_untagged(self):
+        col, nt, deck = make_collection()
+        note = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
+
+        result = apply_note_audio(col, note, [], error="RuntimeError: synthesis exploded")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(note["Audio"], "")
+        self.assertNotIn(AUDIO_DONE_TAG, note.tags)
+
+    def test_plan_then_apply_matches_generate_note_audio_on_the_same_note(self):
+        col, nt, deck = make_collection()
+        a = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
+        b = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
+        mapping = make_mapping()
+
+        sequential = generate_note_audio(col, a, mapping, FakeProvider(), VOICE_ID)
+
+        pending = plan_note_audio(b, mapping)
+        synthesized, error = _synth_all(pending, FakeProvider(), VOICE_ID)
+        split = apply_note_audio(col, b, synthesized, error=error)
+
+        self.assertEqual(sequential.ok, split.ok)
+        self.assertEqual(sorted(sequential.fields_written), sorted(split.fields_written))
+        self.assertEqual(AUDIO_DONE_TAG in a.tags, AUDIO_DONE_TAG in b.tags)
+
+    def test_plan_then_apply_matches_generate_note_audio_on_hard_failure(self):
+        col, nt, deck = make_collection()
+        a = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
+        b = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
+        mapping = make_mapping()
+
+        sequential = generate_note_audio(col, a, mapping, FakeProvider(fail_for=["hello"]), VOICE_ID)
+
+        pending = plan_note_audio(b, mapping)
+        synthesized, error = _synth_all(pending, FakeProvider(fail_for=["hello"]), VOICE_ID)
+        split = apply_note_audio(col, b, synthesized or [], error=error)
+
+        self.assertFalse(sequential.ok)
+        self.assertFalse(split.ok)
+        self.assertEqual(a["Audio"], b["Audio"], "both must leave the field untouched")
+        self.assertEqual(AUDIO_DONE_TAG in a.tags, AUDIO_DONE_TAG in b.tags)
 
 
 class TestNotesNeedingAudio(unittest.TestCase):

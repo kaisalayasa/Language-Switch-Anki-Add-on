@@ -21,12 +21,11 @@ from PyPI this session, the same way ``CardLayout``'s behaviour was verified -- 
 
 from __future__ import annotations
 
-from dataclasses import replace
-from pathlib import Path
 from typing import Any, List, Tuple
 
 from aqt import mw
 from aqt.qt import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -34,22 +33,22 @@ from aqt.qt import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QRadioButton,
     QVBoxLayout,
 )
 from aqt.utils import askUser, showInfo, showWarning
 
 from ..core.profiles import match_profile
 from ..core.role_schema import fields_from_notetype
-from ..ops.tts_batch import finish_audio_batch, generate_note_audio, notes_needing_audio
-from ..tts.piper_provider import PiperProvider
+from ..ops.tts_batch import notes_needing_audio
+from ..ops.tts_runner import BatchOutcome, default_concurrency, run_tts_batch
 from ..tts.piper_voice_manager import CURATED_VOICES
 from .convert_dialog import _decks_with_notetypes, addon_config, template_options_from_config
 
 __all__ = ["show_tts_batch_dialog"]
 
-
-def _cache_dir() -> Path:
-    return Path(__file__).resolve().parent.parent / "user_files"
+_DEFAULT_VOICE_ID = "en_GB-alba-medium"
+_BATCH_CHUNK = 500
 
 
 class TtsBatchDialog(QDialog):
@@ -71,15 +70,45 @@ class TtsBatchDialog(QDialog):
         self.voice_box = QComboBox()
         for spec in CURATED_VOICES:
             self.voice_box.addItem(spec.display_name, spec.voice_id)
-        default_voice = addon_config().get("tts_voice")
-        if default_voice:
-            index = self.voice_box.findData(default_voice)
-            if index != -1:
-                self.voice_box.setCurrentIndex(index)
+        default_voice = addon_config().get("tts_voice") or _DEFAULT_VOICE_ID
+        index = self.voice_box.findData(default_voice)
+        if index != -1:
+            self.voice_box.setCurrentIndex(index)
         layout.addWidget(self.voice_box)
 
         self.force_checkbox = QCheckBox("Force regenerate (ignore already-generated audio)")
+        self.force_checkbox.stateChanged.connect(lambda *_args: self._update_limit_options())
         layout.addWidget(self.force_checkbox)
+
+        limit_row = QHBoxLayout()
+        limit_row.addWidget(QLabel("Notes per run:"))
+        self.limit_all_radio = QRadioButton("All")
+        self.limit_chunk_radio = QRadioButton("%d at a time" % _BATCH_CHUNK)
+        self._chunk_tooltip = (
+            "Stop after %d notes instead of doing the whole deck in one run. The rest are "
+            "left for next time -- \"Generate TTS audio\" only ever processes notes that "
+            "don't already have audio, so re-running later just continues where this run "
+            "left off." % _BATCH_CHUNK
+        )
+        self.limit_chunk_radio.setToolTip(self._chunk_tooltip)
+        self.limit_all_radio.setChecked(True)
+        self._limit_group = QButtonGroup(self)
+        self._limit_group.addButton(self.limit_all_radio)
+        self._limit_group.addButton(self.limit_chunk_radio)
+        limit_row.addWidget(self.limit_all_radio)
+        limit_row.addWidget(self.limit_chunk_radio)
+        limit_row.addStretch(1)
+        layout.addLayout(limit_row)
+
+        self.parallel_checkbox = QCheckBox(
+            "Generate multiple notes at once (faster, uses more CPU)"
+        )
+        self.parallel_checkbox.setToolTip(
+            "Runs several Piper syntheses at the same time instead of one after another. "
+            "Faster on most machines, but leave this off on a low-end or already-busy "
+            "computer."
+        )
+        layout.addWidget(self.parallel_checkbox)
 
         backup_row = QHBoxLayout()
         backup_row.addStretch(1)
@@ -103,6 +132,29 @@ class TtsBatchDialog(QDialog):
         self.buttons.accepted.connect(self._start)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
+
+        self.pair_box.currentIndexChanged.connect(lambda *_args: self._update_limit_options())
+        self._update_limit_options()
+
+    # -- limit options, depend on how many notes are actually pending -------
+
+    def _update_limit_options(self) -> None:
+        current = self._current()
+        pending = (
+            len(notes_needing_audio(mw.col, current[1], force=self.force_checkbox.isChecked()))
+            if current is not None
+            else 0
+        )
+        fits_in_one_chunk = pending <= _BATCH_CHUNK
+        self.limit_chunk_radio.setEnabled(not fits_in_one_chunk)
+        if fits_in_one_chunk:
+            self.limit_chunk_radio.setToolTip(
+                "Only %d note%s pending -- same as \"All\" right now."
+                % (pending, "" if pending == 1 else "s")
+            )
+            self.limit_all_radio.setChecked(True)
+        else:
+            self.limit_chunk_radio.setToolTip(self._chunk_tooltip)
 
     # -- backup -----------------------------------------------------------
 
@@ -155,73 +207,64 @@ class TtsBatchDialog(QDialog):
             )
             return
 
+        limit = _BATCH_CHUNK if self.limit_chunk_radio.isChecked() else 0
+        run_count = min(limit, len(note_ids)) if limit else len(note_ids)
+
         config = addon_config()
         if config.get("prompt_for_backup", True):
             proceed = askUser(
-                "About to generate audio for %d notes. This can take a while on first "
+                "About to generate audio for %d notes%s. This can take a while on first "
                 "run (downloading the Piper binary/voice) and writes real audio into "
                 "your notes.\n\nMake sure you have a backup -- use \"Create backup now\" "
                 "below, or Anki backs up automatically on close.\n\nContinue?"
-                % len(note_ids),
+                % (
+                    run_count,
+                    "" if run_count == len(note_ids) else " (of %d pending)" % len(note_ids),
+                ),
                 parent=self,
                 defaultno=False,
             )
             if not proceed:
                 return
 
-        self._run_batch(notetype, mapping, note_ids, voice_id, config)
+        self._run_batch(notetype, mapping, note_ids, voice_id, config, limit)
 
     # -- the batch itself ---------------------------------------------------
 
-    def _run_batch(self, notetype, mapping, note_ids, voice_id, config) -> None:
+    def _run_batch(self, notetype, mapping, note_ids, voice_id, config, limit) -> None:
         self.buttons.setEnabled(False)
         self.status_label.setText("Starting…")
-        provider = PiperProvider(_cache_dir())
-        total = len(note_ids)
-        counters = {"done": 0, "failed": 0}
+        concurrency = default_concurrency() if self.parallel_checkbox.isChecked() else 1
 
-        mw.progress.start(
-            max=total, min=0, label="Generating audio…", parent=self, immediate=True
-        )
-
-        def task() -> None:
-            col = mw.col
-            for i, nid in enumerate(note_ids):
-                if mw.progress.want_cancel():
-                    break
-                note = col.get_note(nid)
-                result = generate_note_audio(col, note, mapping, provider, voice_id)
-                if result.ok:
-                    counters["done"] += 1
-                else:
-                    counters["failed"] += 1
-                mw.taskman.run_on_main(
-                    lambda i=i: mw.progress.update(
-                        label="Generating audio… (%d/%d)" % (i + 1, total),
-                        value=i + 1,
-                        max=total,
-                    )
-                )
-            options = replace(template_options_from_config(config), include_audio=True)
-            finish_audio_batch(
-                col, notetype, mapping, source_css=notetype.get("css", ""), options=options
-            )
-
-        def on_done(future) -> None:
-            mw.progress.finish()
+        def on_done(outcome: BatchOutcome) -> None:
             self.buttons.setEnabled(True)
-            exc = future.exception()
-            if exc is not None:
-                showWarning("TTS batch failed: %r" % (exc,), parent=self)
+            if outcome.error is not None:
+                showWarning("TTS batch failed: %s" % outcome.error, parent=self)
                 return
+            remaining_note = (
+                " %d notes still remain -- run this again to continue." % outcome.remaining
+                if outcome.remaining
+                else ""
+            )
             showInfo(
-                "Done. %d notes generated, %d failed (left for the next run)."
-                % (counters["done"], counters["failed"]),
+                "Done. %d notes generated, %d failed (left for the next run).%s"
+                % (outcome.done, outcome.failed, remaining_note),
                 parent=self,
             )
             self.accept()
 
-        mw.taskman.run_in_background(task, on_done)
+        run_tts_batch(
+            self,
+            notetype,
+            mapping,
+            note_ids,
+            voice_id,
+            config,
+            template_options_from_config=template_options_from_config,
+            limit=limit,
+            concurrency=concurrency,
+            on_done=on_done,
+        )
 
 
 def show_tts_batch_dialog() -> None:

@@ -242,5 +242,43 @@ class TestProfileMatching(unittest.TestCase):
                 self.assertTrue(mapping.validate().ok, mapping.validate().errors)
 
 
+class TestRenderOrder(unittest.TestCase):
+    """The single-screen redesign's drag order, persisted through a saved profile (M6)."""
+
+    def _mapping(self):
+        word = FieldBinding(name="Word", ord=0)
+        meaning = FieldBinding(name="Meaning", ord=1)
+        mapping = RoleMapping(notetype_name="Basic", fields=[word, meaning])
+        mapping.bind(Role.TARGET_TERM, word)
+        mapping.bind(Role.NATIVE_TERM, meaning)
+        return mapping
+
+    def test_defaults_to_none(self):
+        self.assertIsNone(self._mapping().render_order)
+
+    def test_round_trips_through_to_profile_and_from_profile(self):
+        mapping = self._mapping()
+        mapping.render_order = [Role.POS, Role.TARGET_TERM, Role.NOTES]
+
+        data = mapping.to_profile()
+        self.assertEqual(data["render_order"], ["Pos", "TargetTerm", "Notes"])
+
+        rebuilt = RoleMapping.from_profile(data)
+        self.assertEqual(rebuilt.render_order, [Role.POS, Role.TARGET_TERM, Role.NOTES])
+
+    def test_none_round_trips_to_none(self):
+        data = self._mapping().to_profile()
+        self.assertIsNone(data["render_order"])
+        rebuilt = RoleMapping.from_profile(data)
+        self.assertIsNone(rebuilt.render_order)
+
+    def test_missing_key_in_hand_written_profile_json_defaults_to_none(self):
+        """A profile written before render_order existed has no such key at all."""
+        data = self._mapping().to_profile()
+        del data["render_order"]
+        rebuilt = RoleMapping.from_profile(data)
+        self.assertIsNone(rebuilt.render_order)
+
+
 if __name__ == "__main__":
     unittest.main()

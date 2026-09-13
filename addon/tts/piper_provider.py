@@ -47,6 +47,18 @@ class PiperProvider(TTSProvider):
         self._download_to = download_to
         self._run: RunFn = run or _run_subprocess
 
+    def ensure_ready(self, voice_id: str) -> None:
+        """Downloads the Piper binary and this voice if not already cached, without
+        synthesizing anything.
+
+        Call this once, synchronously, before fanning synthesis calls for the same voice
+        out across multiple threads -- ``ensure_piper_binary``/``ensure_voice`` (called
+        internally by :meth:`synthesize`) are not written to be safe against two threads
+        racing to perform the *first* download of the same file at once.
+        """
+        ensure_piper_binary(self.cache_dir, download_to=self._download_to, run=self._run)
+        ensure_voice(self.cache_dir, voice_id, download_to=self._download_to)
+
     def synthesize(self, text: str, *, voice_id: str, out_path: Optional[Path] = None) -> Path:
         clean = sanitize_text(text, allowed_ranges=self.allowed_ranges)
         if not clean:

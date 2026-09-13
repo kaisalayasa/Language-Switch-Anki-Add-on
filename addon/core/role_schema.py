@@ -218,6 +218,12 @@ class RoleMapping:
     #: display and to let the TTS layer pick a voice.
     target_language: Optional[str] = None
     native_language: Optional[str] = None
+    #: A human's preferred whole-card role order (front and back roles mixed together, as
+    #: a single drag-reorderable field list would produce reading its rows top-to-bottom).
+    #: ``None`` means "use the generator's default order". Opaque to this module -- only
+    #: ``template_generator.split_render_order`` interprets it, splitting it into the
+    #: front/back halves ``TemplateOptions`` expects.
+    render_order: Optional[List[Role]] = None
 
     # -- lookup -------------------------------------------------------------
 
@@ -379,11 +385,17 @@ class RoleMapping:
             )
             for f in data.get("fields", [])
         ]
+        render_order_keys = data.get("render_order")
         mapping = cls(
             notetype_name=data.get("notetype", ""),
             fields=declared,
             target_language=data.get("target_language"),
             native_language=data.get("native_language"),
+            render_order=(
+                [Role.from_key(k) for k in render_order_keys]
+                if render_order_keys is not None
+                else None
+            ),
         )
         by_name = {f.name: f for f in declared}
         for role_key, field_names in (data.get("roles") or {}).items():
@@ -425,6 +437,11 @@ class RoleMapping:
             "notetype": self.notetype_name,
             "target_language": self.target_language,
             "native_language": self.native_language,
+            "render_order": (
+                [role.key for role in self.render_order]
+                if self.render_order is not None
+                else None
+            ),
             "fields": [
                 {
                     "name": f.name,
