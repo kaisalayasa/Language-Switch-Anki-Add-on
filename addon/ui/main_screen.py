@@ -19,6 +19,7 @@ language text; then Save as profile / Convert / Generate TTS audio.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -59,7 +60,12 @@ from ..core.role_schema import (
     fields_from_notetype,
     mapping_from_assignments,
 )
-from ..core.template_generator import GeneratedTemplates, generate_templates, split_render_order
+from ..core.template_generator import (
+    GeneratedTemplates,
+    generate_templates,
+    referenced_fields,
+    split_render_order,
+)
 from ..ops.convert_op import convert_op
 from ..ops.tts_batch import notes_needing_audio
 from ..ops.tts_runner import BatchOutcome, default_concurrency, run_tts_batch
@@ -188,6 +194,17 @@ class MainScreen(QDialog):
         self._note_ids: List[int] = []
         self._html_mode = False
         self._html_dirty = False
+        self._target_deck_dirty = False
+        self._tts_cancel_event: Optional[threading.Event] = None
+        self._convert_running = False
+        #: (clone_notetype_name, mapping) set right after a successful Convert, so the very
+        #: next pair-change (auto-selecting that clone) can carry the role mapping forward
+        #: even when the user never saved it as a profile -- cloning preserves field names
+        #: 1:1, so the same mapping is valid on the clone. Without this, a not-yet-profiled
+        #: deck would show a blank field list right after Convert and _direction_is_correct
+        #: would (wrongly) report "not converted yet", contradicting what just happened.
+        #: Consumed once, whether or not it ends up matching -- see _on_pair_changed.
+        self._converted_mapping_override: Optional[Tuple[str, RoleMapping]] = None
 
         layout = QVBoxLayout(self)
 
@@ -202,6 +219,14 @@ class MainScreen(QDialog):
         self.mode_box.addItem("Flip in place", ConversionMode.FLIP_IN_PLACE)
         picker_row.addWidget(self.mode_box)
         layout.addLayout(picker_row)
+        self.mode_box.currentIndexChanged.connect(lambda *_args: self._update_target_deck_default())
+
+        rename_row = QHBoxLayout()
+        rename_row.addWidget(QLabel("New deck name:"))
+        self.target_deck_edit = QLineEdit()
+        self.target_deck_edit.textEdited.connect(self._on_target_deck_edited)
+        rename_row.addWidget(self.target_deck_edit, stretch=1)
+        layout.addLayout(rename_row)
 
         # -- 2. language banner -----------------------------------------------------
         lang_row = QHBoxLayout()
@@ -315,11 +340,26 @@ class MainScreen(QDialog):
         layout.addWidget(self.status_label)
 
         # -- 5. actions ---------------------------------------------------------------
+        # Two separate steps, on purpose: Convert switches the deck's direction; Generate
+        # TTS audio adds audio for whichever language a card currently shows first. Audio
+        # only ever makes sense to generate *after* the direction is right, so "Generate
+        # TTS audio" stays disabled (see _update_action_state/_direction_is_correct) until
+        # the currently selected notetype's own front template already shows the target
+        # language -- checked against the notetype, not just remembered from a click, so a
+        # deck that was already in the right direction to begin with is never blocked.
+        self.flow_hint_label = QLabel("")
+        self.flow_hint_label.setWordWrap(True)
+        layout.addWidget(self.flow_hint_label)
+
         action_row = QHBoxLayout()
         self.save_profile_button = QPushButton("Save as profile…")
         self.save_profile_button.clicked.connect(self._on_save_profile)
         action_row.addWidget(self.save_profile_button)
         action_row.addStretch(1)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setVisible(False)
+        self.stop_button.clicked.connect(self._on_stop_clicked)
+        action_row.addWidget(self.stop_button)
         self.convert_button = QPushButton("Convert")
         self.convert_button.clicked.connect(self._on_convert)
         action_row.addWidget(self.convert_button)
@@ -336,6 +376,32 @@ class MainScreen(QDialog):
         self._refresh_pairs()
 
     # -- deck/notetype selection --------------------------------------------------
+
+    def _refresh_anki_main_window(self) -> None:
+        """Refresh Anki's own deck browser so a new/changed deck shows up without the
+        user having to manually refresh it themselves.
+
+        Defensive rather than a hard dependency: ``aqt.deckbrowser.DeckBrowser.refresh``
+        is a long-standing, stable widget method (it just re-reads deck stats and
+        redraws), safe to call even when the deck browser isn't the screen currently
+        shown -- but per ``claude.md``'s "never guess an Anki API" rule, this is wrapped
+        so a future Anki build that removed or renamed it degrades to a no-op instead of
+        crashing the (already-successful) conversion.
+        """
+        deck_browser = getattr(mw, "deckBrowser", None)
+        refresh = getattr(deck_browser, "refresh", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:  # noqa: BLE001 -- best-effort UI refresh, never fatal
+                pass
+
+    def closeEvent(self, event: Any) -> None:  # noqa: N802 -- Qt override signature
+        # Safety net: if something changed during this session that the deck browser
+        # never picked up live (see _refresh_anki_main_window), make sure it's caught up
+        # by the time the user closes this screen and looks at Anki again.
+        self._refresh_anki_main_window()
+        super().closeEvent(event)
 
     def _refresh_pairs(self) -> None:
         self._pairs = _decks_with_notetypes(mw.col)
@@ -368,6 +434,13 @@ class MainScreen(QDialog):
         match = match_profile(notetype_name, self._live_fields)
         if match.usable:
             mapping = match.profile.to_mapping(live_fields=self._live_fields)
+        elif (
+            self._converted_mapping_override is not None
+            and self._converted_mapping_override[0] == notetype_name
+        ):
+            # The pair a Convert just finished on -- see the field's own docstring.
+            mapping = self._converted_mapping_override[1]
+            self._converted_mapping_override = None
         else:
             mapping = RoleMapping(
                 notetype_name=notetype_name,
@@ -390,9 +463,38 @@ class MainScreen(QDialog):
         self.fields_button.setChecked(True)
         self.stack.setCurrentWidget(self.field_list)
 
+        self._target_deck_dirty = False
+        self._update_target_deck_default()
+
         self._update_language_banner()
         self._update_tts_limit_options()
+        self._update_action_state()
         self._refresh_preview()
+
+    def _on_target_deck_edited(self, _text: str) -> None:
+        self._target_deck_dirty = True
+
+    def _update_target_deck_default(self) -> None:
+        """Refills "New deck name" with a sensible default -- unless the user has typed
+        their own, which stays put until the deck/notetype pair itself changes. Flip in
+        place never creates a separate deck (notes stay put; only the notetype changes),
+        so the field is locked to the source deck's own name and disabled while that mode
+        is selected."""
+        if not self._deck_name:
+            return
+        if self.mode_box.currentData() is ConversionMode.FLIP_IN_PLACE:
+            self.target_deck_edit.setText(self._deck_name)
+            self.target_deck_edit.setEnabled(False)
+            self.target_deck_edit.setToolTip(
+                "Flip in place keeps notes in their original deck -- there's no new deck "
+                "to name."
+            )
+            return
+        self.target_deck_edit.setEnabled(True)
+        self.target_deck_edit.setToolTip("")
+        if not self._target_deck_dirty:
+            suffix = addon_config().get("name_suffix", "Converted")
+            self.target_deck_edit.setText("%s (%s)" % (self._deck_name, suffix))
 
     def _update_tts_limit_options(self) -> None:
         if self._notetype is None:
@@ -408,6 +510,57 @@ class MainScreen(QDialog):
             self.tts_limit_all_radio.setChecked(True)
         else:
             self.tts_limit_chunk_radio.setToolTip(self._tts_chunk_tooltip)
+
+    # -- Convert-before-Audio gate ----------------------------------------------------
+
+    def _direction_is_correct(self) -> bool:
+        """Whether the currently selected notetype's real, on-disk front template already
+        shows target-language content -- i.e. whether Convert has already been run against
+        it (or it was already in the right direction to begin with).
+
+        Checked against the *live* ``qfmt`` (``self._notetype``), not against what
+        ``_current_templates()`` would freshly generate -- that's always computable from
+        the mapping alone, converted or not, so it can't tell the two apart. This can.
+        """
+        if self._notetype is None or not self._notetype.get("tmpls"):
+            return False
+        try:
+            mapping = self._current_mapping()
+        except ValidationError:
+            return False
+        live_front_fields = referenced_fields(self._notetype["tmpls"][0].get("qfmt", ""))
+        for role in (Role.TARGET_TERM, Role.TARGET_SENTENCE):
+            binding = mapping.first(role)
+            if binding is not None and binding.name in live_front_fields:
+                return True
+        return False
+
+    def _is_busy(self) -> bool:
+        return self._convert_running or self._tts_cancel_event is not None
+
+    def _update_action_state(self) -> None:
+        busy = self._is_busy()
+        correct = self._direction_is_correct()
+        self.convert_button.setEnabled(not busy)
+        self.generate_button.setEnabled(correct and not busy)
+        if correct:
+            self.generate_button.setToolTip("")
+            self.flow_hint_label.setText(
+                "This deck's direction is already switched -- Generate TTS audio is ready. "
+                "It writes real audio in the background; you can click Stop at any time "
+                "and continue right where you left off later."
+            )
+        else:
+            self.generate_button.setToolTip(
+                "Convert this deck's direction first -- Generate TTS audio only works once "
+                "the target language is already on the front of the card."
+            )
+            self.flow_hint_label.setText(
+                "Step 1: click Convert to switch this deck's direction. Step 2: once "
+                "switched, come back here and click Generate TTS audio -- it writes real "
+                "audio in the background, and you can click Stop at any time and continue "
+                "right where you left off later."
+            )
 
     # -- language banner ------------------------------------------------------------
 
@@ -469,6 +622,7 @@ class MainScreen(QDialog):
 
     def _on_field_or_language_changed(self) -> None:
         self._update_language_banner()
+        self._update_action_state()
         self._refresh_preview()
 
     def _refresh_preview(self) -> None:
@@ -622,11 +776,14 @@ class MainScreen(QDialog):
 
         mapping = self._current_mapping()
         config = addon_config()
+        mode = self.mode_box.currentData()
+        source_deck_at_start = self._deck_name
         plan = build_plan(
-            mode=self.mode_box.currentData(),
+            mode=mode,
             mapping=mapping,
             source_notetype=self._notetype_name,
             source_deck=self._deck_name,
+            target_deck=self.target_deck_edit.text().strip() or None,
             suffix=config.get("name_suffix", "Converted"),
             dry_run=False,
         )
@@ -638,16 +795,44 @@ class MainScreen(QDialog):
             showWarning("Cannot convert:\n\n" + "\n".join(validation.errors), parent=self)
             return
 
-        self.convert_button.setEnabled(False)
+        self._convert_running = True
+        self._update_action_state()
 
         def done(result: Any) -> None:
-            self.convert_button.setEnabled(True)
+            self._convert_running = False
             if result is None:
+                self._update_action_state()
                 return
             showInfo("\n".join(result.messages), parent=self)
-            deck_name = mw.col.decks.name(result.target_deck_id)
+            # Flip in place never creates or moves to a new deck -- apply_plan leaves
+            # result.target_deck_id at 0 for that mode, and mw.col.decks.name(0) is not a
+            # real deck, so it must never be consulted here. Read from a variable captured
+            # *before* the (async) conversion ran, not self._deck_name, in case the pair
+            # dropdown got changed while the conversion was still in flight.
+            deck_name = (
+                mw.col.decks.name(result.target_deck_id)
+                if mode is ConversionMode.NEW_DECK
+                else source_deck_at_start
+            )
+            # Cloning preserves field names/order 1:1, so this exact mapping (role bindings
+            # don't change through a conversion -- only which side the template puts them
+            # on does) is already correct for the clone, whether or not it was ever saved
+            # as a profile. Without this, a not-yet-profiled deck would land on the new
+            # pair with a blank field list, and Generate TTS audio would look "not
+            # converted yet" even though it just was.
+            self._converted_mapping_override = (result.clone_notetype_name, mapping)
             self._refresh_pairs()
+            # _select_pair (via _on_pair_changed) already calls _update_action_state, and
+            # the notetype it now points at is the freshly-converted clone -- Generate TTS
+            # audio unlocks immediately, no separate re-check needed.
             self._select_pair(deck_name, result.clone_notetype_name)
+            # CollectionOp's own mw.col.op_made_changes(changes)-driven refresh doesn't
+            # reliably pick up the new deck here (see docs/api-notes.md) -- the deck
+            # creation and note writes happened before the undo marker CollectionOp's
+            # changes object actually describes, so Anki's own deck browser can be left
+            # showing stale state even though the addon's own dropdown updates fine.
+            # Refresh it explicitly rather than rely on that.
+            self._refresh_anki_main_window()
 
         convert_op(
             self, plan, templates, expected_note_count=len(plan.note_ids), on_success=done
@@ -696,6 +881,15 @@ class MainScreen(QDialog):
 
         self._run_tts_batch(self._notetype, mapping, note_ids, voice_id, config, limit)
 
+    def _on_stop_clicked(self) -> None:
+        if self._tts_cancel_event is not None:
+            self._tts_cancel_event.set()
+        self.stop_button.setEnabled(False)
+        self.status_label.setText(
+            "Stopping after the note currently in progress… audio already generated is "
+            "kept, and you can continue right where this leaves off later."
+        )
+
     def _run_tts_batch(
         self,
         notetype: dict,
@@ -705,25 +899,36 @@ class MainScreen(QDialog):
         config: dict,
         limit: int,
     ) -> None:
-        self.generate_button.setEnabled(False)
-        self.status_label.setText("Starting…")
+        self._tts_cancel_event = threading.Event()
+        self._update_action_state()
+        self.stop_button.setEnabled(True)
+        self.stop_button.setVisible(True)
+        self.status_label.setText(
+            "Generating audio… click Stop at any time -- audio already generated is kept, "
+            "and you can continue right where you left off later."
+        )
         concurrency = default_concurrency() if self.tts_parallel_check.isChecked() else 1
 
         def on_done(outcome: BatchOutcome) -> None:
-            self.generate_button.setEnabled(True)
+            self.stop_button.setVisible(False)
+            self._tts_cancel_event = None
             if outcome.error is not None:
+                self._update_action_state()
                 showWarning("TTS batch failed: %s" % outcome.error, parent=self)
                 return
             remaining_note = (
-                " %d notes still remain -- run this again to continue." % outcome.remaining
+                " %d notes still remain -- run this again anytime to continue." % outcome.remaining
                 if outcome.remaining
                 else ""
             )
+            headline = "Stopped early." if outcome.cancelled else "Done."
             showInfo(
-                "Done. %d notes generated, %d failed (left for the next run).%s"
-                % (outcome.done, outcome.failed, remaining_note),
+                "%s %d notes generated, %d failed.%s"
+                % (headline, outcome.done, outcome.failed, remaining_note),
                 parent=self,
             )
+            # Refreshes the whole pair's state, including _update_action_state, from the
+            # live notetype -- covers the "audio done" case the same way as any error path.
             self._on_pair_changed(self.pair_box.currentIndex())
 
         run_tts_batch(
@@ -736,6 +941,7 @@ class MainScreen(QDialog):
             template_options_from_config=template_options_from_config,
             limit=limit,
             concurrency=concurrency,
+            cancel_event=self._tts_cancel_event,
             on_done=on_done,
         )
 

@@ -44,6 +44,7 @@ __all__ = [
     "GeneratedTemplates",
     "generate_templates",
     "split_render_order",
+    "referenced_fields",
     "GENERATED_CSS_MARKER",
 ]
 
@@ -186,7 +187,7 @@ def generate_templates(
         back_html=back,
         css=css,
         template_name=opts.template_name,
-        referenced_fields=_referenced_fields(front, back),
+        referenced_fields=referenced_fields(front, back),
     )
 
 
@@ -320,7 +321,7 @@ def _append_css(source_css: str) -> str:
     return (base.rstrip() + "\n\n" + generated).lstrip("\n")
 
 
-def _referenced_fields(*html: str) -> List[str]:
+def referenced_fields(*html: str) -> List[str]:
     """Every field name the generated HTML mentions, including conditional sections."""
     found: List[str] = []
     for chunk in html:

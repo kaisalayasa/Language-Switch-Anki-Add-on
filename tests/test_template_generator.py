@@ -13,6 +13,7 @@ from addon.core.template_generator import (
     GENERATED_CSS_MARKER,
     TemplateOptions,
     generate_templates,
+    referenced_fields,
     split_render_order,
 )
 
@@ -454,6 +455,32 @@ class TestSplitRenderOrder(unittest.TestCase):
             mapping, options=TemplateOptions(front_order=front_order, back_order=back_order)
         )
         self.assertLess(result.front_html.index("Type"), result.front_html.index("{{Word}}"))
+
+
+class TestReferencedFields(unittest.TestCase):
+    """Promoted from a private helper to public API (``ui/main_screen.py`` uses it to check
+    whether a *live*, on-disk template already shows a given field -- the "has this deck
+    actually been converted yet" gate on the "Generate TTS audio" button)."""
+
+    def test_plain_reference(self):
+        self.assertEqual(referenced_fields("{{Word}}"), ["Word"])
+
+    def test_filtered_reference(self):
+        self.assertEqual(referenced_fields("{{furigana:Reading}}"), ["Reading"])
+
+    def test_conditional_sections_count_as_references(self):
+        self.assertEqual(referenced_fields("{{#Sentence}}{{Sentence}}{{/Sentence}}"), ["Sentence"])
+
+    def test_builtin_anki_fields_are_excluded(self):
+        self.assertEqual(referenced_fields("{{FrontSide}}{{Tags}}{{Word}}"), ["Word"])
+
+    def test_absent_field_is_not_reported(self):
+        self.assertNotIn("Meaning", referenced_fields("{{Word}}"))
+
+    def test_multiple_html_chunks_are_combined_without_duplicates(self):
+        self.assertEqual(
+            referenced_fields("{{Word}}", "{{Word}}{{Meaning}}"), ["Word", "Meaning"]
+        )
 
 
 if __name__ == "__main__":

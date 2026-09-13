@@ -224,5 +224,46 @@ class TestGuardrails(unittest.TestCase):
         self.assertEqual(len(col.notetypes), before, "no clone may be created")
 
 
+class _FlakyOnceCollection(FakeCollection):
+    """Simulates a real-world report: the *first* ``merge_undo_entries`` call still raises
+    "target undo op not found" even though ``apply_plan``'s marker already sits after every
+    schema-level call it knows about (see docs/api-notes.md) -- exercising the retry
+    recovery in ``apply_plan`` rather than the normal, already-covered success path."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.merge_attempts = 0
+
+    def merge_undo_entries(self, target):
+        self.merge_attempts += 1
+        if self.merge_attempts == 1:
+            self._pending_undo_tokens.pop(target, None)
+            raise RuntimeError("target undo op not found")
+        return super().merge_undo_entries(target)
+
+
+class TestUndoMergeRecovery(unittest.TestCase):
+    def test_a_flaky_first_merge_does_not_fail_the_conversion(self):
+        col = _FlakyOnceCollection()
+        src = col.add_notetype("Starter", FIELDS, css=".card { color: White; }")
+        deck = col.add_deck("Starter")
+        col.seed_note(src, deck, ["word0", "meaning0", "[sound:s0.mp3]", "0"])
+        plan = make_plan(col, ConversionMode.NEW_DECK)
+
+        result = run(col, plan)
+
+        self.assertEqual(result.notes_converted, 1)
+        self.assertEqual(col.merge_attempts, 2, "must have retried exactly once, not raised")
+        self.assertTrue(
+            any("Done:" in m for m in result.messages),
+            "a flaky first merge must still end in a normal success message: %r" % result.messages,
+        )
+        self.assertFalse(
+            any("undo" in m.lower() for m in result.messages),
+            "the retry is an internal recovery, not something to surface to the user: %r"
+            % result.messages,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
