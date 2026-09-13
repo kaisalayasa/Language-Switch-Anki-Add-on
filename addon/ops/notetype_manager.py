@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ..core.conversion import ConversionMode, ConversionPlan
 
-__all__ = ["ConversionResult", "ApiMismatch", "apply_plan", "probe_api"]
+__all__ = ["ConversionResult", "ApiMismatch", "apply_plan", "probe_api", "shape_notetype"]
 
 
 class ApiMismatch(RuntimeError):
@@ -147,7 +147,7 @@ def _unique_notetype_name(col: Any, desired: str) -> str:
         suffix += 1
 
 
-def _shape_notetype(source: Dict[str, Any], *, name: str, front: str, back: str,
+def shape_notetype(source: Dict[str, Any], *, name: str, front: str, back: str,
                     css: str, template_name: str) -> Dict[str, Any]:
     """Build the notetype dict a clone should be saved as."""
     shaped = copy.deepcopy(source)
@@ -181,7 +181,7 @@ def build_clone(col: Any, plan: ConversionPlan, front: str, back: str, css: str,
         raise ApiMismatch("notetype %r not found" % plan.source_notetype)
 
     name = _unique_notetype_name(col, plan.clone_notetype)
-    clone = _shape_notetype(source, name=name, front=front, back=back, css=css,
+    clone = shape_notetype(source, name=name, front=front, back=back, css=css,
                             template_name=template_name)
 
     added = _call_checked(col.models.add_dict, "col.models.add_dict", notetype=clone)

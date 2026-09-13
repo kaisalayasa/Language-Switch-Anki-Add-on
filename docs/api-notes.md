@@ -22,6 +22,33 @@ Verified by string-inspecting the compiled modules under
 | GUI | `gui_hooks.main_window_did_init` · `profile_did_open` · `browser_menus_did_init`; `mw.form.menuTools`; `mw.progress.{start, update, finish, want_cancel, set_title}` |
 | Later milestones | `aqt.clayout.CardLayout` (M3 preview) · `aqt/import_export/import_dialog` (M3 prior art) · `aqt.import_export.exporting.ApkgExporter` with `with_media` / `with_scheduling` |
 
+## Background progress/threading (M5) — confirmed against real `aqt` source, 2026-09-13
+
+Batch TTS generation needed incremental per-note progress and cancellation, which
+`CollectionOp`/`QueryOp` don't expose (they bracket one atomic `op(col) -> result`, not a
+running counter). Pulled the same `aqt==26.8.1` wheel used for the `CardLayout` work and read
+`aqt/taskman.py` + `aqt/progress.py` directly rather than guess at the lower-level API:
+
+- `mw.taskman.run_in_background(task, on_done=None, args=None, uses_collection=True) -> Future`
+  — `task` runs on a single dedicated collection-executor worker thread (all
+  collection-touching background work in Anki is serialized through that one thread, so a
+  long batch blocking it for its whole duration is expected, not a problem). `on_done` is
+  called back on the **main thread** (`taskman.py`'s `run_on_main` marshals it via a queued
+  Qt signal — confirmed the same way for `CollectionOp`'s own `success()` during the
+  `CardLayout` investigation).
+- `mw.progress.start(max=0, min=0, label=None, parent=None, immediate=False, title="Anki")`
+  / `.finish()` — call from the **main thread**, bracketing the whole background task, the
+  same way `CollectionOp` does internally via `taskman.with_progress`.
+- `mw.progress.update(label=None, value=None, max=None, ...)` **must** run on the main
+  thread — it has an explicit `if not self.mw.inMainThread(): print(...); return` guard.
+  From the worker thread, call it via `mw.taskman.run_on_main(lambda: mw.progress.update(...))`.
+- `mw.progress.want_cancel() -> bool` has **no** such guard — it's a plain read of
+  `ProgressDialog.wantCancel` (set when the user presses Escape or tries to close the
+  progress window), safe to poll directly from the background loop with no marshaling.
+- `col.create_backup(*, backup_folder: str, force: bool, wait_for_completion: bool) -> bool`
+  (confirmed from `anki/collection.py`) plus `mw.pm.backupFolder() -> str` (confirmed from
+  `aqt/profiles.py`) together back the batch dialog's "Create backup now" button.
+
 ## Piper facts (M2) — verified against the real GitHub/HuggingFace APIs, 2026-09-12
 
 Not Anki APIs, but the same "never guess" discipline applies: getting a download URL or

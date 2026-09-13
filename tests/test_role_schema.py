@@ -13,6 +13,7 @@ from addon.core.profiles import (
     match_profile,
 )
 from addon.core.role_schema import (
+    AUDIO_SOURCE_ROLES,
     FieldAssignment,
     FieldBinding,
     Role,
@@ -196,6 +197,22 @@ class TestAssignmentRoundTrip(unittest.TestCase):
         rows = assignments_from_mapping(mapping)
         self.assertEqual(len(rows), 1)
         self.assertIn(rows[0].role, (Role.TARGET_TERM, Role.TARGET_SENTENCE))
+
+
+class TestAudioSourceRoles(unittest.TestCase):
+    """M5's synthesis pairing: which text role backs which audio role."""
+
+    def test_only_target_side_audio_is_synthesized(self):
+        """Per claude.md's "audio is a replacement, not an addition" -- native audio is
+        never (re)synthesized by this addon."""
+        self.assertEqual(
+            set(AUDIO_SOURCE_ROLES),
+            {Role.TARGET_AUDIO, Role.TARGET_SENTENCE_AUDIO},
+        )
+
+    def test_pairs_audio_with_its_matching_content_role(self):
+        self.assertIs(AUDIO_SOURCE_ROLES[Role.TARGET_AUDIO], Role.TARGET_TERM)
+        self.assertIs(AUDIO_SOURCE_ROLES[Role.TARGET_SENTENCE_AUDIO], Role.TARGET_SENTENCE)
 
 
 class TestProfileMatching(unittest.TestCase):
