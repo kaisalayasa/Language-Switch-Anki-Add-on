@@ -14,7 +14,8 @@ Anki, no real Piper, in the test suite.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..core.role_schema import AUDIO_SOURCE_ROLES, RoleMapping
 from ..core.template_generator import TemplateOptions, generate_templates
@@ -25,8 +26,11 @@ from .notetype_manager import shape_notetype
 __all__ = [
     "AUDIO_DONE_TAG",
     "NoteAudioResult",
+    "PendingSynthesis",
     "notes_needing_audio",
     "generate_note_audio",
+    "plan_note_audio",
+    "apply_note_audio",
     "finish_audio_batch",
 ]
 
@@ -110,6 +114,69 @@ def generate_note_audio(
         note[audio_field.name] = "[sound:%s]" % filename
         result.fields_written.append(audio_field.name)
 
+    if result.changed:
+        if AUDIO_DONE_TAG not in note.tags:
+            note.tags.append(AUDIO_DONE_TAG)
+        col.update_note(note)
+    return result
+
+
+@dataclass(frozen=True)
+class PendingSynthesis:
+    """One audio field a note still needs, with the raw source text to speak."""
+
+    audio_field: str
+    text: str
+
+
+def plan_note_audio(note: Any, mapping: RoleMapping) -> List[PendingSynthesis]:
+    """The read-only half of :func:`generate_note_audio`: what needs (re)synthesizing for
+    this note, without calling a provider or writing anything.
+
+    Split out so a batch runner can synthesize many notes' text concurrently in a thread
+    pool -- safe, since this and :func:`~addon.tts.piper_provider.PiperProvider.synthesize`
+    touch no shared state -- while still writing every result back into the collection one
+    note at a time via :func:`apply_note_audio`, on whichever single thread owns ``col``.
+    Anki's collection is not documented as safe for concurrent access from multiple Python
+    threads, so nothing here or in a caller may call a ``col``/``note`` method from more
+    than one thread at once.
+    """
+    pending: List[PendingSynthesis] = []
+    for audio_role, source_role in AUDIO_SOURCE_ROLES.items():
+        audio_field = mapping.first(audio_role)
+        source_field = mapping.first(source_role)
+        if audio_field is None or source_field is None:
+            continue
+        try:
+            text = note[source_field.name]
+        except (KeyError, IndexError):
+            continue
+        pending.append(PendingSynthesis(audio_field.name, text))
+    return pending
+
+
+def apply_note_audio(
+    col: Any,
+    note: Any,
+    synthesized: List[Tuple[str, Path]],
+    *,
+    error: Optional[str] = None,
+) -> NoteAudioResult:
+    """The write-only half of :func:`generate_note_audio`: writes already-synthesized
+    ``(audio_field_name, wav_path)`` pairs into ``note``, atomically, exactly like it does.
+
+    Pass ``error`` for a hard synthesis failure (anything but "nothing to say") -- nothing
+    is written and the note is left untagged, so it's retried on the next run, matching
+    "one bad note must not sink the batch, but must not be falsely marked done either."
+    """
+    result = NoteAudioResult(note_id=note.id)
+    if error is not None:
+        result.error = error
+        return result
+    for audio_field, wav_path in synthesized:
+        filename = col.media.add_file(str(wav_path))
+        note[audio_field] = "[sound:%s]" % filename
+        result.fields_written.append(audio_field)
     if result.changed:
         if AUDIO_DONE_TAG not in note.tags:
             note.tags.append(AUDIO_DONE_TAG)

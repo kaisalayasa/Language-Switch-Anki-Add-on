@@ -91,6 +91,49 @@ class TestPiperProviderSynthesize(unittest.TestCase):
             with self.assertRaises(SynthesisError):
                 provider.synthesize("hello there", voice_id="en_US-lessac-medium")
 
+    def test_ensure_ready_downloads_binary_and_voice_without_synthesizing(self):
+        calls = []
+
+        def fake_run(argv, input_text=None):
+            calls.append(argv)
+            assert "--version" in argv, "must not invoke Piper for anything but the check"
+            return SubprocessResult(0, "piper 1.2.0", "")
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            _prepopulate_binary(cache_dir)
+            provider = PiperProvider(
+                cache_dir, download_to=_stub_voice_download, run=fake_run
+            )
+
+            provider.ensure_ready("en_US-lessac-medium")
+
+            onnx = Path(cache_dir) / "voices" / "en_US-lessac-medium.onnx"
+            config = Path(cache_dir) / "voices" / "en_US-lessac-medium.onnx.json"
+            self.assertTrue(onnx.exists())
+            self.assertTrue(config.exists())
+            self.assertTrue(all("--version" in argv for argv in calls))
+
+    def test_ensure_ready_is_idempotent(self):
+        """Safe to call again (e.g. once per voice change) -- must not re-download."""
+        with tempfile.TemporaryDirectory() as cache_dir:
+            _prepopulate_binary(cache_dir)
+            downloads = []
+
+            def counting_download(url, dest):
+                downloads.append(url)
+                _stub_voice_download(url, dest)
+
+            provider = PiperProvider(
+                cache_dir,
+                download_to=counting_download,
+                run=lambda argv, input_text=None: SubprocessResult(0, "piper 1.2.0", ""),
+            )
+
+            provider.ensure_ready("en_US-lessac-medium")
+            provider.ensure_ready("en_US-lessac-medium")
+
+            self.assertEqual(len(downloads), 2, "onnx + json, only on the first call")
+
     def test_missing_output_file_raises_synthesis_error(self):
         """Piper exits 0 but never actually writes the file -- must not be reported as success."""
         def fake_run(argv, input_text=None):

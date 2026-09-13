@@ -12,7 +12,19 @@ connects M2's standalone Piper TTS pipeline to real notes for the first time: **
 Generate TTS audio…** batch-synthesizes and writes audio into a converted deck's notes, with
 progress, cancellation, and resumability (a re-run only processes notes that don't already
 have generated audio, tracked via the `ddc-tts-generated` tag), then flips the notetype's
-template on to actually reference the new audio. M6 makes a hand-built field mapping
+template on to actually reference the new audio. Two knobs on top of that basic loop, shared
+by both this dialog and the single-screen "Generate TTS audio" button below (one runner,
+`addon/ops/tts_runner.py`, so the logic exists once): a **"Notes per run" radio (All / 500 at
+a time)** stops a run after 500 notes and simply leaves the rest untagged, so a very large
+deck can be done in deliberately-sized chunks over several sittings instead of one long run
+-- the "500 at a time" option disables itself (falling back to "All") whenever fewer than
+500 notes are actually pending, since it wouldn't do anything different; **"Generate
+multiple notes at once"** opts into synthesizing several notes' audio concurrently (a small
+`ThreadPoolExecutor` of real Piper subprocesses -- capped at 4 workers and scaled down on
+small machines by `default_concurrency()`, off by default so it never surprises a low-end
+machine). Only the synthesis call itself is ever parallelized; every actual collection
+read/write stays on the single background thread the batch already ran on sequentially --
+see the module docstring for why that boundary matters. M6 makes a hand-built field mapping
 reusable: **"Save as profile…"** in the mapper dialog writes the current mapping out as JSON
 into `addon/user_files/profiles/`, and every dialog that resolves a mapping (Convert,
 Preview, Generate TTS audio) already picks up a saved profile automatically next time the
@@ -68,7 +80,7 @@ docs/          deck-facts.md (verified ground truth), api-notes.md
 ## Development
 
 ```bash
-python -m unittest discover -s tests -t .   # 168 tests, no Anki needed, no network needed
+python -m unittest discover -s tests -t .   # 193 tests, no Anki needed, no network needed
 python tools/preview_templates.py core2000  # see the generated templates
 python tools/install_dev.py --link          # install into Anki (close Anki first)
 ```
@@ -81,6 +93,29 @@ TTS audio… (M5)** (batch-writes audio into a converted deck's notes), then a s
 first synthesis of any kind downloads the Piper binary (~20MB) and voice model (~60MB) into
 `addon/user_files/` (gitignored, never wiped by an addon update); later runs are cached, and
 saved profiles live in that same gitignored directory.
+
+There's also **Tools → "Deck Direction Converter — new single screen (testing)…"**, a
+second, separate entry rolled out *alongside* the submenu above, not replacing it yet: one
+dialog (`addon/ui/main_screen.py`) combining the deck/mode picker, a language-detection
+banner with a manual override, a field/role list on the left (or, toggled on, a raw
+Front/Back/Styling HTML editor) next to a live preview pane on the right, voice sampling,
+and the Convert/Generate-TTS-audio buttons, all in one screen. The field list hides a
+profile's `hidden` fields by default (Core 2000 alone marks nine bookkeeping fields this
+way -- real clutter in a list that long) behind a "Show hidden fields" checkbox above it.
+An earlier drag-to-reorder feature on that list was tried and then deliberately
+dropped after review, so field order now just follows a saved profile's order or plain
+notetype order, never an ad hoc drag. "Sample" next to the voice picker speaks the *current
+note's* own target-language text -- sentence first, falling back to the term only for a
+word-only note -- rather than a canned phrase, so it previews this deck's real content and
+how it actually sounds in context; the default voice everywhere a voice picker appears is
+the UK voice, "alba" (`en_GB-alba-medium`, `addon/config.json`'s `tts_voice`). It reuses the
+exact same `core`/`ops` logic as the submenu's dialogs — nothing about what a conversion or
+a TTS batch *does* changes, only how you reach it. **Unverified in real Anki as of this
+write-up**
+— the live preview drives a raw `AnkiWebView` directly for the first time in this codebase
+(ported from `aqt.clayout.CardLayout`'s own pattern, but never actually opened in a live
+Anki process yet). Once it's confirmed working end to end, the old submenu and the six
+dialog files it opens are removed and this becomes the only entry point.
 
 To install a real, packaged copy (rather than the dev symlink above):
 

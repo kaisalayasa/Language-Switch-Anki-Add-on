@@ -63,11 +63,10 @@ class PiperTestDialog(QDialog):
             self.voice_combo.addItem(spec.display_name, spec.voice_id)
         default_voice = (mw.addonManager.getConfig(__name__.split(".")[0]) or {}).get(
             "tts_voice"
-        )
-        if default_voice:
-            index = self.voice_combo.findData(default_voice)
-            if index != -1:
-                self.voice_combo.setCurrentIndex(index)
+        ) or "en_GB-alba-medium"
+        index = self.voice_combo.findData(default_voice)
+        if index != -1:
+            self.voice_combo.setCurrentIndex(index)
         layout.addWidget(self.voice_combo)
 
         self.status_label = QLabel("")

@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field as _dc_field
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 from .role_schema import FieldBinding, Role, RoleMapping
 
@@ -43,6 +43,7 @@ __all__ = [
     "TemplateOptions",
     "GeneratedTemplates",
     "generate_templates",
+    "split_render_order",
     "GENERATED_CSS_MARKER",
 ]
 
@@ -73,6 +74,15 @@ class TemplateOptions:
     template_name: str = "Production"
     #: Appended to the source CSS. Set False to manage styling entirely by hand.
     append_css: bool = True
+    #: Override the order front/back role-blocks are emitted in. ``None`` (the default,
+    #: and what every caller used before this option existed) reproduces the fixed order
+    #: below byte-for-byte. A role valid for that side but missing from a given order is
+    #: appended in its default position rather than silently dropped -- a partial custom
+    #: order can reorder blocks but can never make one disappear. See
+    #: :func:`split_render_order` for turning one whole-card order (e.g. from a
+    #: drag-reorderable field list) into this pair.
+    front_order: Optional[Sequence[Role]] = None
+    back_order: Optional[Sequence[Role]] = None
 
 
 @dataclass
@@ -180,40 +190,98 @@ def generate_templates(
     )
 
 
+#: Roles eligible for the front, in the fixed default order -- exactly what the generator
+#: emitted before ``front_order``/``back_order`` existed.
+_FRONT_ROLES: Tuple[Role, ...] = (
+    Role.TARGET_TERM, Role.TARGET_READING, Role.POS, Role.TARGET_SENTENCE,
+)
+_FRONT_CLASSES = {
+    Role.TARGET_TERM: "%s-target-term" % _PREFIX,
+    Role.TARGET_READING: "%s-target-reading" % _PREFIX,
+    Role.POS: "%s-pos" % _PREFIX,
+    Role.TARGET_SENTENCE: "%s-target-sentence" % _PREFIX,
+}
+
+#: Roles eligible for the back, in the fixed default order.
+_BACK_ROLES: Tuple[Role, ...] = (
+    Role.NATIVE_TERM, Role.NATIVE_READING, Role.NATIVE_SENTENCE, Role.IMAGE, Role.NOTES,
+)
+_BACK_CLASSES = {
+    Role.NATIVE_TERM: "%s-native-term" % _PREFIX,
+    Role.NATIVE_READING: "%s-native-reading" % _PREFIX,
+    Role.NATIVE_SENTENCE: "%s-native-sentence" % _PREFIX,
+    Role.IMAGE: "%s-image" % _PREFIX,
+    Role.NOTES: "%s-notes" % _PREFIX,
+}
+
+_AUDIO_ROLES = (Role.TARGET_AUDIO, Role.TARGET_SENTENCE_AUDIO)
+
+
+def _resolve_order(
+    default_order: Sequence[Role], custom_order: Optional[Sequence[Role]]
+) -> List[Role]:
+    """``custom_order`` filtered to roles valid for this side, plus any valid role it left
+    out appended in its default position -- so a partial custom order can reorder blocks
+    but never silently drops one."""
+    if custom_order is None:
+        return list(default_order)
+    valid = set(default_order)
+    ordered = [r for r in custom_order if r in valid]
+    ordered += [r for r in default_order if r not in ordered]
+    return ordered
+
+
+def split_render_order(
+    render_order: Optional[Sequence[Role]], *, audio_on_front: bool = True
+) -> Tuple[Optional[List[Role]], Optional[List[Role]]]:
+    """Split one whole-card role order -- e.g. what a drag-reorderable field list produces
+    reading its rows top-to-bottom, :class:`~addon.core.role_schema.RoleMapping`'s
+    ``render_order`` -- into the ``front_order``/``back_order`` :class:`TemplateOptions`
+    expects. ``None`` in, ``(None, None)`` out, so "no custom order" round-trips cleanly.
+    """
+    if render_order is None:
+        return None, None
+    front_roles = set(_FRONT_ROLES)
+    back_roles = set(_BACK_ROLES)
+    if audio_on_front:
+        front_roles |= set(_AUDIO_ROLES)
+    else:
+        back_roles |= set(_AUDIO_ROLES)
+    front = [r for r in render_order if r in front_roles]
+    back = [r for r in render_order if r in back_roles]
+    return front, back
+
+
 def _build_front(mapping: RoleMapping, opts: TemplateOptions) -> str:
-    parts: List[str] = []
+    order = _resolve_order(_FRONT_ROLES, opts.front_order)
 
-    # The first target-side block is unconditional: Anki refuses to build a card whose
-    # front renders empty, so the primary prompt must always emit something.
+    # Whichever of these actually carries content is the primary prompt, and its first
+    # binding is kept unconditional regardless of where it lands in the order: Anki
+    # refuses to build a card whose front can render entirely empty, so the primary
+    # prompt must always emit something.
     primary = Role.TARGET_TERM if mapping.has(Role.TARGET_TERM) else Role.TARGET_SENTENCE
-    primary_class = "%s-target-term" % _PREFIX
-    if primary is Role.TARGET_SENTENCE:
-        primary_class = "%s-target-sentence" % _PREFIX
-    parts += _role_blocks(mapping, primary, primary_class, first_unconditional=True)
 
-    parts += _role_blocks(mapping, Role.TARGET_READING, "%s-target-reading" % _PREFIX)
-    parts += _role_blocks(mapping, Role.POS, "%s-pos" % _PREFIX)
-
-    if primary is not Role.TARGET_SENTENCE:
-        parts += _role_blocks(mapping, Role.TARGET_SENTENCE, "%s-target-sentence" % _PREFIX)
+    parts: List[str] = []
+    for role in order:
+        parts += _role_blocks(
+            mapping, role, _FRONT_CLASSES[role], first_unconditional=(role is primary)
+        )
 
     if opts.include_audio and opts.audio_on_front:
-        parts += _audio_blocks(mapping, (Role.TARGET_AUDIO, Role.TARGET_SENTENCE_AUDIO))
+        parts += _audio_blocks(mapping, _AUDIO_ROLES)
 
     return _join(parts)
 
 
 def _build_back(mapping: RoleMapping, opts: TemplateOptions) -> str:
+    order = _resolve_order(_BACK_ROLES, opts.back_order)
     parts: List[str] = ["{{FrontSide}}", '<hr id="answer">']
 
     if opts.include_audio and not opts.audio_on_front:
-        parts += _audio_blocks(mapping, (Role.TARGET_AUDIO, Role.TARGET_SENTENCE_AUDIO))
+        parts += _audio_blocks(mapping, _AUDIO_ROLES)
 
-    parts += _role_blocks(mapping, Role.NATIVE_TERM, "%s-native-term" % _PREFIX)
-    parts += _role_blocks(mapping, Role.NATIVE_READING, "%s-native-reading" % _PREFIX)
-    parts += _role_blocks(mapping, Role.NATIVE_SENTENCE, "%s-native-sentence" % _PREFIX)
-    parts += _role_blocks(mapping, Role.IMAGE, "%s-image" % _PREFIX)
-    parts += _role_blocks(mapping, Role.NOTES, "%s-notes" % _PREFIX)
+    for role in order:
+        parts += _role_blocks(mapping, role, _BACK_CLASSES[role])
 
     if opts.include_unmapped:
         extra = mapping.unmapped()

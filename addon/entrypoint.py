@@ -6,6 +6,11 @@ unit tests) never touches ``aqt``.
 Everything lives under one Tools-menu submenu rather than four top-level entries -- the
 main user-facing flow (Convert, Preview, Generate TTS audio) first, a separator, then the
 standalone dev/debug check ("Test Piper voice") last, since it isn't part of the main path.
+
+A single-screen redesign (``ui/main_screen.py``) replacing this whole submenu with one
+dialog is being rolled out *alongside* it for now, not in place of it -- see the plan this
+was built from. Once it's verified end to end in a real profile, this submenu and the
+dialogs it opens are removed and only the new screen's action remains.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ _ACTION_TEXT = "Convert deck language direction…"
 _PREVIEW_ACTION_TEXT = "Preview converted card…"
 _TTS_BATCH_ACTION_TEXT = "Generate TTS audio… (M5)"
 _PIPER_ACTION_TEXT = "Test Piper voice… (M2)"
+_MAIN_SCREEN_ACTION_TEXT = "Deck Direction Converter — new single screen (testing)…"
 _installed = False
 
 
@@ -55,6 +61,10 @@ def _add_menu_actions() -> None:
     piper_action = QAction(_PIPER_ACTION_TEXT, mw)
     piper_action.triggered.connect(_launch_piper_test)
     submenu.addAction(piper_action)
+
+    main_screen_action = QAction(_MAIN_SCREEN_ACTION_TEXT, mw)
+    main_screen_action.triggered.connect(_launch_main_screen)
+    mw.form.menuTools.addAction(main_screen_action)
 
 
 def _launch_convert() -> None:
@@ -99,3 +109,14 @@ def _launch_tts_batch() -> None:
         showWarning("TTS batch dialog failed to load:\n\n%r" % (exc,))
         return
     show_tts_batch_dialog()
+
+
+def _launch_main_screen() -> None:
+    from aqt.utils import showWarning
+
+    try:
+        from .ui.main_screen import show_main_screen
+    except Exception as exc:  # pragma: no cover - surfaced in the GUI
+        showWarning("The new single-screen UI failed to load:\n\n%r" % (exc,))
+        return
+    show_main_screen()
