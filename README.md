@@ -24,7 +24,15 @@ multiple notes at once"** opts into synthesizing several notes' audio concurrent
 small machines by `default_concurrency()`, off by default so it never surprises a low-end
 machine). Only the synthesis call itself is ever parallelized; every actual collection
 read/write stays on the single background thread the batch already ran on sequentially --
-see the module docstring for why that boundary matters. M6 makes a hand-built field mapping
+see the module docstring for why that boundary matters. A cold-start first run also
+downloads faster now: `PiperProvider.ensure_ready()` fetches the Piper binary and the voice
+model at the same time (a small two-worker `ThreadPoolExecutor`) instead of one after the
+other, since they're both large, independent transfers into unrelated cache folders.
+Progress on either dialog now shows a visible **Stop** button and says plainly that
+stopping is safe -- Anki's own progress window has no such button (only Escape or closing
+it cancels, which isn't obvious), so this addon draws its own; Stop sets a plain
+`threading.Event` the batch polls alongside Anki's own cancellation, and whatever's already
+been generated is kept, exactly as if the run had ended on its own. M6 makes a hand-built field mapping
 reusable: **"Save as profile…"** in the mapper dialog writes the current mapping out as JSON
 into `addon/user_files/profiles/`, and every dialog that resolves a mapping (Convert,
 Preview, Generate TTS audio) already picks up a saved profile automatically next time the
@@ -44,6 +52,24 @@ finalizes" rule.
 Scheduling is **always** reset, in both modes. The old interval and ease describe a skill —
 recognition in the original direction — that was never practised in the new direction, so
 carrying it over would be actively misleading.
+
+A conversion's real writes (the clone, the notes, the scheduling reset) always happen
+before Anki's own undo-grouping step, which is why a `merge_undo_entries` hiccup there
+(Anki's `"target undo op not found"`, seen occasionally in real use despite the ordering
+fix in `docs/api-notes.md`) is now recovered from with a same-tick retry instead of being
+reported as a failed conversion — see `apply_plan` in `notetype_manager.py`. This mattered
+beyond the scary error message: since that exception used to propagate out of the whole
+`CollectionOp`, it also silently skipped the screen's own "done" message and its refresh of
+the deck/notetype list (and Anki's own deck browser refresh), so it could look like nothing
+had happened even though the conversion had already fully succeeded. Confirmed fixed in
+real use — the retry is invisible to the user (no mention of it in the "done" message,
+just the plain success text) and only stays noted in `docs/api-notes.md` in case its
+still-unidentified underlying cause is ever worth chasing for real. Separately, the
+screen now also calls `mw.deckBrowser.refresh()` itself right after a successful
+conversion, and again when the screen is closed as a safety net — `CollectionOp`'s own
+change-driven refresh wasn't reliably enough to make Anki's deck browser show a
+newly-created deck without a manual refresh, even though the addon's own dropdown always
+updated correctly.
 
 The original **notetype object** is never modified in either mode.
 
@@ -80,7 +106,7 @@ docs/          deck-facts.md (verified ground truth), api-notes.md
 ## Development
 
 ```bash
-python -m unittest discover -s tests -t .   # 193 tests, no Anki needed, no network needed
+python -m unittest discover -s tests -t .   # 200 tests, no Anki needed, no network needed
 python tools/preview_templates.py core2000  # see the generated templates
 python tools/install_dev.py --link          # install into Anki (close Anki first)
 ```
@@ -96,22 +122,45 @@ saved profiles live in that same gitignored directory.
 
 There's also **Tools → "Deck Direction Converter — new single screen (testing)…"**, a
 second, separate entry rolled out *alongside* the submenu above, not replacing it yet: one
-dialog (`addon/ui/main_screen.py`) combining the deck/mode picker, a language-detection
-banner with a manual override, a field/role list on the left (or, toggled on, a raw
-Front/Back/Styling HTML editor) next to a live preview pane on the right, voice sampling,
-and the Convert/Generate-TTS-audio buttons, all in one screen. The field list hides a
-profile's `hidden` fields by default (Core 2000 alone marks nine bookkeeping fields this
-way -- real clutter in a list that long) behind a "Show hidden fields" checkbox above it.
-An earlier drag-to-reorder feature on that list was tried and then deliberately
-dropped after review, so field order now just follows a saved profile's order or plain
-notetype order, never an ad hoc drag. "Sample" next to the voice picker speaks the *current
-note's* own target-language text -- sentence first, falling back to the term only for a
-word-only note -- rather than a canned phrase, so it previews this deck's real content and
-how it actually sounds in context; the default voice everywhere a voice picker appears is
-the UK voice, "alba" (`en_GB-alba-medium`, `addon/config.json`'s `tts_voice`). It reuses the
-exact same `core`/`ops` logic as the submenu's dialogs — nothing about what a conversion or
-a TTS batch *does* changes, only how you reach it. **Unverified in real Anki as of this
-write-up**
+dialog (`addon/ui/main_screen.py`) combining the deck/mode picker, an editable **"New deck
+name"** field (pre-filled with the usual `<deck> (<suffix>)` default, disabled and locked to
+the source deck's own name in Flip-in-place mode, since that mode never creates a separate
+deck), a language-detection banner with a manual override, a field/role list on the left
+(or, toggled on, a raw Front/Back/Styling HTML editor) next to a live preview pane on the
+right, voice sampling, and **two buttons -- Convert and Generate TTS audio -- kept
+deliberately separate**, one step each. The field list hides a profile's `hidden` fields by
+default (Core 2000 alone marks nine bookkeeping fields this way -- real clutter in a list
+that long) behind a "Show hidden fields" checkbox above it. An earlier drag-to-reorder
+feature on that list was tried and then deliberately dropped after review, so field order
+now just follows a saved profile's order or plain notetype order, never an ad hoc drag.
+"Sample" next to the voice picker speaks the *current note's* own target-language text --
+sentence first, falling back to the term only for a word-only note -- rather than a canned
+phrase, so it previews this deck's real content and how it actually sounds in context; the
+default voice everywhere a voice picker appears is the UK voice, "alba"
+(`en_GB-alba-medium`, `addon/config.json`'s `tts_voice`).
+
+**"Generate TTS audio" stays disabled until the deck's direction is actually already
+switched**, with a label above the buttons spelling out why: *"Step 1: click Convert to
+switch this deck's direction. Step 2: once switched, come back here and click Generate TTS
+audio."* This closes a real bug that briefly existed here: with two independent buttons
+sharing one deck/notetype dropdown, nothing stopped "Generate TTS audio" from running
+against a pair that was still in its original, pre-conversion direction -- and separately,
+Flip-in-place's own success handler was looking up a deck id that mode never sets
+(`result.target_deck_id` stays `0` for it), so the screen didn't always even land on the
+right pair after converting. The gate (`MainScreen._direction_is_correct`,
+`core.template_generator.referenced_fields`) checks the *live* front template on the
+currently selected notetype for the mapped Target-language field, not just "was Convert
+clicked" -- so a deck that was already in the right direction needs no gating, and, after a
+real conversion, the mapping used carries forward onto the new pair automatically even
+without a saved profile (cloning preserves field names 1:1), so the button unlocks
+immediately rather than looking freshly-unmapped. Once unlocked, Generate TTS audio shows a
+visible **Stop** button while running, with the reassurance text Anki's own progress window
+doesn't give you -- audio already generated is kept, and clicking Generate again later just
+continues where it left off.
+
+It reuses the exact same `core`/`ops` logic as the submenu's dialogs — nothing about what a
+conversion or a TTS batch *does* changes, only how you reach it. **Unverified in real Anki
+as of this write-up**
 — the live preview drives a raw `AnkiWebView` directly for the first time in this codebase
 (ported from `aqt.clayout.CardLayout`'s own pattern, but never actually opened in a live
 Anki process yet). Once it's confirmed working end to end, the old submenu and the six

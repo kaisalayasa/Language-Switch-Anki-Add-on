@@ -55,9 +55,23 @@ class PiperProvider(TTSProvider):
         out across multiple threads -- ``ensure_piper_binary``/``ensure_voice`` (called
         internally by :meth:`synthesize`) are not written to be safe against two threads
         racing to perform the *first* download of the same file at once.
+
+        The binary and the voice live under separate cache subdirectories and share no
+        state, so on a cold start (neither cached yet) this runs both downloads at once
+        in a small thread pool instead of one after the other -- a real speedup on a fresh
+        install, since both are genuinely large, independent transfers.
         """
-        ensure_piper_binary(self.cache_dir, download_to=self._download_to, run=self._run)
-        ensure_voice(self.cache_dir, voice_id, download_to=self._download_to)
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            binary_future = pool.submit(
+                ensure_piper_binary, self.cache_dir, download_to=self._download_to, run=self._run
+            )
+            voice_future = pool.submit(
+                ensure_voice, self.cache_dir, voice_id, download_to=self._download_to
+            )
+            binary_future.result()
+            voice_future.result()
 
     def synthesize(self, text: str, *, voice_id: str, out_path: Optional[Path] = None) -> Path:
         clean = sanitize_text(text, allowed_ranges=self.allowed_ranges)

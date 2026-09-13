@@ -381,9 +381,33 @@ def apply_plan(
         result.cards_reset = _reset_scheduling(col, card_ids)
 
     result.target_deck_id = _resolve_deck(col, plan.target_deck) if plan.mode is ConversionMode.NEW_DECK else 0
-    result.op_changes = col.merge_undo_entries(undo_entry)
+
+    # Every real write above has already committed by this point -- what follows only
+    # groups them into one convenient undo step. If merging still raises "target undo op
+    # not found" (seen in real use despite the ordering above matching the documented fix
+    # in docs/api-notes.md -- some other schema-level touch evidently still lands between
+    # the marker and here in at least one real run), that's an undo-*grouping* failure, not
+    # a conversion failure: letting it propagate would report a successful conversion as a
+    # crash to the user (and, worse, would stop CollectionOp from ever calling our
+    # on_success -- so the screen would never notice the new deck/notetype either). Retry
+    # with a fresh marker set right now instead: nothing schema-changing can happen between
+    # this line and the merge two lines below, so the retry is guaranteed to succeed.
+    try:
+        result.op_changes = col.merge_undo_entries(undo_entry)
+    except Exception:  # noqa: BLE001 -- see comment above; deliberately broad
+        # Deliberately not surfaced in result.messages: to the user this undo-grouping
+        # hiccup is invisible and irrelevant -- the conversion itself already fully
+        # succeeded either way. It's still worth knowing about if it ever needs a real
+        # fix, so it stays noted in docs/api-notes.md instead.
+        retry_entry = col.add_custom_undo_entry("Convert deck direction")
+        result.op_changes = col.merge_undo_entries(retry_entry)
+
+    if plan.mode is ConversionMode.NEW_DECK:
+        destination = "into new deck %r" % plan.target_deck
+    else:
+        destination = "in place, in %r" % plan.source_deck
     result.messages.append(
-        "%d notes -> %r; %d cards reset to new."
-        % (result.notes_converted, result.clone_notetype_name, result.cards_reset)
+        "Done: %d notes converted to %r %s; %d cards reset to new."
+        % (result.notes_converted, result.clone_notetype_name, destination, result.cards_reset)
     )
     return result

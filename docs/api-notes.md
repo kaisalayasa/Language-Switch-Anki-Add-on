@@ -166,6 +166,46 @@ has moved since the matching `add_custom_undo_entry` call — reproducing the re
 faithfully enough that both the original failure and the fix are now provable in the pure
 test suite, without needing a real Anki collection to notice a regression.
 
+**Update: the user still hit this error in real use, in `main_screen.py`'s single-screen
+flow, on a conversion that had visibly succeeded** — despite `apply_plan`'s marker already
+sitting after every schema-level call this module makes, per the fix above. The exact
+second cause could not be pinned down without a live repro (no schema-level call this
+module doesn't already know about was found on inspection), but the consequence turned out
+to be worse than a stray error dialog: because the marker/merge lives inside `apply_plan`,
+an uncaught failure there propagates all the way out through `run_conversion` and
+`convert_op._op`, so `CollectionOp` sees the *whole operation* as having thrown — it never
+calls `on_success`, even though every real write had already committed. That's why the
+error dialog was the *only* thing visible: `main_screen.py`'s success handler (which shows
+the "done" message and re-points the screen at the new deck/notetype) never ran, and
+neither did `CollectionOp`'s own `mw.col.op_made_changes(changes)` UI refresh, which
+explains the deck browser also not showing the new deck.
+
+**Fix:** `apply_plan` now wraps the merge in try/except and retries with a *fresh* marker
+placed at that exact point on failure. This needs no further guessing about the root cause
+-- nothing schema-changing can execute between the retry marker and merging it two lines
+later (single-threaded, no calls in between), so the retry is structurally guaranteed to
+succeed. Confirmed working in real use (2026-09-13): the error dialog is gone, and the
+conversion completes normally. The retry is *not* surfaced in `result.messages` -- to the
+user it's invisible and irrelevant, since the conversion already fully succeeded either
+way -- it's only noted here in case the underlying (still-unidentified) second cause of the
+original merge failure ever needs a real fix rather than a retry working around it.
+Covered by `tests/test_notetype_manager.py::TestUndoMergeRecovery`, using a
+`FakeCollection` subclass whose first `merge_undo_entries` call always fails regardless of
+generation, to exercise the retry path independent of whatever the real second cause is.
+
+**Related, separately confirmed in the same real-use report:** even with the retry above,
+`CollectionOp`'s own `mw.col.op_made_changes(changes)`-driven UI refresh did not reliably
+make Anki's deck browser show the newly-created/changed deck (a manual refresh in Anki was
+needed) -- even though the addon's own screen *did* correctly refresh and re-select the new
+pair. Likely because the deck itself is created via `col.decks.add_normal_deck_with_name`
+before the undo marker that `op_changes` actually describes, so the `OpChanges` returned
+from `merge_undo_entries` may not carry a "decks changed" flag Anki's hook-based refresh
+looks for. Rather than chase the exact flag, `main_screen.py` now calls
+`mw.deckBrowser.refresh()` directly after a successful conversion, and again from
+`closeEvent` as a safety net -- both defensively wrapped (see
+`MainScreen._refresh_anki_main_window`), since `deckBrowser.refresh` is stable/long-standing
+but not worth a hard crash if a future build ever renames it.
+
 ## Still to confirm (exact signatures, not just presence)
 
 Presence is verified; the precise parameter lists are not, because the shipped modules are

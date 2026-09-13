@@ -24,6 +24,7 @@ importable (though not meaningfully callable) outside a real Anki process.
 from __future__ import annotations
 
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -95,6 +96,7 @@ def run_tts_batch(
     template_options_from_config: Callable[[dict], Any],
     limit: int = 0,
     concurrency: int = 1,
+    cancel_event: Optional[threading.Event] = None,
     on_done: Optional[Callable[[BatchOutcome], None]] = None,
 ) -> None:
     """Processes ``note_ids`` (already the "needs audio" set -- see ``notes_needing_audio``)
@@ -109,6 +111,12 @@ def run_tts_batch(
     ``concurrency`` > 1 opts into running that many Piper subprocesses at once (see the
     module docstring for why this is safe); 1 (the default) is the original, unchanged
     sequential path.
+
+    ``cancel_event``, if given, is polled alongside Anki's own ``mw.progress.want_cancel()``
+    (which only ever becomes true when the user presses Escape or closes the progress
+    window -- there is no visible Cancel button on it). A caller that wants a real, visible
+    Stop button sets this event from that button's click handler instead of guessing at an
+    undocumented way to trigger Anki's own cancellation from code.
     """
     from aqt import mw  # lazy: keep this module importable without a running Anki process
 
@@ -116,6 +124,9 @@ def run_tts_batch(
     provider = PiperProvider(cache_dir())
     total = len(todo)
     outcome = BatchOutcome()
+
+    def cancel_requested() -> bool:
+        return mw.progress.want_cancel() or (cancel_event is not None and cancel_event.is_set())
 
     mw.progress.start(max=total, min=0, label="Generating audio…", parent=parent, immediate=True)
 
@@ -128,7 +139,7 @@ def run_tts_batch(
 
     def run_sequential(col: Any) -> None:
         for i, nid in enumerate(todo):
-            if mw.progress.want_cancel():
+            if cancel_requested():
                 outcome.cancelled = True
                 break
             note = col.get_note(nid)
@@ -144,7 +155,7 @@ def run_tts_batch(
 
         plans = {}
         for nid in todo:
-            if mw.progress.want_cancel():
+            if cancel_requested():
                 outcome.cancelled = True
                 return
             plans[nid] = plan_note_audio(col.get_note(nid), mapping)
@@ -165,7 +176,7 @@ def run_tts_batch(
                     outcome.failed += 1
                 done_count += 1
                 report(done_count)
-                if mw.progress.want_cancel():
+                if cancel_requested():
                     outcome.cancelled = True
                     for f in futures:
                         f.cancel()

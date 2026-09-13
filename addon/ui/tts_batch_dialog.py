@@ -21,7 +21,8 @@ from PyPI this session, the same way ``CardLayout``'s behaviour was verified -- 
 
 from __future__ import annotations
 
-from typing import Any, List, Tuple
+import threading
+from typing import Any, List, Optional, Tuple
 
 from aqt import mw
 from aqt.qt import (
@@ -124,6 +125,12 @@ class TtsBatchDialog(QDialog):
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
+
+        self._cancel_event: Optional[threading.Event] = None
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setVisible(False)
+        self.stop_button.clicked.connect(self._on_stop_clicked)
+        layout.addWidget(self.stop_button)
 
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -231,13 +238,30 @@ class TtsBatchDialog(QDialog):
 
     # -- the batch itself ---------------------------------------------------
 
+    def _on_stop_clicked(self) -> None:
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        self.stop_button.setEnabled(False)
+        self.status_label.setText(
+            "Stopping after the note currently in progress… audio already generated is "
+            "kept, and you can continue right where this leaves off later."
+        )
+
     def _run_batch(self, notetype, mapping, note_ids, voice_id, config, limit) -> None:
         self.buttons.setEnabled(False)
-        self.status_label.setText("Starting…")
+        self._cancel_event = threading.Event()
+        self.stop_button.setEnabled(True)
+        self.stop_button.setVisible(True)
+        self.status_label.setText(
+            "Generating audio… click Stop at any time -- audio already generated is kept, "
+            "and you can continue right where you left off later."
+        )
         concurrency = default_concurrency() if self.parallel_checkbox.isChecked() else 1
 
         def on_done(outcome: BatchOutcome) -> None:
             self.buttons.setEnabled(True)
+            self.stop_button.setVisible(False)
+            self._cancel_event = None
             if outcome.error is not None:
                 showWarning("TTS batch failed: %s" % outcome.error, parent=self)
                 return
@@ -246,9 +270,10 @@ class TtsBatchDialog(QDialog):
                 if outcome.remaining
                 else ""
             )
+            headline = "Stopped early." if outcome.cancelled else "Done."
             showInfo(
-                "Done. %d notes generated, %d failed (left for the next run).%s"
-                % (outcome.done, outcome.failed, remaining_note),
+                "%s %d notes generated, %d failed.%s"
+                % (headline, outcome.done, outcome.failed, remaining_note),
                 parent=self,
             )
             self.accept()
@@ -263,6 +288,7 @@ class TtsBatchDialog(QDialog):
             template_options_from_config=template_options_from_config,
             limit=limit,
             concurrency=concurrency,
+            cancel_event=self._cancel_event,
             on_done=on_done,
         )
 
