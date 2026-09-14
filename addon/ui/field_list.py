@@ -34,6 +34,7 @@ from aqt.qt import (
     pyqtSignal,
 )
 
+from ..core.audio_fields import DEMOTED_TO, is_generated_field
 from ..core.language_detect import LanguageGuess, detect_field_language
 from ..core.role_schema import (
     FieldAssignment,
@@ -45,6 +46,15 @@ from ..core.role_schema import (
 __all__ = ["FieldListWidget"]
 
 _UNMAPPED = "(unmapped)"
+
+#: Roles a human can pick. The target audio roles are deliberately missing: generated audio
+#: always goes into a field the conversion creates (see ``core.audio_fields``), so there is
+#: no existing field it would ever be correct to choose here. Offering them would only let
+#: someone pick a field whose contents the next TTS run would overwrite -- and whatever they
+#: picked would be demoted straight back to the native side anyway, which reads as the UI
+#: ignoring them. A row that *is* a generated field still shows its role; it just isn't
+#: something any other row can be set to.
+_SELECTABLE_ROLES: Tuple[Role, ...] = tuple(r for r in Role if r not in DEMOTED_TO)
 
 
 class _FieldRow(QWidget):
@@ -91,12 +101,24 @@ class _FieldRow(QWidget):
 
         self.combo = QComboBox()
         self.combo.addItem(_UNMAPPED, None)
-        for r in Role:
+        for r in _SELECTABLE_ROLES:
             self.combo.addItem(r.key, r)
+        # A generated audio field's own role isn't in the selectable list, so add it just
+        # for this row -- the row should show what it is, and the combo is how it does that.
+        if role is not None and self.combo.findData(role) == -1:
+            self.combo.addItem(role.key, role)
         if role is not None:
             index = self.combo.findData(role)
             if index != -1:
                 self.combo.setCurrentIndex(index)
+        if is_generated_field(name):
+            # This addon owns this field: it was created by a conversion and is filled by
+            # the TTS run. Reassigning it would just strand the audio.
+            self.combo.setEnabled(False)
+            self.combo.setToolTip(
+                "Created by this addon to hold generated audio, and filled by "
+                "\"Generate TTS audio\". Not reassignable."
+            )
         layout.addWidget(self.combo)
 
         self.check = QCheckBox("Hide")

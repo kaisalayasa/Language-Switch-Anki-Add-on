@@ -81,7 +81,10 @@ The original **notetype object** is never modified in either mode.
 - **Field names are untrusted.** Most decks are `Front`/`Back` or `Field 1`. Even
   descriptive names lie: the real Core 2000 notetype has a field called `Notes` holding
   `"Core 2000 Step 01 - 001"` and one called `Core-Index` holding an integer. Roles are the
-  only abstraction; no code matches on a field name.
+  only abstraction; no code matches on a name that came from a *deck*. The one exception is
+  `core/audio_fields.py`, which recognises the field **it created itself** by the `ddc-`
+  name it chose — its own artifact, like the generated CSS marker, and the only way to find
+  that field again later, since it holds nothing until TTS runs.
 - **Never guess an Anki API.** See `docs/api-notes.md`. (`col.sched.forget_cards` does not
   exist — it's `schedule_cards_as_new`.)
 - **Refuse rather than misalign.** If a profile's stored field name and ord disagree with
@@ -91,8 +94,10 @@ The original **notetype object** is never modified in either mode.
 
 ```
 addon/
-  core/        pure logic — role_schema, template_generator, conversion, profiles, language_detect
-  tts/         pure logic — Piper binary/voice managers, subprocess provider, sanitizer
+  core/        pure logic — role_schema, template_generator, conversion, profiles,
+               language_detect, role_detect (auto-mapping), audio_fields (audio policy)
+  tts/         pure logic — Piper binary/voice managers, subprocess provider, sanitizer,
+               script_ranges (voice locale -> pronounceable characters)
   ops/         everything that imports anki/aqt
   ui/          Qt dialogs
   profiles/    shipped field mappings, one JSON per known deck (e.g. core2000.json)
@@ -106,7 +111,7 @@ docs/          deck-facts.md (verified ground truth), api-notes.md
 ## Development
 
 ```bash
-python -m unittest discover -s tests -t .   # 200 tests, no Anki needed, no network needed
+python -m unittest discover -s tests -t .   # 270 tests, no Anki needed, no network needed
 python tools/preview_templates.py core2000  # see the generated templates
 python tools/install_dev.py --link          # install into Anki (close Anki first)
 ```
@@ -133,6 +138,52 @@ default (Core 2000 alone marks nine bookkeeping fields this way -- real clutter 
 that long) behind a "Show hidden fields" checkbox above it. An earlier drag-to-reorder
 feature on that list was tried and then deliberately dropped after review, so field order
 now just follows a saved profile's order or plain notetype order, never an ad hoc drag.
+
+Role assignment comes from three sources, in priority order, per `claude.md`'s Role Mapping
+System: a saved profile (`addon/core/profiles.py`'s `match_profile`, exact field-name-list
+match only, e.g. Core 2000's shipped profile); the user's own edit in the field list, always
+authoritative; and, when neither applies, a content-based seed
+(`addon/core/role_detect.py`'s `guess_role_mapping`) that reads the notetype's own *live*
+template to know which fields are currently on the front (-> become Native after a flip) vs.
+the back (-> become Target) -- a structural fact, not a guess -- then sorts each side's
+fields into Term/Sentence/Reading from real (unsanitized) sample content. The direction
+banner reads the live template the same structural way, independent of the mapping, to show
+what's actually on the card *right now* alongside what it will become -- e.g. "Current: ko ->
+en | after converting: en -> ko" for the Korean deck -- rather than only ever showing the
+one, post-conversion direction.
+
+### Where generated audio goes
+
+**A conversion creates the field its generated audio will live in.** It is never written into
+a field the deck already had. The deck's own audio keeps its contents and is bound to a
+*native* audio role, which the generated template never emits -- so it is hidden, not deleted
+and not overwritten. All of this is `addon/core/audio_fields.py`, and every mapping (profile,
+hand-edited or auto-detected) is passed through its `resolve_audio_fields` before use, so no
+mapping can express anything else.
+
+This replaced an earlier "repurpose the deck's existing audio field" design that failed on a
+real Korean deck converted for someone studying English: the card kept playing the original
+Korean. A repurposed field arrives at TTS time already holding the old language's audio, so
+between the conversion and a successful synthesis run the card plays exactly the language the
+conversion was meant to retire -- and if synthesis fails or is interrupted for a note, that
+window never closes. A field the addon just created is empty, so the worst case is silence
+until the audio exists rather than the wrong language. Two useful consequences: the deck's
+original recordings survive a conversion instead of being overwritten, and switching the
+template's audio on is safe after a partial or cancelled run, because unprocessed notes
+simply render nothing.
+
+Two smaller fixes went with it, both of which could make a whole run finish in seconds,
+report zero failures and produce no audio at all:
+
+- `PiperProvider` used to filter text to a hardcoded **Latin** character range whatever the
+  voice was, which deletes non-Latin text letter by letter. It now derives the range set
+  from the voice's own locale (`addon/tts/script_ranges.py`), and an unlisted locale filters
+  nothing rather than guessing.
+- Filtering to the wrong script rarely leaves an *empty* string, because punctuation is kept
+  regardless of script -- a Korean sentence under a Latin filter reduces to `"."`, which is
+  truthy, so Piper was asked to speak a bare full stop and wrote a meaningless file that then
+  counted as that note's audio. `sanitize_text` now treats "nothing but punctuation survived"
+  as empty. Notes skipped this way are counted and reported rather than passed over silently.
 "Sample" next to the voice picker speaks the *current note's* own target-language text --
 sentence first, falling back to the term only for a word-only note -- rather than a canned
 phrase, so it previews this deck's real content and how it actually sounds in context; the
@@ -159,12 +210,17 @@ doesn't give you -- audio already generated is kept, and clicking Generate again
 continues where it left off.
 
 It reuses the exact same `core`/`ops` logic as the submenu's dialogs — nothing about what a
-conversion or a TTS batch *does* changes, only how you reach it. **Unverified in real Anki
-as of this write-up**
-— the live preview drives a raw `AnkiWebView` directly for the first time in this codebase
-(ported from `aqt.clayout.CardLayout`'s own pattern, but never actually opened in a live
-Anki process yet). Once it's confirmed working end to end, the old submenu and the six
-dialog files it opens are removed and this becomes the only entry point.
+conversion or a TTS batch *does* changes, only how you reach it. Once it's confirmed working
+end to end, the old submenu and the six dialog files it opens are removed and this becomes
+the only entry point.
+
+**Confirmed bug, found in real use and fixed:** switching from a pair with a valid mapping to
+one without (e.g. selecting Core 2000, then a not-yet-mapped deck) left the *previous* pair's
+card sitting in the preview instead of updating -- `_refresh_preview`'s early-return paths
+(no notes selected; the new mapping fails validation) never touched the preview widget at
+all. `PreviewPanel` gained a `clear(message="")` method, called from both of those paths, so
+switching decks now always shows either the new card or an explicit blank/placeholder state,
+never a stale one.
 
 To install a real, packaged copy (rather than the dev symlink above):
 
@@ -198,10 +254,14 @@ guide — all need the MIT-vs-GPL decision, which is intentionally on hold ("I d
 anything about open source, leave it for later"). Nothing in the addon depends on that
 decision; it only blocks the parts of M7 about being ready for outside contributors.
 
-Also on the backlog, deferred as of M4/M5/M6's sessions: the TTS sanitizer only strips
-non-Latin script today (`PiperProvider` defaults to `LATIN_RANGES` unconditionally — a real
-bug for any non-Latin target language, not yet fixed even though `RoleMapping.target_language`
-and now `language_detect.py` both carry the signal that would fix it); orphaned old-language
-media cleanup after Flip-in-place + TTS replacement; auto-selecting Target/Native or a Role
-dropdown from `language_detect.py`'s guesses (deliberately left manual in M4 pending a second
-real test deck to validate against — `test profile` still only has Core 2000).
+Also on the backlog: orphaned old-language media cleanup after Flip-in-place + TTS
+replacement. (The TTS sanitizer's hardcoded Latin range list, listed here for several
+sessions, is **fixed** — see "Where generated audio goes" above.)
+
+**Known limitation, not a bug:** the curated voice list
+(`addon/tts/piper_voice_manager.py`) ships English voices only — `en_US-lessac-medium` and
+`en_GB-alba-medium` — matching `claude.md`'s "ship a small curated list of known-good
+English voice IDs" for v1. So a deck whose *newly-fronted* language is not English has no
+voice to generate with yet, even though everything else about it now works. Converting
+*into* English (the Korean deck's case) is fully supported. Piper publishes voices for many
+languages; widening the curated list is a data change, not a code one.

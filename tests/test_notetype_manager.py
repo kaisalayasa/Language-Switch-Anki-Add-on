@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import unittest
 
+from addon.core.audio_fields import AUDIO_DONE_TAG
 from addon.core.conversion import ConversionMode, build_plan
 from addon.core.role_schema import FieldBinding, Role, RoleMapping
 from addon.ops.notetype_manager import ApiMismatch, apply_plan
@@ -262,6 +263,117 @@ class TestUndoMergeRecovery(unittest.TestCase):
             any("undo" in m.lower() for m in result.messages),
             "the retry is an internal recovery, not something to surface to the user: %r"
             % result.messages,
+        )
+
+
+class TestGeneratedAudioFieldsAreCreatedOnTheClone(unittest.TestCase):
+    """A conversion adds the field its generated audio will live in.
+
+    The alternative -- reusing the deck's existing audio field -- is what made a converted
+    Korean deck keep playing Korean: that field already held the old language's audio, so
+    the card played it for as long as synthesis hadn't overwritten it, which for a failed or
+    partial run is forever. See addon/core/audio_fields.py.
+    """
+
+    def _converted(self, mode, new_fields=("ddc-audio (EN)",)):
+        col, src, _deck = make_collection()
+        plan = make_plan(col, mode)
+        plan.new_fields = list(new_fields)
+        result = run(col, plan)
+        return col, src, col.models.by_name(result.clone_notetype_name), result
+
+    def test_the_clone_gains_the_field_and_the_original_does_not(self):
+        col, src, clone, _result = self._converted(ConversionMode.NEW_DECK)
+        self.assertIn("ddc-audio (EN)", [f["name"] for f in clone["flds"]])
+        self.assertNotIn("ddc-audio (EN)", [f["name"] for f in src["flds"]])
+
+    def test_it_is_appended_after_the_originals_which_all_keep_their_ord(self):
+        """Ords matter: Flip-in-place hands Anki a field map built from them. Inserting the
+        new field among the existing ones would shift every later field by one."""
+        _col, src, clone, _result = self._converted(ConversionMode.NEW_DECK)
+        for original in src["flds"]:
+            match = [f for f in clone["flds"] if f["name"] == original["name"]]
+            self.assertEqual(len(match), 1, original["name"])
+            self.assertEqual(match[0]["ord"], original["ord"], original["name"])
+        self.assertEqual(clone["flds"][-1]["name"], "ddc-audio (EN)")
+        self.assertEqual(clone["flds"][-1]["ord"], len(src["flds"]))
+
+    def test_two_audio_fields_can_be_added_at_once(self):
+        _col, _src, clone, _r = self._converted(
+            ConversionMode.NEW_DECK, new_fields=("ddc-audio (EN)", "ddc-audio-sentence (EN)")
+        )
+        names = [f["name"] for f in clone["flds"]]
+        self.assertIn("ddc-audio (EN)", names)
+        self.assertIn("ddc-audio-sentence (EN)", names)
+        self.assertEqual(len(set(names)), len(names), "no duplicate field names")
+
+    def test_the_new_field_starts_empty_on_every_duplicated_note(self):
+        """The whole point. An empty field renders as nothing, so a card can be silent but
+        never wrong, however the TTS run goes."""
+        col, _src, _clone, result = self._converted(ConversionMode.NEW_DECK)
+        copies = [n for n in col.notes.values() if n.mid == result.clone_notetype_id]
+        self.assertEqual(len(copies), 5)
+        for note in copies:
+            self.assertEqual(note["ddc-audio (EN)"], "")
+            self.assertEqual(note["Sound"], note["Sound"])  # original audio carried over
+            self.assertTrue(note["Sound"].startswith("[sound:"))
+
+    def test_flip_in_place_also_gets_the_field(self):
+        col, _src, clone, result = self._converted(ConversionMode.FLIP_IN_PLACE)
+        self.assertIn("ddc-audio (EN)", [f["name"] for f in clone["flds"]])
+
+        moved = [n for n in col.notes.values() if n.mid == result.clone_notetype_id]
+        self.assertEqual(len(moved), 5)
+        for note in moved:
+            self.assertEqual(note["ddc-audio (EN)"], "", "the new field must arrive empty")
+            self.assertTrue(note["Word"].startswith("word"), "originals must survive intact")
+            self.assertTrue(note["Sound"].startswith("[sound:"))
+
+    def test_a_conversion_with_no_new_fields_is_unchanged(self):
+        col, src, _deck = make_collection()
+        plan = make_plan(col, ConversionMode.NEW_DECK)
+        result = run(col, plan)
+        clone = col.models.by_name(result.clone_notetype_name)
+        self.assertEqual(
+            [f["name"] for f in clone["flds"]], [f["name"] for f in src["flds"]]
+        )
+
+    def test_adding_a_field_that_is_already_there_does_nothing(self):
+        """Converting an already-converted deck must not accumulate duplicates."""
+        col, _src, _deck = make_collection()
+        plan = make_plan(col, ConversionMode.NEW_DECK)
+        plan.new_fields = ["Sound"]  # already on the notetype
+        result = run(col, plan)
+        names = [f["name"] for f in col.models.by_name(result.clone_notetype_name)["flds"]]
+        self.assertEqual(names.count("Sound"), 1)
+
+    def test_the_generated_field_dict_is_not_a_copy_of_another_fields_identity(self):
+        _col, src, clone, _r = self._converted(ConversionMode.NEW_DECK)
+        added = [f for f in clone["flds"] if f["name"] == "ddc-audio (EN)"][0]
+        for donor in src["flds"]:
+            if "id" in donor:
+                self.assertNotEqual(added.get("id"), donor["id"])
+
+
+class TestStaleDoneTagIsNeverCarriedOntoADuplicate(unittest.TestCase):
+    def test_the_audio_done_tag_is_stripped_even_though_it_is_not_configured(self):
+        """The tag means "this note's generated audio is current". A fresh duplicate's
+        generated audio field is empty, so carrying the tag over would make the TTS batch
+        skip the note as already done and leave it permanently silent."""
+        col, src, deck = make_collection()
+        col.seed_note(src, deck, ["w", "m", "[sound:x.mp3]", "9"],
+                      tags=[AUDIO_DONE_TAG, "keepme"])
+        plan = make_plan(col, ConversionMode.NEW_DECK)
+        plan.strip_tags = ["leech"]  # the shipped default; the done tag is not in it
+
+        result = run(col, plan)
+
+        copies = [n for n in col.notes.values() if n.mid == result.clone_notetype_id]
+        self.assertTrue(copies)
+        for note in copies:
+            self.assertNotIn(AUDIO_DONE_TAG, note.tags)
+        self.assertTrue(
+            any("keepme" in n.tags for n in copies), "unrelated tags must still carry over"
         )
 
 

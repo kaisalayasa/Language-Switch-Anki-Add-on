@@ -323,6 +323,29 @@ def _collect_samples(note_ids, *, limit_per_field: int = 3, max_len: int = 60):
     return samples
 
 
+def _collect_raw_samples(note_ids, *, limit_per_field: int = 8, max_len: int = 400):
+    """Unsanitized per-field samples for content-based role detection
+    (``core.role_detect.guess_role_mapping``).
+
+    Unlike :func:`_collect_samples` (the HTML-stripped version used for the field list's
+    display column), this keeps ``[sound:...]`` tags and ``kanji[kana]``-style ruby markup
+    intact -- those are exactly the signals the guesser looks for, and
+    ``tts.sanitize.sanitize_text`` strips both unconditionally regardless of
+    ``allowed_ranges``. Blank values are kept (not skipped) so the bucket's length reflects
+    notes actually scanned, which the guesser's emptiness-ratio signal depends on. A larger
+    ``limit_per_field`` than the display sampler's default: that ratio is noisy at n=3.
+    """
+    samples: dict = {}
+    for nid in note_ids:
+        note = mw.col.get_note(nid)
+        for name in note.keys():
+            bucket = samples.setdefault(name, [])
+            if len(bucket) >= limit_per_field:
+                continue
+            bucket.append(note[name][:max_len])
+    return samples
+
+
 def _on_windows() -> bool:
     import sys
 

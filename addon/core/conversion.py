@@ -92,6 +92,7 @@ class PreflightSummary:
     note_count: int
     scheduling_will_reset: bool = True
     media_cleanup: bool = False
+    new_fields: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
     def lines(self) -> List[str]:
@@ -120,6 +121,12 @@ class PreflightSummary:
         out.append(
             "Media cleanup:     %s" % ("yes" if self.media_cleanup else "no (nothing deleted)")
         )
+        if self.new_fields:
+            out.append(
+                "New fields:        %s (added empty, on the new notetype only; generated "
+                "audio is written here so existing audio is kept and hidden rather than "
+                "overwritten)" % ", ".join(self.new_fields)
+            )
         return out
 
     def as_text(self) -> str:
@@ -142,6 +149,13 @@ class ConversionPlan:
     reset_scheduling: bool = True
     media_cleanup: bool = False
     dry_run: bool = False
+    #: Field names to add to the clone that the source notetype does not have -- in practice
+    #: the audio fields generated TTS is written into, per ``core.audio_fields``. Appended
+    #: after the source's own fields, never inserted among them, and always empty to begin
+    #: with. Empty is the point: the demoted language's audio is left in its original field
+    #: and hidden rather than overwritten, so a card can never play the wrong language while
+    #: waiting for its audio to be generated.
+    new_fields: List[str] = field(default_factory=list)
 
     @property
     def scope_query(self) -> str:
@@ -187,6 +201,7 @@ class ConversionPlan:
             note_count=len(self.note_ids),
             scheduling_will_reset=self.reset_scheduling,
             media_cleanup=self.media_cleanup,
+            new_fields=list(self.new_fields),
         )
         summary.warnings.extend(self.validate().warnings)
         summary.warnings.extend(warnings or [])

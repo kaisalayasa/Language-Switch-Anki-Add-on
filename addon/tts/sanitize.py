@@ -60,7 +60,31 @@ def sanitize_text(raw: str, *, allowed_ranges: Sequence[Tuple[int, int]] = ()) -
     if allowed_ranges:
         text = _filter_script(text, allowed_ranges)
     text = _WHITESPACE_RE.sub(" ", text).strip()
+    if text and allowed_ranges and not _has_speakable_content(text, allowed_ranges):
+        # Everything the filter kept is punctuation. That happens when the text was written
+        # in a script the ranges don't cover: the letters are all dropped and the sentence's
+        # full stop survives, because punctuation is kept regardless of script. Returning it
+        # would be worse than returning nothing -- callers treat empty as "nothing to say"
+        # and skip it, but a lone "." looks like real text, so it gets synthesized into a
+        # meaningless audio file that then counts as this note's audio.
+        return ""
     return text
+
+
+def _has_speakable_content(text: str, allowed_ranges: Iterable[Tuple[int, int]]) -> bool:
+    """Whether anything here is worth saying out loud.
+
+    Digits count: a field holding just ``42`` is a real thing to speak. Punctuation and
+    whitespace on their own do not.
+    """
+    ranges = list(allowed_ranges)
+    for ch in text:
+        if ch.isdigit():
+            return True
+        cp = ord(ch)
+        if any(lo <= cp <= hi for lo, hi in ranges):
+            return True
+    return False
 
 
 def _filter_script(text: str, allowed_ranges: Iterable[Tuple[int, int]]) -> str:

@@ -22,7 +22,7 @@ from __future__ import annotations
 import threading
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from aqt import mw
 from aqt.operations import QueryOp
@@ -49,11 +49,16 @@ from aqt.qt import (
 from aqt.sound import av_player
 from aqt.utils import askUser, showInfo, showWarning
 
+from ..core.audio_fields import (
+    plan_generated_fields,
+    resolve_audio_fields,
+    sound_field_names,
+)
 from ..core.conversion import ConversionMode, build_plan, scope_query
 from ..core.language_detect import detect_field_language
 from ..core.profiles import USER_PROFILE_DIR, load_profiles, match_profile, save_profile, slugify
+from ..core.role_detect import guess_role_mapping
 from ..core.role_schema import (
-    FieldBinding,
     Role,
     RoleMapping,
     ValidationError,
@@ -72,6 +77,7 @@ from ..ops.tts_runner import BatchOutcome, default_concurrency, run_tts_batch
 from ..tts.piper_provider import PiperProvider
 from ..tts.piper_voice_manager import CURATED_VOICES
 from .convert_dialog import (
+    _collect_raw_samples,
     _collect_samples,
     _decks_with_notetypes,
     addon_config,
@@ -191,6 +197,10 @@ class MainScreen(QDialog):
         self._notetype: Optional[dict] = None
         self._live_fields: List[Tuple[int, str]] = []
         self._samples: Dict[str, List[str]] = {}
+        #: Names of fields whose real content holds ``[sound:...]``, refreshed per pair.
+        #: Feeds core.audio_fields so audio the deck already had is bound to a native role
+        #: (kept, but never rendered) instead of falling through to the back of the card.
+        self._sound_fields: Set[str] = set()
         self._note_ids: List[int] = []
         self._html_mode = False
         self._html_dirty = False
@@ -431,6 +441,13 @@ class MainScreen(QDialog):
         self._note_ids = mw.col.find_notes(scope_query(notetype_name, deck))
         self._samples = _collect_samples(self._note_ids[:3])
 
+        # Which fields actually hold audio, for every branch below -- not just the detected
+        # one. It's what lets audio the deck already had be bound to a native role and so
+        # kept off the card, whether the mapping came from a profile, a carry-forward or a
+        # fresh guess. See core.audio_fields.
+        raw_samples = _collect_raw_samples(self._note_ids[:8])
+        self._sound_fields = sound_field_names(raw_samples)
+
         match = match_profile(notetype_name, self._live_fields)
         if match.usable:
             mapping = match.profile.to_mapping(live_fields=self._live_fields)
@@ -442,10 +459,16 @@ class MainScreen(QDialog):
             mapping = self._converted_mapping_override[1]
             self._converted_mapping_override = None
         else:
-            mapping = RoleMapping(
-                notetype_name=notetype_name,
-                fields=[FieldBinding(name=n, ord=o) for o, n in self._live_fields],
+            tmpls = self._notetype.get("tmpls") or [{}]
+            mapping = guess_role_mapping(
+                notetype_name,
+                self._live_fields,
+                raw_samples,
+                front_html=tmpls[0].get("qfmt", ""),
+                back_html=tmpls[0].get("afmt", ""),
+                css=self._notetype.get("css", ""),
             )
+        mapping = resolve_audio_fields(mapping, sound_fields=self._sound_fields)
 
         self.target_language.blockSignals(True)
         self.native_language.blockSignals(True)
@@ -570,6 +593,35 @@ class MainScreen(QDialog):
         self.native_language.setVisible(manual)
         self._update_language_banner()
 
+    def _majority_language(self, field_names: set) -> Optional[str]:
+        """The most common confidently-detected language among ``field_names``, or
+        ``None`` if none of them produced a confident guess."""
+        counts: Dict[str, int] = {}
+        for _ord, name in self._live_fields:
+            if name not in field_names:
+                continue
+            guess = detect_field_language(self._samples.get(name, []))
+            if guess.is_confident:
+                counts[guess.code] = counts.get(guess.code, 0) + 1
+        return max(counts.items(), key=lambda kv: kv[1])[0] if counts else None
+
+    def _structural_direction(self) -> Optional[str]:
+        """What's actually on the card *right now*, read straight off the live qfmt/afmt
+        -- an objective fact about the deck as it exists today, independent of any role
+        mapping (which describes what *will* happen once Convert runs, not what already
+        has). ``None`` if there's no notetype yet or neither side yields a confident guess.
+        """
+        if self._notetype is None or not self._notetype.get("tmpls"):
+            return None
+        tmpl = self._notetype["tmpls"][0]
+        front_fields = set(referenced_fields(tmpl.get("qfmt", "")))
+        back_fields = set(referenced_fields(tmpl.get("afmt", ""))) - front_fields
+        front_lang = self._majority_language(front_fields)
+        back_lang = self._majority_language(back_fields)
+        if not front_lang and not back_lang:
+            return None
+        return "%s → %s" % (front_lang or "?", back_lang or "?")
+
     def _update_language_banner(self) -> None:
         counts: Dict[str, int] = {}
         for _ord, name in self._live_fields:
@@ -583,8 +635,24 @@ class MainScreen(QDialog):
 
         target = self.target_language.text().strip()
         native = self.native_language.text().strip()
-        if target or native:
-            direction = "%s → %s" % (native or "?", target or "?")
+        current = self._structural_direction()
+
+        if self._direction_is_correct():
+            # Front already shows target -- "current" and "after converting" are the same
+            # thing, so there's nothing to contrast. Prefer the structural reading; fall
+            # back to the mapping's own target/native strings if detection came up empty.
+            direction = "%s (already converted)" % (
+                current or "%s → %s" % (target or "?", native or "?")
+            )
+        elif target or native:
+            after = "%s → %s" % (target or "?", native or "?")
+            direction = (
+                "Current: %s   |   after converting: %s" % (current, after)
+                if current
+                else "after converting: %s" % after
+            )
+        elif current:
+            direction = "Current: %s   -- map roles (or set manually) to see the direction after converting" % current
         else:
             direction = 'not set -- check "Set manually", or map roles and save a profile'
 
@@ -593,6 +661,13 @@ class MainScreen(QDialog):
     # -- mapping / templates --------------------------------------------------------
 
     def _current_mapping(self) -> RoleMapping:
+        """What the field list currently says, with the audio policy applied.
+
+        Resolving here rather than at each use means every consumer -- preview, direction
+        check, sample text, Convert, "save as profile" -- sees the same thing: generated
+        fields hold the target audio, and any audio the deck already had is bound to a
+        native role so it stays on the note but never reaches a card.
+        """
         assignments = self.field_list.current_assignments()
         target = self.target_language.text().strip() or None
         native = self.native_language.text().strip() or None
@@ -600,9 +675,26 @@ class MainScreen(QDialog):
             self._notetype_name, assignments, target_language=target, native_language=native
         )
         mapping.render_order = self.field_list.current_render_order() or None
-        return mapping
+        return resolve_audio_fields(mapping, sound_fields=self._sound_fields)
 
-    def _current_templates(self) -> GeneratedTemplates:
+    def _conversion_mapping(self) -> Tuple[RoleMapping, List[Tuple[Role, str]]]:
+        """``(mapping, [(role, new field name), ...])`` for an actual conversion.
+
+        Differs from :meth:`_current_mapping` in one way: it also accounts for the audio
+        fields the conversion is about to create, so the templates it generates can already
+        reference them. They don't exist on the notetype being looked at -- only on the
+        clone, once ``apply_plan`` has built it.
+        """
+        mapping = self._current_mapping()
+        planned = plan_generated_fields(mapping)
+        if not planned:
+            return mapping, []
+        resolved = resolve_audio_fields(
+            mapping, sound_fields=self._sound_fields, extra_fields=planned
+        )
+        return resolved, planned
+
+    def _current_templates(self, mapping: Optional[RoleMapping] = None) -> GeneratedTemplates:
         if self._html_mode:
             front, back, css = self.html_editor.get_content()
             return GeneratedTemplates(
@@ -611,7 +703,8 @@ class MainScreen(QDialog):
                 css=css,
                 template_name=addon_config().get("template_name", "Production"),
             )
-        mapping = self._current_mapping()
+        if mapping is None:
+            mapping = self._current_mapping()
         opts = template_options_from_config(addon_config())
         order = self.field_list.current_render_order()
         front_order, back_order = split_render_order(order, audio_on_front=opts.audio_on_front)
@@ -627,11 +720,13 @@ class MainScreen(QDialog):
 
     def _refresh_preview(self) -> None:
         if not self._note_ids or self._notetype is None:
+            self.preview.clear()
             return
         try:
             templates = self._current_templates()
         except ValidationError as exc:
             self.status_label.setText("Cannot preview yet: %s" % exc)
+            self.preview.clear("Map the fields (or fix the errors above) to see a preview.")
             return
         self.status_label.setText("")
         note = mw.col.get_note(self._note_ids[0])
@@ -703,7 +798,7 @@ class MainScreen(QDialog):
                         continue
                     try:
                         text = note[binding.name]
-                    except (KeyError, IndexError):
+                    except (KeyError, IndexError, ValueError):
                         continue
                     if text.strip():
                         return text
@@ -769,12 +864,15 @@ class MainScreen(QDialog):
             showWarning("No notes in the selected deck/notetype.", parent=self)
             return
         try:
-            templates = self._current_templates()
+            # The conversion's own mapping, which knows about the audio fields it is about
+            # to create -- not self._current_mapping(), which describes the notetype as it
+            # stands right now.
+            mapping, planned_fields = self._conversion_mapping()
+            templates = self._current_templates(mapping)
         except ValidationError as exc:
             showWarning("Cannot convert: %s" % exc, parent=self)
             return
 
-        mapping = self._current_mapping()
         config = addon_config()
         mode = self.mode_box.currentData()
         source_deck_at_start = self._deck_name
@@ -788,6 +886,7 @@ class MainScreen(QDialog):
             dry_run=False,
         )
         plan.strip_tags = list(config.get("strip_tags", ["leech"]))
+        plan.new_fields = [name for _role, name in planned_fields]
         plan.note_ids = list(mw.col.find_notes(plan.scope_query))
 
         validation = plan.validate()
@@ -814,12 +913,13 @@ class MainScreen(QDialog):
                 if mode is ConversionMode.NEW_DECK
                 else source_deck_at_start
             )
-            # Cloning preserves field names/order 1:1, so this exact mapping (role bindings
-            # don't change through a conversion -- only which side the template puts them
-            # on does) is already correct for the clone, whether or not it was ever saved
-            # as a profile. Without this, a not-yet-profiled deck would land on the new
-            # pair with a blank field list, and Generate TTS audio would look "not
-            # converted yet" even though it just was.
+            # The clone keeps every source field at its own name and ord and only appends
+            # the generated audio field(s) -- which this mapping already describes, since
+            # it's the one the conversion ran with. Role bindings don't otherwise change
+            # through a conversion (only which side the template puts them on does), so it
+            # is already correct for the clone, profile or no profile. Without this, a
+            # not-yet-profiled deck would land on the new pair with a blank field list and
+            # Generate TTS audio would look "not converted yet" even though it just was.
             self._converted_mapping_override = (result.clone_notetype_name, mapping)
             self._refresh_pairs()
             # _select_pair (via _on_pair_changed) already calls _update_action_state, and
@@ -845,12 +945,30 @@ class MainScreen(QDialog):
             return
         match = match_profile(self._notetype_name, self._live_fields)
         mapping = (
-            match.profile.to_mapping(live_fields=self._live_fields)
+            # A profile's own audio bindings go through the same policy as everything else:
+            # a shipped profile written before generated audio fields existed still names
+            # the deck's original audio field for TargetAudio, and writing English speech
+            # into the field holding the deck's Japanese pronunciation is exactly what this
+            # addon no longer does. resolve_audio_fields demotes it and points the target
+            # roles at the generated field instead.
+            resolve_audio_fields(
+                match.profile.to_mapping(live_fields=self._live_fields),
+                sound_fields=self._sound_fields,
+            )
             if match.usable
             else self._current_mapping()
         )
         if not mapping.validate().ok:
             showWarning("Map the fields (or fix the errors shown) before generating audio.", parent=self)
+            return
+
+        if mapping.first(Role.TARGET_AUDIO) is None and mapping.first(Role.TARGET_SENTENCE_AUDIO) is None:
+            showWarning(
+                "This notetype has no field for generated audio yet.\n\nConvert the deck "
+                "first -- the conversion creates that field. Generating audio into a field "
+                "the deck already had would overwrite the original recordings.",
+                parent=self,
+            )
             return
 
         voice_id = self.voice_box.currentData()
@@ -921,10 +1039,22 @@ class MainScreen(QDialog):
                 if outcome.remaining
                 else ""
             )
+            # A run that only ever found "nothing to say" completes fast and reports no
+            # failures, which reads as success. Say plainly that no audio came out of it,
+            # and name the usual cause -- a voice that speaks a different language than the
+            # text it was handed.
+            skipped_note = ""
+            if outcome.skipped:
+                skipped_note = (
+                    "\n\n%d note%s had nothing to synthesize -- the source field was empty, "
+                    "or its text is in a script the selected voice doesn't speak. Check that "
+                    "the voice matches the language now on the front of the card."
+                    % (outcome.skipped, "" if outcome.skipped == 1 else "s")
+                )
             headline = "Stopped early." if outcome.cancelled else "Done."
             showInfo(
-                "%s %d notes generated, %d failed.%s"
-                % (headline, outcome.done, outcome.failed, remaining_note),
+                "%s %d notes generated, %d failed.%s%s"
+                % (headline, outcome.done, outcome.failed, remaining_note, skipped_note),
                 parent=self,
             )
             # Refreshes the whole pair's state, including _update_action_state, from the

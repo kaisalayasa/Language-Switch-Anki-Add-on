@@ -206,6 +206,51 @@ looks for. Rather than chase the exact flag, `main_screen.py` now calls
 `MainScreen._refresh_anki_main_window`), since `deckBrowser.refresh` is stable/long-standing
 but not worth a hard crash if a future build ever renames it.
 
+## Adding fields to the clone (generated audio fields)
+
+A conversion now creates the field its generated audio will live in, rather than reusing
+one the deck already had (see `addon/core/audio_fields.py` for why). That makes this the
+first place the addon changes a notetype's **field list**, not just its templates.
+
+**What it does, and why this shape:**
+
+- The field is added to the clone dict **before** `col.models.add_dict(...)` — i.e. the
+  notetype is *created* with the extra field, rather than the field being added to an
+  already-saved notetype. That avoids a second schema-level write entirely, and avoids
+  Anki's "add field to existing notetype" path (which rewrites every note of that type).
+- `notetype_manager.make_field_factory` prefers **`col.models.new_field(name)`** (confirmed
+  present above), so the dict carries whatever keys this Anki build expects. If that call
+  doesn't accept a bare name on some build, it falls back to deep-copying an existing field
+  dict and clearing the keys that identify it (`id`, `ord`, `description`, `tag`) — copying
+  the `id` would make the new field indistinguishable from the one it was copied from.
+  `col.models.add_field` is deliberately **not** used: it's documented as operating on a
+  notetype, and appending to `flds` ourselves needs no assumption about its signature.
+- Fields are **appended after** the source's own fields, never inserted among them. This
+  is what keeps the Flip-in-place field map correct under either reading: matched by
+  *name*, the appended names exist only on the clone and match nothing; matched by
+  *position*, their ords are past the end of the source's field list, so there's nothing
+  there either. Inserting them next to their sibling audio field would shift every later
+  field by one and make the positional reading silently wrong.
+- `build_clone` verifies the fields are actually present on the saved notetype and raises
+  `ApiMismatch` naming them if not — the generated templates reference them, so a silent
+  drop would leave every card rendering a dangling `{{Field}}`.
+
+**To confirm on the first real run** (both fail loudly rather than corrupt anything):
+
+1. **Flip-in-place with an added field.** New-deck mode is unaffected (notes are built
+   fresh from the clone and the new field is simply left empty, which is covered by
+   `tests/test_notetype_manager.py::TestGeneratedAudioFieldsAreCreatedOnTheClone`). Flip in
+   place goes through `change_notetype_of_notes` with Anki's own prefilled map, and the
+   appended-at-the-end reasoning above is a *deduction* from how such a map can be built,
+   not something verified against this build. Check that converting in Flip-in-place mode
+   leaves every original field's content intact on the notes.
+2. **The generated field name contains a space and parentheses** (`ddc-audio (EN)`), which
+   is ordinary for Anki field names and renders as `{{ddc-audio (EN)}}` /
+   `{{#ddc-audio (EN)}}` — neither character is special to the template parser, and no
+   forbidden character (`:`, `"`, `{`, `}`) is used. If Anki nonetheless rejects or renames
+   it, `build_clone`'s verification raises `ApiMismatch` immediately, and the fix is to
+   change `_ROLE_STEM` in `addon/core/audio_fields.py`.
+
 ## Still to confirm (exact signatures, not just presence)
 
 Presence is verified; the precise parameter lists are not, because the shipped modules are
@@ -415,10 +460,11 @@ of this section for what actually shipped.
   `col.models.copy()`. Naming is our own `_unique_notetype_name()` (see the trap above),
   not `ensure_name_unique`. Gives us control of the name and one predictable add step
   across versions.
-- **Field maps**: because the clone preserves field names, order and count, the
-  change-notetype map Anki prefills is an **identity** map. That is the correct explicit
-  map here — role mapping drives template HTML only, never field migration. Non-identity
-  maps only become relevant if we add or remove fields on the clone.
+- **Field maps**: the clone keeps every source field at its own name and ord, so the
+  change-notetype map Anki prefills is an identity map *for those fields*. Role mapping
+  drives template HTML only, never field migration.
+  **This is now the "we add fields on the clone" case the line below used to say was
+  hypothetical** — see the next section.
 - **`trash_files` vs delete**: trashing is recoverable, which is why the (M5) media cleanup
   uses it.
 - **Preview writes nothing at all**: see the `aqt.clayout.CardLayout` section above --

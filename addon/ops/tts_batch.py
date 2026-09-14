@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..core.audio_fields import AUDIO_DONE_TAG
 from ..core.role_schema import AUDIO_SOURCE_ROLES, RoleMapping
 from ..core.template_generator import TemplateOptions, generate_templates
 from ..tts.piper_provider import EmptyTextError
@@ -34,17 +35,21 @@ __all__ = [
     "finish_audio_batch",
 ]
 
-#: Marks a note as having current, generated audio. The resumability/caching mechanism for
-#: the whole batch: a re-run only touches notes without this tag, unless ``force=True``.
-#: Namespaced (matches template_generator.py's ``ddc`` CSS-class prefix) so it reads
-#: unambiguously in the Browser as belonging to this addon.
-AUDIO_DONE_TAG = "ddc-tts-generated"
+# AUDIO_DONE_TAG is defined in core.audio_fields (imported above) and re-exported here,
+# where it has always been imported from. It moved so the conversion layer can strip it off
+# duplicated notes without ops/ importing ops/ in a circle.
 
 
 @dataclass
 class NoteAudioResult:
     note_id: int
     fields_written: List[str] = field(default_factory=list)
+    #: Audio fields that had nothing to synthesize -- the source field was empty, or held
+    #: only characters the chosen voice cannot speak. Counted and reported rather than
+    #: passed over in silence: a whole run of these looks exactly like success (no errors,
+    #: finishes fast) while producing no audio whatsoever, which is a confusing way to
+    #: discover a voice/deck mismatch.
+    skipped: List[str] = field(default_factory=list)
     #: Set only for a real synthesis failure (not "nothing to say") -- the note is left
     #: untagged and will be retried on the next run.
     error: Optional[str] = None
@@ -99,12 +104,13 @@ def generate_note_audio(
             continue
         try:
             text = note[source_field.name]
-        except (KeyError, IndexError):
+        except (KeyError, IndexError, ValueError):
             continue
 
         try:
             wav_path = provider.synthesize(text, voice_id=voice_id)
         except EmptyTextError:
+            result.skipped.append(audio_field.name)
             continue
         except Exception as exc:  # noqa: BLE001 -- one note's failure must not sink the batch
             result.error = "%s: %s" % (type(exc).__name__, exc)
@@ -149,7 +155,7 @@ def plan_note_audio(note: Any, mapping: RoleMapping) -> List[PendingSynthesis]:
             continue
         try:
             text = note[source_field.name]
-        except (KeyError, IndexError):
+        except (KeyError, IndexError, ValueError):
             continue
         pending.append(PendingSynthesis(audio_field.name, text))
     return pending
@@ -161,6 +167,7 @@ def apply_note_audio(
     synthesized: List[Tuple[str, Path]],
     *,
     error: Optional[str] = None,
+    skipped: Optional[List[str]] = None,
 ) -> NoteAudioResult:
     """The write-only half of :func:`generate_note_audio`: writes already-synthesized
     ``(audio_field_name, wav_path)`` pairs into ``note``, atomically, exactly like it does.
@@ -169,7 +176,7 @@ def apply_note_audio(
     is written and the note is left untagged, so it's retried on the next run, matching
     "one bad note must not sink the batch, but must not be falsely marked done either."
     """
-    result = NoteAudioResult(note_id=note.id)
+    result = NoteAudioResult(note_id=note.id, skipped=list(skipped or []))
     if error is not None:
         result.error = error
         return result
