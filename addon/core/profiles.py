@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
 
+from .audio_fields import is_generated_field
 from .role_schema import RoleMapping, ValidationResult
 
 __all__ = [
@@ -157,7 +158,10 @@ def save_profile(
     if description:
         data["description"] = description
     data["version"] = 1
-    field_names = [f["name"] for f in data["fields"]]
+    # Same reasoning as match_profile's: a profile saved off a converted deck must still
+    # match the unconverted original it came from, so the addon's own generated fields stay
+    # out of the fingerprint that identifies the deck.
+    field_names = [f["name"] for f in data["fields"] if not is_generated_field(f["name"])]
     data["binds_to"] = {
         "notetype_names": [mapping.notetype_name] if mapping.notetype_name else [],
         "field_fingerprint": field_names,
@@ -186,7 +190,12 @@ def match_profile(
     content into every note.
     """
     candidates = list(profiles) if profiles is not None else load_profiles()
-    live_names = [name for _, name in sorted(live_fields)]
+    # Fields this addon generated are excluded from the fingerprint: they describe a
+    # conversion's output, not the deck's own identity. Without this, converting a deck
+    # would change its fingerprint (the clone carries an extra audio field) and its own
+    # profile would stop matching the moment it was most needed -- on reopening the
+    # converted deck to generate audio for it.
+    live_names = [name for _, name in sorted(live_fields) if not is_generated_field(name)]
 
     by_name = [p for p in candidates if notetype_name in p.notetype_names]
     fallback: Optional[Profile] = by_name[0] if by_name else None

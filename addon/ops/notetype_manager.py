@@ -15,6 +15,7 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from ..core.audio_fields import AUDIO_DONE_TAG
 from ..core.conversion import ConversionMode, ConversionPlan
 
 __all__ = ["ConversionResult", "ApiMismatch", "apply_plan", "probe_api", "shape_notetype"]
@@ -147,15 +148,90 @@ def _unique_notetype_name(col: Any, desired: str) -> str:
         suffix += 1
 
 
+#: Keys on an existing field dict that describe *that* field rather than a new one. ``id``
+#: matters most: modern Anki tracks fields by it across a change-notetype, so a copy that
+#: kept its template's id would be indistinguishable from the field it was copied from.
+_FIELD_IDENTITY_KEYS = ("id", "ord", "description", "tag")
+
+
+def _field_from_template(name: str, template: Dict[str, Any]) -> Dict[str, Any]:
+    """A new field dict shaped like one the notetype already has.
+
+    The fallback for when ``col.models.new_field`` isn't usable. Copying an existing field
+    means the new one inherits this deck's font and size (so it looks native in the editor)
+    and, more importantly, carries whatever keys *this* Anki build expects, without this
+    module having to know what they are.
+    """
+    field = copy.deepcopy(template)
+    for key in _FIELD_IDENTITY_KEYS:
+        field.pop(key, None)
+    field["name"] = name
+    field["sticky"] = False
+    return field
+
+
+def make_field_factory(col: Any) -> Callable[[str, Dict[str, Any]], Dict[str, Any]]:
+    """Return ``make_field(name, template) -> field dict`` for this collection.
+
+    Prefers ``col.models.new_field``, which ``docs/api-notes.md`` confirms is present on the
+    target build (presence verified by byte-scanning; the exact signature was not, hence the
+    guarded call). Falls back to copying an existing field rather than hand-building a dict
+    whose required keys this addon would be guessing at.
+    """
+    new_field = getattr(col.models, "new_field", None)
+
+    def make_field(name: str, template: Dict[str, Any]) -> Dict[str, Any]:
+        if new_field is not None:
+            try:
+                built = new_field(name)
+            except TypeError:
+                built = None  # different calling convention on this build; use the fallback
+            if isinstance(built, dict):
+                built["name"] = name
+                return built
+        return _field_from_template(name, template)
+
+    return make_field
+
+
 def shape_notetype(source: Dict[str, Any], *, name: str, front: str, back: str,
-                    css: str, template_name: str) -> Dict[str, Any]:
-    """Build the notetype dict a clone should be saved as."""
+                    css: str, template_name: str,
+                    extra_fields: Sequence[str] = (),
+                    make_field: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+                    ) -> Dict[str, Any]:
+    """Build the notetype dict a clone should be saved as.
+
+    ``extra_fields`` names fields to add that the source doesn't have -- the generated audio
+    fields, per ``core.audio_fields``. They are **appended after** the source's own fields
+    and never inserted among them, which keeps every original field at its original ord.
+    That is what lets a Flip-in-place change-notetype keep mapping old field *n* to new field
+    *n*, with the appended ones having no counterpart to come from (see ``_flip_in_place``).
+
+    Adding a field that is already there is a no-op, so converting an already-converted
+    notetype a second time doesn't accumulate duplicates.
+    """
     shaped = copy.deepcopy(source)
     shaped["id"] = 0
     shaped["name"] = name
 
     if not shaped.get("tmpls"):
         raise ApiMismatch("notetype %r has no templates" % source.get("name"))
+
+    if extra_fields:
+        flds = shaped.get("flds")
+        if not flds:
+            raise ApiMismatch("notetype %r has no fields to extend" % source.get("name"))
+        flds.sort(key=lambda f: int(f.get("ord", 0)))
+        build = make_field or _field_from_template
+        present = {str(f["name"]).strip().lower() for f in flds}
+        for field_name in extra_fields:
+            if str(field_name).strip().lower() in present:
+                continue
+            flds.append(build(field_name, flds[-1]))
+            present.add(str(field_name).strip().lower())
+        for index, fld in enumerate(flds):
+            fld["ord"] = index
+        shaped["flds"] = flds
 
     # M1 emits a single template. Keep the first, drop the rest: extra templates would
     # generate extra cards in a direction we did not design.
@@ -182,7 +258,9 @@ def build_clone(col: Any, plan: ConversionPlan, front: str, back: str, css: str,
 
     name = _unique_notetype_name(col, plan.clone_notetype)
     clone = shape_notetype(source, name=name, front=front, back=back, css=css,
-                            template_name=template_name)
+                            template_name=template_name,
+                            extra_fields=plan.new_fields,
+                            make_field=make_field_factory(col))
 
     added = _call_checked(col.models.add_dict, "col.models.add_dict", notetype=clone)
     clone_id = _extract_id(added, "col.models.add_dict")
@@ -196,6 +274,18 @@ def build_clone(col: Any, plan: ConversionPlan, front: str, back: str, css: str,
     saved = col.models.by_name(clone["name"])
     if saved is None:
         raise ApiMismatch("clone %r was not saved" % clone["name"])
+
+    # The generated templates already reference these fields; a build that silently dropped
+    # one would leave every card rendering a dangling {{Field}}. Checked against what was
+    # actually saved, not against what we asked for.
+    saved_names = {str(f["name"]).strip().lower() for f in saved.get("flds", [])}
+    missing = [n for n in plan.new_fields if str(n).strip().lower() not in saved_names]
+    if missing:
+        raise ApiMismatch(
+            "the clone was saved without the generated audio field(s) %s. Verify "
+            "col.models.new_field/add_dict against your Anki build (docs/api-notes.md)."
+            % ", ".join(repr(n) for n in missing)
+        )
     return saved
 
 
@@ -207,9 +297,19 @@ def build_clone(col: Any, plan: ConversionPlan, front: str, back: str, css: str,
 def _flip_in_place(col: Any, plan: ConversionPlan, clone: Dict[str, Any]) -> int:
     """Repoint the existing notes onto the clone.
 
-    The clone preserves field names, order and count, so the field/template map Anki
-    prefills is an identity map -- which is the correct explicit map here, not a "blind
-    positional" one. Role mapping drives template HTML only, never field migration.
+    The clone keeps every source field at its original name and ord, and only *appends* the
+    generated audio field(s) after them (see ``shape_notetype``). So Anki's prefilled
+    field map is an identity map for all the source's own fields, with the appended ones
+    having no source field to come from -- which is exactly right: they are meant to start
+    empty, and get filled by the TTS run. Role mapping drives template HTML only, never
+    field migration.
+
+    The appended-at-the-end ordering is deliberate rather than incidental. It makes the
+    prefilled map correct whether Anki builds it by matching field *names* (the appended
+    names exist only on the clone, so they match nothing) or by position (their ords are
+    past the end of the source's field list, so there is nothing at that position either).
+    Inserting them next to their sibling fields instead would shift every later field by one
+    and make the positional reading silently wrong. See docs/api-notes.md.
     """
     source = col.models.by_name(plan.source_notetype)
     info = _call_checked(
@@ -234,14 +334,15 @@ def _flip_in_place(col: Any, plan: ConversionPlan, clone: Dict[str, Any]) -> int
 def _copy_fields_by_name(source_note: Any, target_note: Any, field_names: Sequence[str]) -> None:
     """Fill ``target_note``'s fields from ``source_note``, matching by name.
 
-    Fields the clone has that the source note doesn't (shouldn't normally happen, since
-    the clone's field list comes from the source notetype) are silently skipped rather
-    than raised -- this is a best-effort copy, not a validation step.
+    Fields the clone has that the source note doesn't are skipped rather than raised. That
+    is the normal case now, not an edge one: the clone carries the generated audio field(s)
+    the conversion just added, and those are *meant* to arrive empty -- there is nothing on
+    the source note to copy into them, and the TTS run fills them later.
     """
     for name in field_names:
         try:
             value = source_note[name]
-        except (KeyError, IndexError):
+        except (KeyError, IndexError, ValueError):
             continue
         target_note[name] = value
 
@@ -256,6 +357,12 @@ def _new_deck(col: Any, plan: ConversionPlan, clone: Dict[str, Any]) -> int:
     deck_id = _resolve_deck(col, plan.target_deck)
     clone_fields = [f["name"] for f in clone["flds"]]
     strip = {t.lower() for t in plan.strip_tags}
+    # Always stripped, regardless of what the user configured: the tag means "this note's
+    # generated audio is current", and a brand-new duplicate's audio never is. Carrying it
+    # over would make the TTS batch skip the note as already done, leaving it permanently
+    # silent -- its generated audio field is empty, since only the *source* fields are
+    # copied across.
+    strip.add(AUDIO_DONE_TAG.lower())
 
     created = 0
     for nid in plan.note_ids:

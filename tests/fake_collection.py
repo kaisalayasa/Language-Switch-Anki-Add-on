@@ -21,11 +21,25 @@ class FakeNote:
         self.fields = list(values) + [""] * (len(field_names) - len(values))
         self.tags: List[str] = list(tags or [])
 
+    def _index(self, key: str) -> int:
+        """Raises ``KeyError`` for an unknown field, like a mapping -- and like the
+        production code that reads notes has always been written to expect.
+
+        A bare ``list.index`` raises ``ValueError`` instead, which no caller catches, so a
+        notetype that legitimately has a field the *note* doesn't (exactly what a clone with
+        a freshly added audio field looks like mid-conversion) blew up here rather than
+        being skipped. That was this double being unfaithful, not the addon being wrong.
+        """
+        try:
+            return self._names.index(key)
+        except ValueError:
+            raise KeyError(key) from None
+
     def __getitem__(self, key: str) -> str:
-        return self.fields[self._names.index(key)]
+        return self.fields[self._index(key)]
 
     def __setitem__(self, key: str, value: str) -> None:
-        self.fields[self._names.index(key)] = value
+        self.fields[self._index(key)] = value
 
     def keys(self) -> List[str]:
         return list(self._names)
@@ -89,6 +103,17 @@ class FakeModels:
     def field_names(self, notetype: dict) -> List[str]:
         return [f["name"] for f in notetype["flds"]]
 
+    def new_field(self, name: str) -> dict:
+        """Mirrors real Anki's ``ModelManager.new_field``: builds a detached field dict.
+
+        Confirmed present on the target build (docs/api-notes.md). It is modelled here
+        because ``notetype_manager.make_field_factory`` prefers it, so the fake has to offer
+        it for the tests to exercise the path production actually takes. The ord is left for
+        whoever inserts it into a notetype to assign, exactly as real Anki does.
+        """
+        return {"name": name, "ord": None, "sticky": False, "rtl": False,
+                "font": "Arial", "size": 20, "description": ""}
+
     def change_notetype_info(self, old_notetype_id: int, new_notetype_id: int) -> _ChangeNotetypeInfo:
         return _ChangeNotetypeInfo(_ChangeNotetypeRequest(old_notetype_id, new_notetype_id))
 
@@ -100,6 +125,14 @@ class FakeModels:
             note = self.col.notes[nid]
             note.mid = request.new_notetype_id
             note._names = list(names)
+            # Real Anki resizes each note's values to the new notetype's field count, with
+            # fields that have no counterpart in the old notetype arriving empty. Modelled
+            # because the clone is now a *superset* of the source (it appends the generated
+            # audio field), so without this a flipped note would have a name for that field
+            # and no slot behind it.
+            if len(note.fields) < len(names):
+                note.fields += [""] * (len(names) - len(note.fields))
+            del note.fields[len(names):]
         for card in self.col.cards:
             if card["nid"] in set(request.note_ids):
                 card["mid"] = request.new_notetype_id

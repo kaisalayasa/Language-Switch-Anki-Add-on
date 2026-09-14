@@ -20,7 +20,8 @@ from typing import Optional, Sequence, Tuple
 from .piper_binary_manager import RunFn, _run_subprocess, ensure_piper_binary
 from .piper_voice_manager import DownloadFn, ensure_voice
 from .provider_base import TTSProvider
-from .sanitize import LATIN_RANGES, sanitize_text
+from .sanitize import sanitize_text
+from .script_ranges import ranges_for_voice
 
 __all__ = ["PiperProvider", "EmptyTextError", "SynthesisError"]
 
@@ -38,10 +39,19 @@ class PiperProvider(TTSProvider):
         self,
         cache_dir: Path,
         *,
-        allowed_ranges: Sequence[Tuple[int, int]] = LATIN_RANGES,
+        allowed_ranges: Optional[Sequence[Tuple[int, int]]] = None,
         download_to: Optional[DownloadFn] = None,
         run: Optional[RunFn] = None,
     ):
+        """``allowed_ranges`` defaults to ``None``, meaning "work it out from the voice"
+        (see :mod:`addon.tts.script_ranges`) rather than to a fixed script.
+
+        That default used to be a Latin range list, which quietly assumed every deck this
+        addon would ever convert speaks a Latin-script language. For anything else it
+        filtered the text away to nothing, which surfaces as "empty field", so a run could
+        complete with no errors and no audio. Deriving from the voice makes the right thing
+        happen without every call site having to remember to pass this.
+        """
         self.cache_dir = Path(cache_dir)
         self.allowed_ranges = allowed_ranges
         self._download_to = download_to
@@ -74,10 +84,17 @@ class PiperProvider(TTSProvider):
             voice_future.result()
 
     def synthesize(self, text: str, *, voice_id: str, out_path: Optional[Path] = None) -> Path:
-        clean = sanitize_text(text, allowed_ranges=self.allowed_ranges)
+        ranges = (
+            self.allowed_ranges
+            if self.allowed_ranges is not None
+            else ranges_for_voice(voice_id)
+        )
+        clean = sanitize_text(text, allowed_ranges=ranges)
         if not clean:
             raise EmptyTextError(
-                "Nothing left to synthesize after sanitizing %r" % (text,)
+                "Nothing left to synthesize after sanitizing %r (voice %r speaks a "
+                "different script than this text is written in, or the field is empty)"
+                % (text, voice_id)
             )
 
         binary = ensure_piper_binary(

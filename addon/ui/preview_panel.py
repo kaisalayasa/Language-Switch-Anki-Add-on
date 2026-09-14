@@ -132,6 +132,25 @@ class PreviewPanel(QWidget):
                 self.webview.setPlaybackRequiresGesture(True)
             av_player.play_tags(audio)
 
+    def clear(self, message: str = "") -> None:
+        """Blank the preview immediately -- for whenever there's nothing valid to render
+        (an incomplete mapping, no notes selected, switching to a pair not ready yet).
+
+        Without this, a caller that just stops calling :meth:`render`/:meth:`refresh`
+        leaves whatever card was on screen from the *previous* selection, which reads as
+        the preview being stuck rather than as there being nothing to show yet -- this is
+        the fix for exactly that: switching decks and still seeing the old deck's card.
+        """
+        if self._render_timer:
+            self._render_timer.stop()
+            self._render_timer = None
+        self._note = None
+        self._model = None
+        self._rendered_card = None
+        self._have_autoplayed = False
+        text = ('<div style="padding: 24px; opacity: 0.6;">%s</div>' % message) if message else ""
+        self.webview.eval("_showAnswer(%s, %s);" % (json.dumps(text), json.dumps([])))
+
     def show_side(self, *, front: bool) -> None:
         self._show_front = front
         self._have_autoplayed = False

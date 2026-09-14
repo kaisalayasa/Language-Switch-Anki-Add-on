@@ -70,7 +70,13 @@ class TestNoLanguageKnowledge(unittest.TestCase):
 
     # The one permitted exception: "furigana" names an Anki *template filter*, and appears
     # only in prose explaining that filters are opaque strings supplied by the profile.
-    PURE_MODULES = ["role_schema.py", "template_generator.py"]
+    #
+    # ``audio_fields.py`` is held to the same bar even though it is the one module that
+    # matches on a field name at all. What it matches is the name *it* chose, which is why
+    # that name must stay free of any language: it is written into real collections, and a
+    # deck converted to one language must still be recognised after being re-converted to
+    # another. ``role_detect.py`` is deliberately absent -- naming languages is its job.
+    PURE_MODULES = ["audio_fields.py", "role_schema.py", "template_generator.py"]
 
     def test_pure_modules_are_language_agnostic(self):
         for name, source in _core_sources():

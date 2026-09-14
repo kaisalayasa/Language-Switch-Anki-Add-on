@@ -58,6 +58,11 @@ def cache_dir() -> Path:
 class BatchOutcome:
     done: int = 0
     failed: int = 0
+    #: Notes that produced no audio because there was nothing to say -- an empty source
+    #: field, or text in a script the chosen voice doesn't speak. Surfaced separately from
+    #: ``failed`` because it isn't an error, and separately from ``done`` because a run that
+    #: is entirely these looks like a success that silently did nothing.
+    skipped: int = 0
     #: Notes still lacking generated audio after this run -- either because "Limit" left
     #: them untouched, or because they failed. Recomputed via ``notes_needing_audio`` after
     #: the run rather than tracked by hand, so it's correct regardless of *why* a note is
@@ -71,18 +76,24 @@ class BatchOutcome:
 
 def _synth_one(
     provider: PiperProvider, voice_id: str, pending: list
-) -> Tuple[Optional[List[Tuple[str, Path]]], Optional[str]]:
-    """Runs on a worker thread: pure synthesis, no ``col``/``note`` access at all."""
+) -> Tuple[Optional[List[Tuple[str, Path]]], Optional[str], List[str]]:
+    """Runs on a worker thread: pure synthesis, no ``col``/``note`` access at all.
+
+    Returns ``(synthesized, error, skipped)`` -- ``skipped`` naming the audio fields that
+    had nothing to say, so the caller can report them rather than lose them.
+    """
     synthesized: List[Tuple[str, Path]] = []
+    skipped: List[str] = []
     for item in pending:
         try:
             wav_path = provider.synthesize(item.text, voice_id=voice_id)
         except EmptyTextError:
+            skipped.append(item.audio_field)
             continue
         except Exception as exc:  # noqa: BLE001 -- reported per-note, must not sink the batch
-            return None, "%s: %s" % (type(exc).__name__, exc)
+            return None, "%s: %s" % (type(exc).__name__, exc), skipped
         synthesized.append((item.audio_field, wav_path))
-    return synthesized, None
+    return synthesized, None, skipped
 
 
 def run_tts_batch(
@@ -144,10 +155,12 @@ def run_tts_batch(
                 break
             note = col.get_note(nid)
             result = generate_note_audio(col, note, mapping, provider, voice_id)
-            if result.ok:
+            if not result.ok:
+                outcome.failed += 1
+            elif result.changed:
                 outcome.done += 1
             else:
-                outcome.failed += 1
+                outcome.skipped += 1
             report(i + 1)
 
     def run_concurrent(col: Any) -> None:
@@ -167,13 +180,17 @@ def run_tts_batch(
             }
             for future in as_completed(futures):
                 nid = futures[future]
-                synthesized, error = future.result()
+                synthesized, error, skipped = future.result()
                 note = col.get_note(nid)
-                result = apply_note_audio(col, note, synthesized or [], error=error)
-                if result.ok:
+                result = apply_note_audio(
+                    col, note, synthesized or [], error=error, skipped=skipped
+                )
+                if not result.ok:
+                    outcome.failed += 1
+                elif result.changed:
                     outcome.done += 1
                 else:
-                    outcome.failed += 1
+                    outcome.skipped += 1
                 done_count += 1
                 report(done_count)
                 if cancel_requested():
@@ -190,6 +207,14 @@ def run_tts_batch(
             else:
                 run_sequential(col)
 
+        # Safe to run unconditionally, including after a partial or cancelled run, because
+        # the field this turns on is one the conversion *created* and left empty (see
+        # core.audio_fields). Notes this run never reached simply render no audio until
+        # their turn comes. That was emphatically not true under the previous design, where
+        # the target audio field was an existing one still holding the demoted language's
+        # audio -- there, flipping the template early made every unprocessed note start
+        # playing exactly the audio the conversion was meant to retire. The hazard is gone
+        # at its source rather than worked around with a "did everything finish?" gate.
         options = replace(template_options_from_config(config), include_audio=True)
         finish_audio_batch(
             col, notetype, mapping, source_css=notetype.get("css", ""), options=options
