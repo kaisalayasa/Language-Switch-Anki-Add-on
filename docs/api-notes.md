@@ -206,6 +206,23 @@ looks for. Rather than chase the exact flag, `main_screen.py` now calls
 `MainScreen._refresh_anki_main_window`), since `deckBrowser.refresh` is stable/long-standing
 but not worth a hard crash if a future build ever renames it.
 
+## The `text:` field modifier (role_detect's mixed text+audio field fix)
+
+`FieldBinding.filter` (already used for Core 2000's `furigana` filter) is now also set to
+`"text"` for a field that mixes real content with an embedded `[sound:...]` reference in the
+same field (see `core/role_detect.py`'s `_filter_for`). This relies on `{{text:Field}}`
+stripping special references (sound, images) and HTML from a field's rendered value.
+
+**This is core Anki template syntax, not a Python/aqt API** — documented, long-standing,
+part of the template-rendering language itself rather than something that has shifted across
+`aqt`/`anki` releases the way Python method signatures have (see the traps below). It was not
+independently re-verified against a real running Anki 26.08.1 instance this pass; confirmed
+only by documentation and by the reproduction in `tests/test_role_detect.py`. **Verify it
+visually** the first time a mixed-field deck (the German test deck) goes through the live
+preview: the term should render as plain text with no leftover play icon for its own
+original-language audio. If `{{text:Field}}` behaves differently than documented on this
+build, that would show up immediately there, before any real note is touched.
+
 ## Adding fields to the clone (generated audio fields)
 
 A conversion now creates the field its generated audio will live in, rather than reusing

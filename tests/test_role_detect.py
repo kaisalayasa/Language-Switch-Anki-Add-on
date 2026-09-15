@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import unittest
 
-from addon.core.audio_fields import is_generated_field
+from addon.core.audio_fields import generated_field_name, is_generated_field
 from addon.core.role_detect import guess_role_mapping, is_converted_notetype
 from addon.core.role_schema import Role
 from addon.core.template_generator import (
@@ -309,6 +309,132 @@ class TestNothingMatchesOnFieldNames(unittest.TestCase):
         )
         self.assertEqual(_name(mapping, Role.TARGET_TERM), "Audio")
         self.assertIsNone(mapping.first(Role.NATIVE_AUDIO))
+
+
+# A German deck shaped the way many real downloaded decks actually are: term and audio
+# share ONE field ("Hund [sound:hund.mp3]"), unlike Core 2000/the Korean deck's cleanly
+# split fields. This is the exact shape that broke direction detection and the preview in
+# real use -- reported as "current" detecting fine but "after converting" showing "en -> ?"
+# and the preview refusing to render with "no native-side content assigned".
+DE_FIELDS = [(0, "German"), (1, "English")]
+DE_FRONT = "{{German}}"
+DE_BACK = "{{FrontSide}}<hr id=answer>{{English}}"
+DE_SAMPLES = {
+    "German": [
+        "Der Hund läuft schnell durch den Park. [sound:hund1.mp3]",
+        "Die Katze schläft den ganzen Tag auf dem Sofa. [sound:katze1.mp3]",
+        "Ich trinke jeden Morgen ein Glas Wasser. [sound:wasser1.mp3]",
+        "Die Schule beginnt um acht Uhr morgens. [sound:schule1.mp3]",
+        "Mein bester Freund wohnt in einer anderen Stadt. [sound:freund1.mp3]",
+        "Liebe zeigt sich durch Taten, nicht nur durch Worte. [sound:liebe1.mp3]",
+    ],
+    "English": [
+        "The dog runs quickly through the park.",
+        "The cat sleeps all day on the sofa.",
+        "I drink a glass of water every morning.",
+        "School starts at eight o'clock in the morning.",
+        "My best friend lives in another city.",
+        "Love shows itself through actions, not just words.",
+    ],
+}
+
+
+class TestMixedTextAndAudioInOneField(unittest.TestCase):
+    """Regression coverage for the German-deck bug: a field combining real content with an
+    embedded [sound:...] reference must still be usable as content, with its audio stripped
+    from what's actually rendered -- not discarded wholesale the way a pure-audio field is.
+    """
+
+    def setUp(self):
+        self.mapping = _guess(DE_FIELDS, DE_SAMPLES, DE_FRONT, DE_BACK)
+
+    def test_language_is_detected_on_the_side_with_the_mixed_field(self):
+        """Before the fix this was None -- the exact "after converting: en -> ?" report."""
+        self.assertEqual(self.mapping.native_language, "de")
+        self.assertEqual(self.mapping.target_language, "en")
+
+    def test_the_mixed_field_is_bound_as_the_only_native_content_candidate(self):
+        self.assertEqual(_name(self.mapping, Role.NATIVE_TERM), "German")
+
+    def test_the_mapping_validates_so_the_preview_can_render(self):
+        """Before the fix this failed with "no native-side content assigned", which is
+        exactly what main_screen.py surfaces as "Map the fields... to see a preview."."""
+        result = self.mapping.validate()
+        self.assertTrue(result.ok, result.errors)
+
+    def test_the_mixed_fields_binding_gets_the_strip_special_filter(self):
+        binding = self.mapping.first(Role.NATIVE_TERM)
+        self.assertEqual(binding.filter, "text")
+
+    def test_a_clean_field_is_left_unfiltered(self):
+        binding = self.mapping.first(Role.TARGET_TERM)
+        self.assertEqual(binding.name, "English")
+        self.assertIsNone(binding.filter)
+
+    def test_the_mixed_field_is_not_also_bound_as_a_native_audio_role(self):
+        """It carries its own audio, but it is the term, not a demoted audio field -- it
+        must end up with exactly one role, not two."""
+        roles = self.mapping.roles_for("German")
+        self.assertEqual(roles, [Role.NATIVE_TERM])
+
+    def test_the_rendered_card_uses_the_filter_not_the_bare_field(self):
+        """The conditional guard stays on the bare field name -- only the substitution
+        itself is filtered; that's the only syntactically valid way to combine the two."""
+        templates = generate_templates(self.mapping, options=TemplateOptions(include_audio=False))
+        self.assertIn("{{text:German}}", templates.back_html)
+        self.assertIn("{{#German}}", templates.back_html)
+        self.assertNotIn("{{German}}}}", templates.back_html)  # sanity: no malformed tag
+
+
+class TestGluedSoundTagIsNeverMisreadAsRuby(unittest.TestCase):
+    """A term with no space before its embedded audio tag ("Hund[sound:hund.mp3]") must not
+    be mistaken for furigana-style ruby annotation -- [sound:...] is never a reading."""
+
+    def test_a_glued_sound_tag_does_not_trigger_ruby_detection(self):
+        fields = [(0, "German"), (1, "English")]
+        samples = {
+            "German": [v.replace(" [sound:", "[sound:") for v in DE_SAMPLES["German"]],
+            "English": DE_SAMPLES["English"],
+        }
+        mapping = _guess(fields, samples, "{{German}}", "{{FrontSide}}<hr>{{English}}")
+        self.assertEqual(_name(mapping, Role.NATIVE_TERM), "German")
+        self.assertIsNone(mapping.first(Role.NATIVE_READING))
+
+
+class TestGeneratedAudioFieldIsNeverStripped(unittest.TestCase):
+    """The regression that matters most: this addon's own generated audio field also has
+    has_sound=True once a TTS run has filled it. Reopening an already-converted,
+    already-generated deck must never apply the strip-special filter to it -- that would
+    silently turn "plays real audio" into "plays nothing", the opposite of the point.
+    """
+
+    def setUp(self):
+        original = _guess(KO_FIELDS, KO_SAMPLES, KO_FRONT, KO_BACK)
+        templates = generate_templates(original, options=TemplateOptions(include_audio=False))
+
+        generated_name = generated_field_name(Role.TARGET_AUDIO, language="en")
+        clone_fields = KO_FIELDS + [(5, generated_name)]
+        clone_samples = dict(KO_SAMPLES)
+        # Filled in by a completed TTS run -- has_sound=True, exactly like the bug's trigger.
+        clone_samples[generated_name] = ["[sound:gen1.wav]"] * 6
+
+        self.generated_name = generated_name
+        self.reopened = _guess(
+            clone_fields, clone_samples, templates.front_html, templates.back_html,
+            css=templates.css,
+        )
+
+    def test_the_generated_audio_binding_is_not_filtered(self):
+        binding = self.reopened.first(Role.TARGET_AUDIO)
+        self.assertEqual(binding.name, self.generated_name)
+        self.assertIsNone(binding.filter)
+
+    def test_the_generated_reference_is_unfiltered_in_the_rendered_template(self):
+        templates = generate_templates(
+            self.reopened, options=TemplateOptions(include_audio=True)
+        )
+        self.assertIn("{{%s}}" % self.generated_name, templates.front_html)
+        self.assertNotIn("{{text:%s}}" % self.generated_name, templates.front_html)
 
 
 if __name__ == "__main__":
