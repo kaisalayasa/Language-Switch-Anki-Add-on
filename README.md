@@ -111,7 +111,7 @@ docs/          deck-facts.md (verified ground truth), api-notes.md
 ## Development
 
 ```bash
-python -m unittest discover -s tests -t .   # 270 tests, no Anki needed, no network needed
+python -m unittest discover -s tests -t .   # 280 tests, no Anki needed, no network needed
 python tools/preview_templates.py core2000  # see the generated templates
 python tools/install_dev.py --link          # install into Anki (close Anki first)
 ```
@@ -151,6 +151,23 @@ banner reads the live template the same structural way, independent of the mappi
 what's actually on the card *right now* alongside what it will become -- e.g. "Current: ko ->
 en | after converting: en -> ko" for the Korean deck -- rather than only ever showing the
 one, post-conversion direction.
+
+**Confirmed bug, found in real use and fixed:** a German test deck exposed a real gap --
+"current" direction detected fine, but "after converting" showed `en -> ?` and the preview
+refused to render ("Map the fields... to see a preview"). Cause: that deck puts term text and
+its own pronunciation audio in *one field* (`"Hund [sound:hund.mp3]"`), unlike Core
+2000/the Korean deck's cleanly split fields -- the old logic treated any field containing
+`[sound:...]` as 100% audio and excluded it from content roles and language detection
+entirely, even though real text survived once the audio markup was stripped. With the only
+native-side field disqualified, the language guess came back empty and the mapping had
+nothing to put on the back of the card. Fixed in `role_detect.py`: content-eligibility no
+longer keys off `has_sound` directly (a genuinely audio-only field is already excluded once
+its stripped text turns out empty); the field's embedded audio is instead stripped from
+what's actually *rendered*, via Anki's own `{{text:Field}}` modifier, applied only when the
+field isn't this addon's own generated audio field (which must never be stripped, or a
+working deck's real TTS audio would go silent on reopen). See
+`tests/test_role_detect.py::TestMixedTextAndAudioInOneField` and
+`TestGeneratedAudioFieldIsNeverStripped`.
 
 ### Where generated audio goes
 

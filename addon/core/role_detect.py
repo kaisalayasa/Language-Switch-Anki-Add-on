@@ -34,15 +34,23 @@ dialog, an ``.apkg`` round trip and a different machine.
 
 Content second
 --------------
-Within a side, roles come from what the content *is*: an ``[sound:...]`` reference, a
-``base[reading]`` ruby annotation, digits only, how often the field is empty at all, and how
-long the text runs (a word is short, an example sentence is not). Language detection then
-acts as a guard rather than a driver -- a field whose language disagrees with its own side's
-majority is left unmapped instead of being put on the card, which is what keeps the
-converted front showing one language.
+Within a side, roles come from what the content *is*: a ``base[reading]`` ruby annotation,
+digits only, how often the field is empty at all, and how long the text runs (a word is
+short, an example sentence is not). Language detection then acts as a guard rather than a
+driver -- a field whose language disagrees with its own side's majority is left unmapped
+instead of being put on the card, which is what keeps the converted front showing one
+language.
 
-Audio is not decided here
--------------------------
+An ``[sound:...]`` reference inside a field is *not* itself disqualifying -- only whether
+real text remains once it's stripped is (see ``FieldSignals.is_content``). Some decks split
+term and audio into separate fields (Core 2000, the Korean test deck); others put both in
+one field (``"Hund [sound:hund.mp3]"``). The latter shape still has a real term to detect
+and to put on the card -- it just needs its embedded audio stripped from what's actually
+*rendered*, which ``guess_role_mapping`` does via Anki's own ``text:`` field modifier (see
+``_filter_for`` there) rather than by discarding the field's content wholesale.
+
+Audio roles are not decided here
+---------------------------------
 Which field holds the newly generated audio is policy, not detection: it is always a field
 the addon creates. See ``audio_fields`` -- this module simply hands its result to
 :func:`~addon.core.audio_fields.resolve_audio_fields`, which binds generated fields to the
@@ -66,9 +74,19 @@ __all__ = ["FieldSignals", "guess_role_mapping", "is_converted_notetype"]
 _TAG_RE = re.compile(r"<[^>]+>")
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _SOUND_RE = re.compile(r"\[sound:[^\]]*\]")
-_RUBY_RE = re.compile(r"\S+\[[^\[\]]+\]")
+# Negative lookahead so a glued "word[sound:file.mp3]" (no space before the bracket) is
+# never misread as furigana-style ruby markup -- [sound:...] is never a reading annotation.
+_RUBY_RE = re.compile(r"\S+\[(?!sound:)[^\[\]]+\]")
 _ENTITY_RE = re.compile(r"&[a-zA-Z]+;|&#\d+;")
 _WS_RE = re.compile(r"\s+")
+
+#: Anki's own built-in template modifier (not a Python/aqt API -- core template syntax,
+#: long-standing and documented): "strip all special references (images, audio, and so on)
+#: and all HTML" from a field's rendered value. Applied to a field that mixes real content
+#: with an embedded [sound:...] reference in the SAME field, so its audio doesn't leak onto
+#: the card just because its text does. See guess_role_mapping's use of it, and the
+#: is_generated_field exclusion there -- this must never touch this addon's own audio field.
+_STRIP_SPECIAL_FILTER = "text"
 
 #: Below this share of non-empty samples a field is bookkeeping or an optional extra, not
 #: something to build a card around. The reference deck has a field that is empty on 1980 of
@@ -139,8 +157,16 @@ class FieldSignals:
 
     @property
     def is_content(self) -> bool:
-        """Eligible to carry a term/sentence/reading role."""
-        return not self.has_sound and not self.is_bookkeeping
+        """Eligible to carry a term/sentence/reading role.
+
+        Deliberately **not** gated on ``has_sound`` directly. A field that mixes real text
+        with an embedded ``[sound:...]`` reference (common in decks that don't split term
+        and audio into separate fields) still has real content once that reference is
+        stripped -- and ``fill_ratio``/``avg_length`` already reflect the *stripped* text
+        (see ``_visible_text``), so a pure-audio field (nothing left after stripping) is
+        already correctly excluded via ``is_sparse`` without needing a second check here.
+        """
+        return not self.is_bookkeeping
 
 
 def _visible_text(raw: str) -> str:
@@ -171,11 +197,14 @@ def _signals_for(name: str, ord_: int, samples: Sequence[str]) -> FieldSignals:
 
     has_sound = field_has_sound(values)
 
-    # Audio markup is meaningless to a language detector, and a field of pure digits has no
-    # language either -- feeding it either one only produces a confident wrong answer.
+    # A field of pure digits has no language -- feeding it in only produces a confident
+    # wrong answer. Audio markup itself is already gone from `non_empty` (_visible_text
+    # strips [sound:...] before this point), so a field that mixes real text with an
+    # embedded sound reference still gets a real language guess from what's left; only a
+    # field that is *purely* audio ends up with empty `non_empty` and is skipped here.
     language = None
     confidence = "unknown"
-    if non_empty and not numeric and not has_sound:
+    if non_empty and not numeric:
         guess = detect_field_language(non_empty)
         language, confidence = guess.code, guess.confidence
 
@@ -229,11 +258,9 @@ def _sides(
 def _majority_language(signals: Sequence[FieldSignals]) -> Optional[str]:
     """The language of a side, weighted by how much text each field actually carries.
 
-    A flat one-field-one-vote count gets this wrong in a way that matters: ``langdetect`` is
-    unreliable on very short text (a single common word can come back confidently wrong),
-    and a deck side is typically one short term plus one long sentence. Weighting by average
-    length lets the field with enough text to be detectable decide, instead of letting a
-    four-character word outvote it.
+    A straight count would let a single throwaway field (a stray tag, a one-word note)
+    outvote the real content. Weighting by length instead means the field(s) that actually
+    carry the side's meaning decide it.
     """
     weights: Dict[str, float] = {}
     for signal in signals:
@@ -335,16 +362,15 @@ def guess_role_mapping(
 
     converted = is_converted_notetype(css, names)
     current_front, current_back = _sides(names, front_html, back_html)
+    front_signals = [signals[n] for n in current_front]
+    back_signals = [signals[n] for n in current_back]
 
     # The whole structural rule, in one line. Before a conversion the current front holds
     # the language being demoted; after one it already holds the promoted language.
     if converted:
-        target_names, native_names = current_front, current_back
+        target_signals, native_signals = front_signals, back_signals
     else:
-        native_names, target_names = current_front, current_back
-
-    target_signals = [signals[n] for n in target_names]
-    native_signals = [signals[n] for n in native_names]
+        native_signals, target_signals = front_signals, back_signals
 
     target_language = _majority_language(target_signals)
     native_language = _majority_language(native_signals)
@@ -383,8 +409,29 @@ def guess_role_mapping(
     _fill(Role.TARGET_TERM, Role.TARGET_SENTENCE, pick_last=True)
     _fill(Role.NATIVE_TERM, Role.NATIVE_SENTENCE, pick_last=False)
 
+    def _filter_for(name: str) -> Optional[str]:
+        # A mixed text+audio field gets its rendered value passed through Anki's own
+        # "text:" modifier, which strips special references (sound, images) and HTML --
+        # so the card shows the word, not a playable icon for the deck's original audio.
+        # Applies whether the field ends up as a content role or falls through to the
+        # unmapped dump; either way it's rendered via {{Field}}/{{filter:Field}} and could
+        # otherwise leak audio onto the card.
+        #
+        # `is_generated_field` is the one hard exclusion: this addon's own generated audio
+        # field also reports has_sound=True once TTS has filled it, and that field's whole
+        # purpose is for [sound:...] to be interpreted and played, never stripped. Every
+        # other has_sound field this module ever renders via {{Field}} is a content role or
+        # the unmapped dump -- never TargetAudio (always the generated field) and never
+        # NativeAudio/NativeSentenceAudio (never rendered by the generator at all) -- so
+        # this single guard is sufficient.
+        if signals[name].has_sound and not is_generated_field(name):
+            return _STRIP_SPECIAL_FILTER
+        return None
+
     bindings = {
-        name: FieldBinding(name=name, ord=o, hidden=signals[name].is_bookkeeping)
+        name: FieldBinding(
+            name=name, ord=o, hidden=signals[name].is_bookkeeping, filter=_filter_for(name)
+        )
         for o, name in ordered
     }
     mapping = RoleMapping(
