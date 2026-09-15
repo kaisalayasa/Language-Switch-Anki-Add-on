@@ -1,9 +1,10 @@
 """Text sanitization ahead of TTS synthesis.
 
-The messy sample below is real ``Vocabulary-English`` content, copied verbatim from
-``docs/deck-facts.md`` -- not a synthetic fixture. A second case proves the script filter is
-generic (works for any codepoint-range allowlist), not hardcoded to English/Latin, matching
-the same generalization rule already enforced on ``addon/core`` by ``test_purity.py``.
+The messy samples below mirror the HTML noise real field data routinely has -- entities,
+wrapper tags, comments, embedded other-language characters -- without being copied from any
+particular deck. A second case proves the script filter is generic (works for any
+codepoint-range allowlist), not hardcoded to English/Latin, matching the same generalization
+rule already enforced on ``addon/core`` by ``test_purity.py``.
 """
 
 from __future__ import annotations
@@ -18,14 +19,14 @@ _CJK_RANGES = ((0x4E00, 0x9FFF),)
 
 class TestSanitizeMarkup(unittest.TestCase):
     def test_strips_html_tags_and_decodes_entities(self):
-        raw = "processing,&nbsp;management<div>(unlike 加工, a new thing is not created)</div>"
+        raw = "processing,&nbsp;management<div>(unlike 加工, a related word)</div>"
         clean = sanitize_text(raw, allowed_ranges=LATIN_RANGES)
         self.assertNotIn("<div>", clean)
         self.assertNotIn("&nbsp;", clean)
         self.assertNotIn("加工", clean)
         self.assertIn("processing", clean)
         self.assertIn("management", clean)
-        self.assertIn("a new thing is not created", clean)
+        self.assertIn("a related word", clean)
 
     def test_strips_html_comment(self):
         raw = "<!--anki-->cease, stop,&nbsp;let up"
@@ -34,10 +35,10 @@ class TestSanitizeMarkup(unittest.TestCase):
         self.assertIn("cease, stop", clean)
 
     def test_strips_br_tag(self):
-        raw = "be in time, serve (my) purpose<br>なくても〜 do without"
+        raw = "be in time, serve one's purpose<br>なくても〜 do without"
         clean = sanitize_text(raw, allowed_ranges=LATIN_RANGES)
         self.assertNotIn("<br>", clean)
-        self.assertIn("be in time, serve (my) purpose", clean)
+        self.assertIn("be in time, serve one's purpose", clean)
 
     def test_strips_sound_tag(self):
         raw = "hello [sound:foo.mp3] world"

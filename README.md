@@ -32,11 +32,7 @@ Progress on either dialog now shows a visible **Stop** button and says plainly t
 stopping is safe -- Anki's own progress window has no such button (only Escape or closing
 it cancels, which isn't obvious), so this addon draws its own; Stop sets a plain
 `threading.Event` the batch polls alongside Anki's own cancellation, and whatever's already
-been generated is kept, exactly as if the run had ended on its own. M6 makes a hand-built field mapping
-reusable: **"Save as profile…"** in the mapper dialog writes the current mapping out as JSON
-into `addon/user_files/profiles/`, and every dialog that resolves a mapping (Convert,
-Preview, Generate TTS audio) already picks up a saved profile automatically next time the
-same notetype comes up — no separate "load" step. M4 adds a per-field language guess (Unicode
+been generated is kept, exactly as if the run had ended on its own. M4 adds a per-field language guess (Unicode
 script, falling back to `langdetect` for same-script text) shown as a "Detected" column and
 summary label in the mapper dialog — informational only; it never sets the Target/Native
 language boxes or a Role dropdown on its own, per `claude.md`'s "detection seeds, never
@@ -87,43 +83,41 @@ The original **notetype object** is never modified in either mode.
   that field again later, since it holds nothing until TTS runs.
 - **Never guess an Anki API.** See `docs/api-notes.md`. (`col.sched.forget_cards` does not
   exist — it's `schedule_cards_as_new`.)
-- **Refuse rather than misalign.** If a profile's stored field name and ord disagree with
-  the live notetype, the run stops instead of writing the wrong content into every note.
+- **Refuse rather than misalign.** If a mapping's stored field name and ord disagree with
+  the live notetype (e.g. a carried-forward mapping applied to a notetype that's since
+  drifted), the run stops instead of writing the wrong content into every note.
 
 ## Layout
 
 ```
 addon/
-  core/        pure logic — role_schema, template_generator, conversion, profiles,
+  core/        pure logic — role_schema, template_generator, conversion,
                language_detect, role_detect (auto-mapping), audio_fields (audio policy)
   tts/         pure logic — Piper binary/voice managers, subprocess provider, sanitizer,
                script_ranges (voice locale -> pronounceable characters)
   ops/         everything that imports anki/aqt
   ui/          Qt dialogs
-  profiles/    shipped field mappings, one JSON per known deck (e.g. core2000.json)
-  user_files/  gitignored, per-machine: Piper cache + profiles/ (user-saved mappings, M6)
+  user_files/  gitignored, per-machine: Piper binary/voice cache
   vendor/      committed third-party source (langdetect + six, M4) — see vendor/README.md
 tests/         stock-Python unit tests, no Anki required
-tools/         preview_templates.py, install_dev.py, build_ankiaddon.py
+tools/         install_dev.py, build_ankiaddon.py
 docs/          deck-facts.md (verified ground truth), api-notes.md
 ```
 
 ## Development
 
 ```bash
-python -m unittest discover -s tests -t .   # 280 tests, no Anki needed, no network needed
-python tools/preview_templates.py core2000  # see the generated templates
+python -m unittest discover -s tests -t .   # 265 tests, no Anki needed, no network needed
 python tools/install_dev.py --link          # install into Anki (close Anki first)
 ```
 
 Then in Anki: **Tools → Deck Direction Converter** — one submenu holding **Convert deck
-language direction…** (map fields, convert; its "Map fields…" dialog has a **"Save as
-profile…"** button, M6), **Preview converted card…** (live preview, no writes), **Generate
-TTS audio… (M5)** (batch-writes audio into a converted deck's notes), then a separator and
-**Test Piper voice… (M2)** (a standalone synthesis check, not part of the main flow). The
-first synthesis of any kind downloads the Piper binary (~20MB) and voice model (~60MB) into
-`addon/user_files/` (gitignored, never wiped by an addon update); later runs are cached, and
-saved profiles live in that same gitignored directory.
+language direction…** (map fields, convert), **Preview converted card…** (live preview, no
+writes), **Generate TTS audio… (M5)** (batch-writes audio into a converted deck's notes),
+then a separator and **Test Piper voice… (M2)** (a standalone synthesis check, not part of
+the main flow). The first synthesis of any kind downloads the Piper binary (~20MB) and voice
+model (~60MB) into `addon/user_files/` (gitignored, never wiped by an addon update); later
+runs are cached.
 
 There's also **Tools → "Deck Direction Converter — new single screen (testing)…"**, a
 second, separate entry rolled out *alongside* the submenu above, not replacing it yet: one
@@ -133,24 +127,47 @@ the source deck's own name in Flip-in-place mode, since that mode never creates 
 deck), a language-detection banner with a manual override, a field/role list on the left
 (or, toggled on, a raw Front/Back/Styling HTML editor) next to a live preview pane on the
 right, voice sampling, and **two buttons -- Convert and Generate TTS audio -- kept
-deliberately separate**, one step each. The field list hides a profile's `hidden` fields by
-default (Core 2000 alone marks nine bookkeeping fields this way -- real clutter in a list
-that long) behind a "Show hidden fields" checkbox above it. An earlier drag-to-reorder
+deliberately separate**, one step each. The field list hides a mapping's `hidden` fields by
+default (a real deck can easily have half a dozen bookkeeping columns -- real clutter in a
+list that long) behind a "Show hidden fields" checkbox above it. An earlier drag-to-reorder
 feature on that list was tried and then deliberately dropped after review, so field order
-now just follows a saved profile's order or plain notetype order, never an ad hoc drag.
+now just follows a carried-forward mapping's order or plain notetype order, never an ad hoc
+drag.
 
-Role assignment comes from three sources, in priority order, per `claude.md`'s Role Mapping
-System: a saved profile (`addon/core/profiles.py`'s `match_profile`, exact field-name-list
-match only, e.g. Core 2000's shipped profile); the user's own edit in the field list, always
-authoritative; and, when neither applies, a content-based seed
+Role assignment comes from two sources, in priority order, per `claude.md`'s Role Mapping
+System: the user's own edit in the field list, always authoritative once made (and carried
+forward across a Convert onto the resulting clone); and, until then, a content-based seed
 (`addon/core/role_detect.py`'s `guess_role_mapping`) that reads the notetype's own *live*
 template to know which fields are currently on the front (-> become Native after a flip) vs.
 the back (-> become Target) -- a structural fact, not a guess -- then sorts each side's
-fields into Term/Sentence/Reading from real (unsanitized) sample content. The direction
+fields into Term/Sentence/Reading from real (unsanitized) sample content. **A third source,
+matching against a saved JSON profile, existed through M6 and was removed afterward** -- see
+"Removed: the profile-matching system" below. The direction
 banner reads the live template the same structural way, independent of the mapping, to show
 what's actually on the card *right now* alongside what it will become -- e.g. "Current: ko ->
 en | after converting: en -> ko" for the Korean deck -- rather than only ever showing the
 one, post-conversion direction.
+
+### Removed: the profile-matching system
+
+Through M6 there was a third, highest-priority source of a mapping: a shipped or
+user-saved JSON profile (`addon/core/profiles.py`), matched to a notetype by an exact
+field-name fingerprint. "Save as profile…" in the mapper dialog wrote the current mapping
+to `addon/user_files/profiles/`, and every dialog that resolved a mapping checked for a
+matching profile first, before falling back to a content-based guess.
+
+Removed entirely, deliberately: the whole module (`core/profiles.py`), the shipped
+`core2000.json` profile, the "Save as profile…" button and "Reset to shipped profile"
+button, and every call site (`convert_dialog.py`, `role_mapper.py`, `tts_batch_dialog.py`,
+`card_preview.py`, `main_screen.py`). Every one of those call sites now goes straight to
+`guess_role_mapping` (or a carried-forward mapping from an override, where one already
+exists) instead -- the exact tier-3 fallback that already existed for every notetype a
+profile *didn't* cover. `card_preview.py` in particular used to require a shipped profile
+to do anything at all ("this standalone preview only works from a shipped profile"); it now
+seeds from content detection like everything else, so it works for any notetype, not just
+the handful with a saved profile. `RoleMapping.to_profile()`/`.from_profile()` (the
+dict<->mapping codec) stay -- unrelated to the file-based matching system, still used for
+the carried-forward-override plumbing and for `render_order` round-tripping.
 
 **Confirmed bug, found in real use and fixed:** a German test deck exposed a real gap --
 "current" direction detected fine, but "after converting" showed `en -> ?` and the preview
@@ -174,8 +191,8 @@ working deck's real TTS audio would go silent on reopen). See
 **A conversion creates the field its generated audio will live in.** It is never written into
 a field the deck already had. The deck's own audio keeps its contents and is bound to a
 *native* audio role, which the generated template never emits -- so it is hidden, not deleted
-and not overwritten. All of this is `addon/core/audio_fields.py`, and every mapping (profile,
-hand-edited or auto-detected) is passed through its `resolve_audio_fields` before use, so no
+and not overwritten. All of this is `addon/core/audio_fields.py`, and every mapping
+(hand-edited or auto-detected) is passed through its `resolve_audio_fields` before use, so no
 mapping can express anything else.
 
 This replaced an earlier "repurpose the deck's existing audio field" design that failed on a
@@ -219,9 +236,9 @@ right pair after converting. The gate (`MainScreen._direction_is_correct`,
 `core.template_generator.referenced_fields`) checks the *live* front template on the
 currently selected notetype for the mapped Target-language field, not just "was Convert
 clicked" -- so a deck that was already in the right direction needs no gating, and, after a
-real conversion, the mapping used carries forward onto the new pair automatically even
-without a saved profile (cloning preserves field names 1:1), so the button unlocks
-immediately rather than looking freshly-unmapped. Once unlocked, Generate TTS audio shows a
+real conversion, the mapping used carries forward onto the new pair automatically
+(cloning preserves field names 1:1), so the button unlocks immediately rather than looking
+freshly-unmapped. Once unlocked, Generate TTS audio shows a
 visible **Stop** button while running, with the reassurance text Anki's own progress window
 doesn't give you -- audio already generated is kept, and clicking Generate again later just
 continues where it left off.
@@ -253,7 +270,7 @@ repo for a public-release workflow this project hasn't committed to yet (license
 GPL — is still an open question, deliberately deferred). This script does the one thing
 needed for now: produce a file Anki can actually install, for testing outside the dev
 symlink. It excludes `addon/user_files/` (a fresh install shouldn't inherit the packager's
-locally-downloaded Piper binary/voice or locally-saved profiles).
+locally-downloaded Piper binary/voice cache).
 
 Develop against a scratch profile, not your real collection. Every operation is scoped to a
 single (deck, notetype) pair, but in-development code writes to the same `collection.anki2`

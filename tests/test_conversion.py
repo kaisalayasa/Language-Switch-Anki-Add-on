@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import unittest
 
 from addon.core.conversion import (
@@ -11,23 +10,23 @@ from addon.core.conversion import (
     escape_search_term,
     scope_query,
 )
-from addon.core.profiles import BUILTIN_PROFILE_DIR, load_profile_file
 
-from tests.test_template_generator import CORE2000_LIVE_FIELDS, simple_mapping
+from tests.test_template_generator import GENERIC_LIVE_FIELDS, _generic_mapping, simple_mapping
 from addon.core.role_schema import Role
 
-CORE2000_JSON = os.path.join(BUILTIN_PROFILE_DIR, "core2000.json")
+# An arbitrary but fixed note count, standing in for "however many notes a real deck has".
+_SAMPLE_NOTE_COUNT = 500
 
 
-def core2000_mapping():
-    return load_profile_file(CORE2000_JSON).to_mapping(live_fields=CORE2000_LIVE_FIELDS)
+def generic_mapping():
+    return _generic_mapping(live_fields=GENERIC_LIVE_FIELDS)
 
 
 def plan(mode=ConversionMode.NEW_DECK, **kw):
-    kw.setdefault("mapping", core2000_mapping())
-    kw.setdefault("source_notetype", "Core 2000")
-    kw.setdefault("source_deck", "Core 2000")
-    kw.setdefault("note_ids", list(range(1983)))
+    kw.setdefault("mapping", generic_mapping())
+    kw.setdefault("source_notetype", "Generic")
+    kw.setdefault("source_deck", "Generic")
+    kw.setdefault("note_ids", list(range(_SAMPLE_NOTE_COUNT)))
     return build_plan(mode=mode, **kw)
 
 
@@ -35,9 +34,9 @@ class TestScoping(unittest.TestCase):
     """Getting this wrong is the one mistake with collection-wide blast radius."""
 
     def test_scope_is_narrowed_by_both_notetype_and_deck(self):
-        q = scope_query("Core 2000", "Core 2000")
-        self.assertIn('note:"Core 2000"', q)
-        self.assertIn('deck:"Core 2000"', q)
+        q = scope_query("Generic", "Generic")
+        self.assertIn('note:"Generic"', q)
+        self.assertIn('deck:"Generic"', q)
 
     def test_search_metacharacters_are_escaped(self):
         for raw, must_contain in [
@@ -58,7 +57,7 @@ class TestScoping(unittest.TestCase):
 
 class TestModeSafetyRules(unittest.TestCase):
     def test_new_deck_mode_refuses_to_write_into_the_source_deck(self):
-        p = plan(ConversionMode.NEW_DECK, target_deck="Core 2000")
+        p = plan(ConversionMode.NEW_DECK, target_deck="Generic")
         self.assertFalse(p.validate().ok)
 
     def test_new_deck_mode_refuses_media_cleanup(self):
@@ -70,7 +69,7 @@ class TestModeSafetyRules(unittest.TestCase):
         self.assertTrue(any("never run in new-deck mode" in e for e in result.errors))
 
     def test_clone_may_not_reuse_the_source_notetype_name(self):
-        p = plan(clone_notetype="Core 2000")
+        p = plan(clone_notetype="Generic")
         result = p.validate()
         self.assertFalse(result.ok)
         self.assertTrue(any("never modified" in e for e in result.errors))
@@ -111,7 +110,7 @@ class TestDefaultNaming(unittest.TestCase):
 class TestPreflight(unittest.TestCase):
     def test_summary_states_the_note_count_and_reset(self):
         text = plan(ConversionMode.NEW_DECK).preflight().as_text()
-        self.assertIn("1983", text)
+        self.assertIn(str(_SAMPLE_NOTE_COUNT), text)
         self.assertIn("WILL BE RESET", text)
         self.assertIn("untouched", text)
 

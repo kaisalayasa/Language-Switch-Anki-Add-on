@@ -39,12 +39,18 @@ from aqt.qt import (
 )
 from aqt.utils import askUser, showInfo, showWarning
 
-from ..core.profiles import match_profile
-from ..core.role_schema import fields_from_notetype
+from ..core.conversion import scope_query
+from ..core.role_detect import guess_role_mapping
+from ..core.role_schema import Role, fields_from_notetype
 from ..ops.tts_batch import notes_needing_audio
 from ..ops.tts_runner import BatchOutcome, default_concurrency, run_tts_batch
 from ..tts.piper_voice_manager import CURATED_VOICES
-from .convert_dialog import _decks_with_notetypes, addon_config, template_options_from_config
+from .convert_dialog import (
+    _collect_raw_samples,
+    _decks_with_notetypes,
+    addon_config,
+    template_options_from_config,
+)
 
 __all__ = ["show_tts_batch_dialog"]
 
@@ -193,15 +199,32 @@ class TtsBatchDialog(QDialog):
         deck, notetype_name, _ = current
         notetype = mw.col.models.by_name(notetype_name)
         live_fields = fields_from_notetype(notetype["flds"])
-        match = match_profile(notetype_name, live_fields)
-        if not match.usable:
+
+        sample_note_ids = mw.col.find_notes(scope_query(notetype_name, deck))
+        raw_samples = _collect_raw_samples(sample_note_ids[:8])
+        tmpls = notetype.get("tmpls") or [{}]
+        mapping = guess_role_mapping(
+            notetype_name,
+            live_fields,
+            raw_samples,
+            front_html=tmpls[0].get("qfmt", ""),
+            back_html=tmpls[0].get("afmt", ""),
+            css=notetype.get("css", ""),
+        )
+        if not mapping.validate().ok:
             showWarning(
-                "No field mapping is known for %r.\n\nMap it first via Tools → Convert "
+                "No usable field mapping for %r.\n\nMap it first via Tools → Convert "
                 "deck language direction… → \"Map fields…\"." % notetype_name,
                 parent=self,
             )
             return
-        mapping = match.profile.to_mapping(live_fields=live_fields)
+        if mapping.first(Role.TARGET_AUDIO) is None and mapping.first(Role.TARGET_SENTENCE_AUDIO) is None:
+            showWarning(
+                "This notetype has no field for generated audio yet.\n\nConvert the deck "
+                "first -- the conversion creates that field.",
+                parent=self,
+            )
+            return
         voice_id = self.voice_box.currentData()
         force = self.force_checkbox.isChecked()
 

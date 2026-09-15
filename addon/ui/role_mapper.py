@@ -8,13 +8,12 @@ bindings; this dialog is a deliberately simpler v1 view onto it via
 ``core.role_schema.FieldAssignment``/``mapping_from_assignments``/``assignments_from_mapping``.
 
 This module touches ``aqt`` freely (it's a dialog, not pure logic) but contains no field-name
-matching of its own -- every field name it shows came from the live notetype or a profile the
-user already chose to load, never something this module infers.
+matching of its own -- every field name it shows came from the live notetype, never something
+this module infers.
 
 No preview button here -- live card preview is its own Tools-menu action
-(``addon/ui/card_preview.py``) that works from a shipped profile directly. Previewing an
-in-progress, not-yet-saved mapping built here isn't available yet; this dialog's job is
-building the mapping, not rendering it.
+(``addon/ui/card_preview.py``). Previewing an in-progress, not-yet-saved mapping built here
+isn't available yet; this dialog's job is building the mapping, not rendering it.
 """
 
 from __future__ import annotations
@@ -29,19 +28,15 @@ from aqt.qt import (
     QDialogButtonBox,
     QHBoxLayout,
     QHeaderView,
-    QInputDialog,
     QLabel,
     QLineEdit,
-    QPushButton,
     Qt,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
 )
-from aqt.utils import askUser, showInfo, showWarning
 
 from ..core.language_detect import LanguageGuess, detect_field_language
-from ..core.profiles import USER_PROFILE_DIR, load_profiles, save_profile, slugify
 from ..core.role_schema import (
     FieldAssignment,
     Role,
@@ -65,7 +60,6 @@ class RoleMapperDialog(QDialog):
         live_fields: Sequence[Tuple[int, str]],
         samples: Dict[str, List[str]],
         initial_mapping: RoleMapping,
-        profile_mapping: Optional[RoleMapping],
     ):
         super().__init__(parent)
         self.setWindowTitle("Map fields — %s" % notetype_name)
@@ -74,7 +68,6 @@ class RoleMapperDialog(QDialog):
         self._notetype_name = notetype_name
         self._live_fields = list(live_fields)
         self._samples = samples
-        self._profile_mapping = profile_mapping
         self._result_mapping: Optional[RoleMapping] = None
         self._role_combos: Dict[int, QComboBox] = {}
         self._hide_checks: Dict[int, QCheckBox] = {}
@@ -118,27 +111,6 @@ class RoleMapperDialog(QDialog):
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
-
-        button_row = QHBoxLayout()
-        self.reset_button = QPushButton("Reset to shipped profile")
-        self.reset_button.setEnabled(profile_mapping is not None)
-        self.reset_button.setToolTip(
-            "Discards your edits and re-seeds this table from the shipped profile for this "
-            "notetype." if profile_mapping is not None else
-            "No shipped profile matches this notetype, so there is nothing to reset to."
-        )
-        self.reset_button.clicked.connect(self._on_reset)
-        button_row.addWidget(self.reset_button)
-        button_row.addStretch(1)
-        self.save_button = QPushButton("Save as profile…")
-        self.save_button.setToolTip(
-            "Save the current mapping as a reusable JSON profile, so it's remembered next "
-            "time this notetype is opened here -- instead of being lost when this dialog "
-            "closes."
-        )
-        self.save_button.clicked.connect(self._on_save_profile)
-        button_row.addWidget(self.save_button)
-        layout.addLayout(button_row)
 
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -257,42 +229,6 @@ class RoleMapperDialog(QDialog):
             text = "Cannot proceed:\n" + "\n".join("  - %s" % e for e in result.errors)
         self.status_label.setText(text)
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(result.ok)
-        if hasattr(self, "save_button"):
-            self.save_button.setEnabled(result.ok)
-
-    def _on_reset(self) -> None:
-        if self._profile_mapping is None:
-            return
-        self.target_language.setText(self._profile_mapping.target_language or "")
-        self.native_language.setText(self._profile_mapping.native_language or "")
-        self._populate(assignments_from_mapping(self._profile_mapping))
-        self._revalidate()
-
-    def _on_save_profile(self) -> None:
-        mapping = self._current_mapping()
-        if not mapping.validate().ok:
-            showWarning("Fix the mapping errors above before saving it as a profile.", parent=self)
-            return
-
-        name, ok = QInputDialog.getText(
-            self, "Save as profile", "Profile name:", QLineEdit.EchoMode.Normal, self._notetype_name
-        )
-        if not ok or not name.strip():
-            return
-        name = name.strip()
-        profile_id = slugify(name)
-
-        existing = {p.id for p in load_profiles([USER_PROFILE_DIR])}
-        if profile_id in existing:
-            if not askUser(
-                "A saved profile named %r already exists. Overwrite it?" % name,
-                parent=self,
-                defaultno=True,
-            ):
-                return
-
-        path = save_profile(mapping, id=profile_id, title=name)
-        showInfo("Saved profile to:\n\n%s" % path, parent=self)
 
     def _on_accept(self) -> None:
         self._result_mapping = self._current_mapping()

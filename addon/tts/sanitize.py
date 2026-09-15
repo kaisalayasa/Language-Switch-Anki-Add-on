@@ -1,9 +1,9 @@
 """Clean raw Anki field HTML into plain text worth feeding to a TTS engine.
 
-Pure string processing -- no filesystem, no subprocess, no network. Real field data (see
-``docs/deck-facts.md``) looks like::
+Pure string processing -- no filesystem, no subprocess, no network. Real field data routinely
+looks like::
 
-    processing,&nbsp;management<div>(unlike 加工, a new thing is not created)</div>
+    processing,&nbsp;management<div>(unlike 加工, a related word, this one has extra nuance)</div>
 
 Feeding that straight to a synthesizer produces garbage: HTML tags read as literal text,
 ``&nbsp;`` doesn't decode itself, and a gloss that embeds a few characters of the *other*

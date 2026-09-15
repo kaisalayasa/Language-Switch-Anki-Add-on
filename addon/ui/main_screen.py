@@ -14,7 +14,7 @@ override; a left/right split (a field/role list by default, or a raw Front/Back/
 editor when "HTML" is switched on, on the left -- and, on the right, a live preview,
 ``preview_panel.PreviewPanel``, an embeddable ``AnkiWebView`` that never writes to the
 collection); a voice picker with a sample button that speaks the current note's own target-
-language text; then Save as profile / Convert / Generate TTS audio.
+language text; then Convert / Generate TTS audio.
 """
 
 from __future__ import annotations
@@ -33,7 +33,6 @@ from aqt.qt import (
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
@@ -56,7 +55,6 @@ from ..core.audio_fields import (
 )
 from ..core.conversion import ConversionMode, build_plan, scope_query
 from ..core.language_detect import detect_field_language
-from ..core.profiles import USER_PROFILE_DIR, load_profiles, match_profile, save_profile, slugify
 from ..core.role_detect import guess_role_mapping
 from ..core.role_schema import (
     Role,
@@ -208,11 +206,12 @@ class MainScreen(QDialog):
         self._tts_cancel_event: Optional[threading.Event] = None
         self._convert_running = False
         #: (clone_notetype_name, mapping) set right after a successful Convert, so the very
-        #: next pair-change (auto-selecting that clone) can carry the role mapping forward
-        #: even when the user never saved it as a profile -- cloning preserves field names
-        #: 1:1, so the same mapping is valid on the clone. Without this, a not-yet-profiled
-        #: deck would show a blank field list right after Convert and _direction_is_correct
-        #: would (wrongly) report "not converted yet", contradicting what just happened.
+        #: next pair-change (auto-selecting that clone) can carry the exact role mapping
+        #: forward rather than re-running content detection against it -- cloning preserves
+        #: field names 1:1, so the same mapping is valid on the clone, and re-detecting could
+        #: land on something else entirely (the clone's own generated CSS marker changes what
+        #: "converted" detection sees). Without this, _direction_is_correct could (wrongly)
+        #: report "not converted yet" immediately after a Convert that just succeeded.
         #: Consumed once, whether or not it ends up matching -- see _on_pair_changed.
         self._converted_mapping_override: Optional[Tuple[str, RoleMapping]] = None
 
@@ -362,9 +361,6 @@ class MainScreen(QDialog):
         layout.addWidget(self.flow_hint_label)
 
         action_row = QHBoxLayout()
-        self.save_profile_button = QPushButton("Save as profile…")
-        self.save_profile_button.clicked.connect(self._on_save_profile)
-        action_row.addWidget(self.save_profile_button)
         action_row.addStretch(1)
         self.stop_button = QPushButton("Stop")
         self.stop_button.setVisible(False)
@@ -443,15 +439,12 @@ class MainScreen(QDialog):
 
         # Which fields actually hold audio, for every branch below -- not just the detected
         # one. It's what lets audio the deck already had be bound to a native role and so
-        # kept off the card, whether the mapping came from a profile, a carry-forward or a
-        # fresh guess. See core.audio_fields.
+        # kept off the card, whether the mapping came from a carry-forward or a fresh guess.
+        # See core.audio_fields.
         raw_samples = _collect_raw_samples(self._note_ids[:8])
         self._sound_fields = sound_field_names(raw_samples)
 
-        match = match_profile(notetype_name, self._live_fields)
-        if match.usable:
-            mapping = match.profile.to_mapping(live_fields=self._live_fields)
-        elif (
+        if (
             self._converted_mapping_override is not None
             and self._converted_mapping_override[0] == notetype_name
         ):
@@ -654,7 +647,7 @@ class MainScreen(QDialog):
         elif current:
             direction = "Current: %s   -- map roles (or set manually) to see the direction after converting" % current
         else:
-            direction = 'not set -- check "Set manually", or map roles and save a profile'
+            direction = 'not set -- check "Set manually", or map roles yourself'
 
         self.detected_label.setText("Detected: %s    Direction: %s" % (detected, direction))
 
@@ -664,7 +657,7 @@ class MainScreen(QDialog):
         """What the field list currently says, with the audio policy applied.
 
         Resolving here rather than at each use means every consumer -- preview, direction
-        check, sample text, Convert, "save as profile" -- sees the same thing: generated
+        check, sample text, Convert -- sees the same thing: generated
         fields hold the target audio, and any audio the deck already had is bound to a
         native role so it stays on the note but never reaches a card.
         """
@@ -829,34 +822,6 @@ class MainScreen(QDialog):
 
         QueryOp(parent=self, op=op, success=on_success).failure(on_failure).run_in_background()
 
-    # -- save as profile --------------------------------------------------------------
-
-    def _on_save_profile(self) -> None:
-        mapping = self._current_mapping()
-        if not mapping.validate().ok:
-            showWarning("Fix the mapping errors before saving it as a profile.", parent=self)
-            return
-
-        name, ok = QInputDialog.getText(
-            self, "Save as profile", "Profile name:", QLineEdit.EchoMode.Normal, self._notetype_name
-        )
-        if not ok or not name.strip():
-            return
-        name = name.strip()
-        profile_id = slugify(name)
-
-        existing = {p.id for p in load_profiles([USER_PROFILE_DIR])}
-        if profile_id in existing:
-            if not askUser(
-                "A saved profile named %r already exists. Overwrite it?" % name,
-                parent=self,
-                defaultno=True,
-            ):
-                return
-
-        path = save_profile(mapping, id=profile_id, title=name)
-        showInfo("Saved profile to:\n\n%s" % path, parent=self)
-
     # -- convert ------------------------------------------------------------------------
 
     def _on_convert(self) -> None:
@@ -917,9 +882,9 @@ class MainScreen(QDialog):
             # the generated audio field(s) -- which this mapping already describes, since
             # it's the one the conversion ran with. Role bindings don't otherwise change
             # through a conversion (only which side the template puts them on does), so it
-            # is already correct for the clone, profile or no profile. Without this, a
-            # not-yet-profiled deck would land on the new pair with a blank field list and
-            # Generate TTS audio would look "not converted yet" even though it just was.
+            # is already correct for the clone. Without this, the new pair would land on a
+            # freshly re-detected mapping and Generate TTS audio could look "not converted
+            # yet" even though it just was.
             self._converted_mapping_override = (result.clone_notetype_name, mapping)
             self._refresh_pairs()
             # _select_pair (via _on_pair_changed) already calls _update_action_state, and
@@ -943,21 +908,10 @@ class MainScreen(QDialog):
     def _on_generate_tts(self) -> None:
         if self._notetype is None:
             return
-        match = match_profile(self._notetype_name, self._live_fields)
-        mapping = (
-            # A profile's own audio bindings go through the same policy as everything else:
-            # a shipped profile written before generated audio fields existed still names
-            # the deck's original audio field for TargetAudio, and writing English speech
-            # into the field holding the deck's Japanese pronunciation is exactly what this
-            # addon no longer does. resolve_audio_fields demotes it and points the target
-            # roles at the generated field instead.
-            resolve_audio_fields(
-                match.profile.to_mapping(live_fields=self._live_fields),
-                sound_fields=self._sound_fields,
-            )
-            if match.usable
-            else self._current_mapping()
-        )
+        # Whatever the field list currently shows -- already seeded from a carried-forward
+        # override or a fresh content-based guess in _on_pair_changed, and already passed
+        # through the audio policy (resolve_audio_fields) in _current_mapping itself.
+        mapping = self._current_mapping()
         if not mapping.validate().ok:
             showWarning("Map the fields (or fix the errors shown) before generating audio.", parent=self)
             return
