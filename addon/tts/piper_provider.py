@@ -2,8 +2,8 @@
 
 Per ``claude.md``: subprocess, not the ``piper-tts`` Python package (that would drag in
 onnxruntime's platform-specific wheels into addon packaging). Text is always sanitized before
-synthesis -- real field data has HTML noise and embedded other-language characters (see
-``docs/deck-facts.md``), and feeding that raw to Piper produces garbage output.
+synthesis -- real field data routinely has HTML noise and embedded other-language
+characters, and feeding that raw to Piper produces garbage output.
 
 The exact CLI invocation shape (stdin text + ``--model``/``--output_file`` flags) matches
 Piper's documented usage but has not been run against the real downloaded binary yet --

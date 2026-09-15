@@ -2,16 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import unittest
 
-from addon.core.profiles import (
-    BUILTIN_PROFILE_DIR,
-    MatchQuality,
-    load_profile_file,
-    load_profiles,
-    match_profile,
-)
 from addon.core.role_schema import (
     AUDIO_SOURCE_ROLES,
     FieldAssignment,
@@ -23,16 +15,65 @@ from addon.core.role_schema import (
     mapping_from_assignments,
 )
 
-CORE2000_JSON = os.path.join(BUILTIN_PROFILE_DIR, "core2000.json")
-
-LIVE = [
-    (0, "Optimized-Voc-Index"), (1, "Vocabulary-Kanji"), (2, "Vocabulary-Furigana"),
-    (3, "Vocabulary-Kana"), (4, "Vocabulary-English"), (5, "Vocabulary-Audio"),
-    (6, "Vocabulary-Pos"), (7, "Caution"), (8, "Expression"), (9, "Reading"),
-    (10, "Sentence-Kana"), (11, "Sentence-English"), (12, "Sentence-Clozed"),
-    (13, "Sentence-Audio"), (14, "Notes"), (15, "Core-Index"),
-    (16, "Optimized-Sent-Index"), (17, "Frequency"),
+# A synthetic "rich" profile -- same shape as a real deck notetype (readings, a sentence
+# pair, audio, POS/notes/cloze extras, and several hidden bookkeeping fields) but with
+# deck-agnostic field names, so these tests exercise the generic profile machinery without
+# depending on any specific shipped deck.
+GENERIC_LIVE_FIELDS = [
+    (0, "Index"), (1, "Term"), (2, "TermReading"), (3, "TermKana"),
+    (4, "Meaning"), (5, "Audio"), (6, "Pos"), (7, "Note"),
+    (8, "Phrase"), (9, "PhraseReading"), (10, "PhraseKana"), (11, "SentenceMeaning"),
+    (12, "SentenceClozed"), (13, "SentenceAudio"), (14, "Extra"), (15, "RefIndex"),
+    (16, "SentIndex"), (17, "Freq"),
 ]
+
+GENERIC_PROFILE_DATA = {
+    "id": "generic_rich",
+    "title": "Generic rich test profile",
+    "version": 1,
+    "target_language": "en",
+    "native_language": "ja",
+    "notetype": "Generic",
+    "binds_to": {
+        "notetype_names": ["Generic"],
+        "field_fingerprint": [name for _, name in GENERIC_LIVE_FIELDS],
+    },
+    "fields": [
+        {"name": "Index", "ord": 0, "hidden": True},
+        {"name": "Term", "ord": 1, "hidden": True},
+        {"name": "TermReading", "ord": 2, "filter": "furigana", "css_class": "japanese"},
+        {"name": "TermKana", "ord": 3, "hidden": True},
+        {"name": "Meaning", "ord": 4},
+        {"name": "Audio", "ord": 5},
+        {"name": "Pos", "ord": 6},
+        {"name": "Note", "ord": 7},
+        {"name": "Phrase", "ord": 8, "hidden": True},
+        {"name": "PhraseReading", "ord": 9, "filter": "furigana", "css_class": "japanese"},
+        {"name": "PhraseKana", "ord": 10, "hidden": True},
+        {"name": "SentenceMeaning", "ord": 11},
+        {"name": "SentenceClozed", "ord": 12},
+        {"name": "SentenceAudio", "ord": 13},
+        {"name": "Extra", "ord": 14, "hidden": True},
+        {"name": "RefIndex", "ord": 15, "hidden": True},
+        {"name": "SentIndex", "ord": 16, "hidden": True},
+        {"name": "Freq", "ord": 17, "hidden": True},
+    ],
+    "roles": {
+        "TargetTerm": ["Meaning"],
+        "TargetSentence": ["SentenceMeaning"],
+        "TargetAudio": ["Audio"],
+        "TargetSentenceAudio": ["SentenceAudio"],
+        "NativeTerm": ["TermReading"],
+        "NativeSentence": ["PhraseReading"],
+        "Pos": ["Pos"],
+        "Notes": ["Note"],
+        "ClozeText": ["SentenceClozed"],
+    },
+}
+
+
+def _generic_mapping(live_fields=None):
+    return RoleMapping.from_profile(GENERIC_PROFILE_DATA, live_fields=live_fields)
 
 
 class TestRoleKeys(unittest.TestCase):
@@ -53,7 +94,8 @@ class TestRoleKeys(unittest.TestCase):
             Role.from_key("NotARole")
 
     def test_roles_are_symmetric_across_both_sides(self):
-        """The native side needs readings and audio too -- see docs/deck-facts.md."""
+        """The native side needs readings and audio too -- a reading-heavy target language
+        (e.g. Japanese) can end up on either side depending on conversion direction."""
         target = {r.kind for r in Role if r.side is Side.TARGET}
         native = {r.kind for r in Role if r.side is Side.NATIVE}
         self.assertEqual(target, native)
@@ -100,9 +142,9 @@ class TestValidation(unittest.TestCase):
         result = mapping.validate()
         self.assertFalse(result.ok)
 
-    def test_core2000_profile_validates_against_the_real_notetype(self):
-        mapping = load_profile_file(CORE2000_JSON).to_mapping(live_fields=LIVE)
-        result = mapping.validate_against(LIVE)
+    def test_a_rich_profile_validates_against_its_real_notetype(self):
+        mapping = _generic_mapping(live_fields=GENERIC_LIVE_FIELDS)
+        result = mapping.validate_against(GENERIC_LIVE_FIELDS)
         self.assertTrue(result.ok, result.errors)
 
 
@@ -110,41 +152,41 @@ class TestRefusesToGuess(unittest.TestCase):
     """A silently misaligned field map would write wrong content into every note."""
 
     def test_renamed_field_is_refused(self):
-        drifted = [(o, "RENAMED" if o == 4 else n) for o, n in LIVE]
-        mapping = load_profile_file(CORE2000_JSON).to_mapping()
+        drifted = [(o, "RENAMED" if o == 4 else n) for o, n in GENERIC_LIVE_FIELDS]
+        mapping = _generic_mapping()
         result = mapping.validate_against(drifted)
         self.assertFalse(result.ok)
         self.assertTrue(any("refusing to guess" in e for e in result.errors))
 
     def test_reordered_fields_are_refused(self):
-        swapped = list(LIVE)
-        swapped[4], swapped[5] = (4, LIVE[5][1]), (5, LIVE[4][1])
-        mapping = load_profile_file(CORE2000_JSON).to_mapping()
+        swapped = list(GENERIC_LIVE_FIELDS)
+        swapped[4], swapped[5] = (4, GENERIC_LIVE_FIELDS[5][1]), (5, GENERIC_LIVE_FIELDS[4][1])
+        mapping = _generic_mapping()
         result = mapping.validate_against(swapped)
         self.assertFalse(result.ok)
         self.assertTrue(any("refusing to guess" in e for e in result.errors))
 
     def test_missing_field_is_refused(self):
-        truncated = LIVE[:-1]
-        mapping = load_profile_file(CORE2000_JSON).to_mapping()
+        truncated = GENERIC_LIVE_FIELDS[:-1]
+        mapping = _generic_mapping()
         result = mapping.validate_against(truncated)
         self.assertFalse(result.ok)
 
 
 class TestUnmapped(unittest.TestCase):
     def test_unmapped_excludes_assigned_and_hidden(self):
-        mapping = load_profile_file(CORE2000_JSON).to_mapping(live_fields=LIVE)
+        mapping = _generic_mapping(live_fields=GENERIC_LIVE_FIELDS)
         names = [b.name for b in mapping.unmapped()]
-        self.assertNotIn("Vocabulary-English", names)   # assigned
-        self.assertNotIn("Frequency", names)            # hidden
-        self.assertIn("Frequency", [b.name for b in mapping.unmapped(include_hidden=True)])
+        self.assertNotIn("Meaning", names)  # assigned
+        self.assertNotIn("Freq", names)     # hidden
+        self.assertIn("Freq", [b.name for b in mapping.unmapped(include_hidden=True)])
 
 
 class TestAssignmentRoundTrip(unittest.TestCase):
     """The pure helpers M3's RoleMapperDialog is built on: flat UI rows <-> RoleMapping."""
 
-    def test_round_trips_the_core2000_profile_through_the_table_shape(self):
-        original = load_profile_file(CORE2000_JSON).to_mapping(live_fields=LIVE)
+    def test_round_trips_a_rich_profile_through_the_table_shape(self):
+        original = _generic_mapping(live_fields=GENERIC_LIVE_FIELDS)
         rebuilt = mapping_from_assignments(
             original.notetype_name,
             assignments_from_mapping(original),
@@ -152,13 +194,13 @@ class TestAssignmentRoundTrip(unittest.TestCase):
             native_language=original.native_language,
         )
         self.assertEqual(rebuilt.to_profile(), original.to_profile())
-        self.assertTrue(rebuilt.validate_against(LIVE).ok)
+        self.assertTrue(rebuilt.validate_against(GENERIC_LIVE_FIELDS).ok)
 
     def test_blank_assignments_produce_an_all_unassigned_mapping(self):
-        assignments = [FieldAssignment(name=n, ord=o) for o, n in LIVE]
+        assignments = [FieldAssignment(name=n, ord=o) for o, n in GENERIC_LIVE_FIELDS]
         mapping = mapping_from_assignments("T", assignments)
         self.assertEqual(mapping.assignments, {})
-        self.assertEqual(len(mapping.unmapped(include_hidden=True)), len(LIVE))
+        self.assertEqual(len(mapping.unmapped(include_hidden=True)), len(GENERIC_LIVE_FIELDS))
 
     def test_assigning_a_role_makes_the_field_show_up_under_that_role(self):
         assignments = [
@@ -203,7 +245,7 @@ class TestAudioSourceRoles(unittest.TestCase):
     """M5's synthesis pairing: which text role backs which audio role."""
 
     def test_only_target_side_audio_is_synthesized(self):
-        """Per claude.md's "audio is a replacement, not an addition" -- native audio is
+        """Per CLAUDE.md's "audio is a replacement, not an addition" -- native audio is
         never (re)synthesized by this addon."""
         self.assertEqual(
             set(AUDIO_SOURCE_ROLES),
@@ -213,33 +255,6 @@ class TestAudioSourceRoles(unittest.TestCase):
     def test_pairs_audio_with_its_matching_content_role(self):
         self.assertIs(AUDIO_SOURCE_ROLES[Role.TARGET_AUDIO], Role.TARGET_TERM)
         self.assertIs(AUDIO_SOURCE_ROLES[Role.TARGET_SENTENCE_AUDIO], Role.TARGET_SENTENCE)
-
-
-class TestProfileMatching(unittest.TestCase):
-    def test_exact_fingerprint_match_is_usable(self):
-        match = match_profile("Core 2000", LIVE)
-        self.assertEqual(match.quality, MatchQuality.EXACT)
-        self.assertTrue(match.usable)
-
-    def test_name_match_with_wrong_fields_is_not_usable(self):
-        """Same notetype name, different schema -- route to the mapper UI, don't force it."""
-        match = match_profile("Core 2000", [(0, "Front"), (1, "Back")])
-        self.assertEqual(match.quality, MatchQuality.NAME_ONLY)
-        self.assertFalse(match.usable)
-
-    def test_unknown_notetype_matches_nothing(self):
-        match = match_profile("Some Random Deck", [(0, "Front"), (1, "Back")])
-        self.assertEqual(match.quality, MatchQuality.NONE)
-        self.assertIsNone(match.profile)
-        self.assertFalse(match.usable)
-
-    def test_builtin_profiles_all_load_and_validate(self):
-        profiles = load_profiles()
-        self.assertTrue(profiles, "no built-in profiles found")
-        for profile in profiles:
-            with self.subTest(profile=profile.id):
-                mapping = profile.to_mapping()
-                self.assertTrue(mapping.validate().ok, mapping.validate().errors)
 
 
 class TestRenderOrder(unittest.TestCase):

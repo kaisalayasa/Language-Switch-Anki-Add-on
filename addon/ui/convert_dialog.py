@@ -1,10 +1,13 @@
 """Conversion dialog: pick a deck, pick a mode, map fields, read the preflight, confirm.
 
-Field mapping (M3) comes from ``_resolve_mapping``: the user's own edit via "Map fields…"
-(``RoleMapperDialog``) if one exists for the currently selected notetype, else a shipped
-profile's exact match, else nothing -- in which case the dialog points at "Map fields…"
-instead of hard-stopping the way M1 did. This dialog's job stays what it was in M1: make
-absolutely clear what is about to happen before anything is written.
+Field mapping comes from ``_resolve_mapping``: the user's own edit via "Map fields…"
+(``RoleMapperDialog``) if one exists for the currently selected notetype, else a fresh
+content-based guess (``core.role_detect.guess_role_mapping``) -- never nothing, since that
+guesser always produces *something* for any two-field-or-more deck (see its own docstring).
+A guess that still doesn't validate (e.g. detection found no usable native-side content) is
+caught when templates are generated, and the dialog points at "Map fields…" instead of
+hard-stopping. This dialog's job stays what it was in M1: make absolutely clear what is
+about to happen before anything is written.
 """
 
 from __future__ import annotations
@@ -28,8 +31,8 @@ from aqt.qt import (
 from aqt.utils import showWarning, tooltip
 
 from ..core.conversion import ConversionMode, build_plan, scope_query
-from ..core.profiles import match_profile
-from ..core.role_schema import FieldBinding, RoleMapping, fields_from_notetype
+from ..core.role_detect import guess_role_mapping
+from ..core.role_schema import RoleMapping, ValidationError, fields_from_notetype
 from ..core.template_generator import TemplateOptions, generate_templates
 from ..ops.convert_op import convert_op
 from ..tts.sanitize import sanitize_text
@@ -107,8 +110,8 @@ class ConvertDialog(QDialog):
         row.addStretch(1)
         self.map_fields_button = QPushButton("Map fields…")
         self.map_fields_button.setToolTip(
-            "Review or build the field-to-role mapping for this notetype. Known decks are "
-            "pre-filled from a shipped profile; anything else starts blank."
+            "Review or build the field-to-role mapping for this notetype. Pre-filled from a "
+            "best guess based on the deck's own content -- correct anything it got wrong."
         )
         self.map_fields_button.clicked.connect(self._open_mapper)
         row.addWidget(self.map_fields_button)
@@ -142,30 +145,27 @@ class ConvertDialog(QDialog):
         deck, notetype, _ = self._pairs[self.pair_box.currentIndex()]
         return deck, notetype
 
-    def _resolve_mapping(self, notetype_name: str, live_fields) -> Optional[RoleMapping]:
-        """A mapping for ``notetype_name``, or ``None`` if nothing is known yet.
+    def _resolve_mapping(self, notetype_name: str, live_fields, notetype, note_ids) -> RoleMapping:
+        """A mapping for ``notetype_name``.
 
         Priority: (1) the user's own edit from "Map fields…", kept only while it was built
         for this same notetype -- switching the deck/notetype pair drops a stale override
-        automatically; (2) a shipped profile, but only if it's an exact, validating match
-        (``match.usable``) -- a same-name-but-different-fields profile is never force-fitted.
+        automatically; (2) a fresh content-based guess, seeded from a handful of real note
+        samples. Never ``None`` -- ``guess_role_mapping`` always returns something, even if
+        it doesn't validate; a bad guess is caught later, when templates are generated.
         """
         if self._override is not None and self._override[0] == notetype_name:
             return self._override[1]
-        match = match_profile(notetype_name, live_fields)
-        if match.usable:
-            return match.profile.to_mapping(live_fields=live_fields)
-        return None
-
-    def _profile_seed(self, notetype_name: str, live_fields) -> Optional[RoleMapping]:
-        """A shipped profile's mapping for ``notetype_name``, ignoring ``self._override`` --
-        used only to feed the mapper dialog's "Reset to shipped profile" button, which must
-        stay offered even after the user has edited the mapping once.
-        """
-        match = match_profile(notetype_name, live_fields)
-        if match.profile is not None and match.usable:
-            return match.profile.to_mapping(live_fields=live_fields)
-        return None
+        raw_samples = _collect_raw_samples(note_ids[:8])
+        tmpls = notetype.get("tmpls") or [{}]
+        return guess_role_mapping(
+            notetype_name,
+            live_fields,
+            raw_samples,
+            front_html=tmpls[0].get("qfmt", ""),
+            back_html=tmpls[0].get("afmt", ""),
+            css=notetype.get("css", ""),
+        )
 
     def _build(self):
         """Returns (plan, templates, note_count) or (None, None, reason)."""
@@ -176,22 +176,23 @@ class ConvertDialog(QDialog):
 
         notetype = mw.col.models.by_name(notetype_name)
         live_fields = fields_from_notetype(notetype["flds"])
+        note_ids_for_seed = mw.col.find_notes(scope_query(notetype_name, deck))
 
-        mapping = self._resolve_mapping(notetype_name, live_fields)
-        if mapping is None:
-            return None, None, (
-                "No field mapping yet for %r.\n\n"
-                "Click \"Map fields…\" below to build one -- known decks are pre-filled "
-                "from a shipped profile; anything else starts blank." % notetype_name
-            )
+        mapping = self._resolve_mapping(notetype_name, live_fields, notetype, note_ids_for_seed)
 
         config = addon_config()
 
-        templates = generate_templates(
-            mapping,
-            source_css=notetype.get("css", ""),
-            options=template_options_from_config(config),
-        )
+        try:
+            templates = generate_templates(
+                mapping,
+                source_css=notetype.get("css", ""),
+                options=template_options_from_config(config),
+            )
+        except ValidationError as exc:
+            return None, None, (
+                "No usable field mapping yet for %r: %s\n\n"
+                "Click \"Map fields…\" below to fix it." % (notetype_name, exc)
+            )
 
         plan = build_plan(
             mode=self.mode_box.currentData(),
@@ -210,8 +211,7 @@ class ConvertDialog(QDialog):
 
         The summary alone (mode, counts, deck names) tells you what will happen but not
         what the result will look like. Showing the generated Front/Back template lets you
-        judge the card layout before anything is written -- this is the same output
-        ``tools/preview_templates.py`` prints, just inline in the dialog.
+        judge the card layout before anything is written.
         """
         text = plan.preflight().as_text()
         if templates is not None:
@@ -271,16 +271,9 @@ class ConvertDialog(QDialog):
         deck, notetype_name = current
         notetype = mw.col.models.by_name(notetype_name)
         live_fields = fields_from_notetype(notetype["flds"])
-
-        profile_seed = self._profile_seed(notetype_name, live_fields)
-        seed = self._resolve_mapping(notetype_name, live_fields)
-        if seed is None:
-            seed = RoleMapping(
-                notetype_name=notetype_name,
-                fields=[FieldBinding(name=n, ord=o) for o, n in live_fields],
-            )
-
         note_ids = mw.col.find_notes(scope_query(notetype_name, deck))
+
+        seed = self._resolve_mapping(notetype_name, live_fields, notetype, note_ids)
         samples = _collect_samples(note_ids[:3])
 
         dialog = RoleMapperDialog(
@@ -289,7 +282,6 @@ class ConvertDialog(QDialog):
             live_fields=live_fields,
             samples=samples,
             initial_mapping=seed,
-            profile_mapping=profile_seed,
         )
         if dialog.exec():
             self._override = (notetype_name, dialog.result_mapping())
@@ -305,8 +297,8 @@ def _dry_run(plan, templates):
 def _collect_samples(note_ids, *, limit_per_field: int = 3, max_len: int = 60):
     """A few real, HTML-stripped sample values per field, for the mapper's Sample column.
 
-    Field names lie (see claude.md / docs/deck-facts.md), so showing what a field actually
-    *contains* is the only way a human can map it sensibly. Reuses M2's sanitizer in
+    Field names lie (see CLAUDE.md's "Field names are untrusted input"), so showing what a
+    field actually *contains* is the only way a human can map it sensibly. Reuses M2's sanitizer in
     strip-markup-only mode (``allowed_ranges=()``) rather than writing a second HTML
     stripper for display purposes.
     """

@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import unittest
 
-from addon.core.profiles import BUILTIN_PROFILE_DIR, load_profile_file
 from addon.core.role_schema import FieldBinding, Role, RoleMapping, ValidationError
 from addon.core.template_generator import (
     GENERATED_CSS_MARKER,
@@ -17,17 +15,65 @@ from addon.core.template_generator import (
     split_render_order,
 )
 
-CORE2000_JSON = os.path.join(BUILTIN_PROFILE_DIR, "core2000.json")
-
-# The real notetype, as read out of collection.anki2. See docs/deck-facts.md.
-CORE2000_LIVE_FIELDS = [
-    (0, "Optimized-Voc-Index"), (1, "Vocabulary-Kanji"), (2, "Vocabulary-Furigana"),
-    (3, "Vocabulary-Kana"), (4, "Vocabulary-English"), (5, "Vocabulary-Audio"),
-    (6, "Vocabulary-Pos"), (7, "Caution"), (8, "Expression"), (9, "Reading"),
-    (10, "Sentence-Kana"), (11, "Sentence-English"), (12, "Sentence-Clozed"),
-    (13, "Sentence-Audio"), (14, "Notes"), (15, "Core-Index"),
-    (16, "Optimized-Sent-Index"), (17, "Frequency"),
+# A synthetic "rich" profile -- readings, a sentence pair, audio, POS/notes/cloze extras,
+# and several hidden bookkeeping fields, the same shape a real deck notetype has -- but with
+# deck-agnostic field names, so these tests exercise generation for a rich mapping without
+# depending on any specific shipped deck.
+GENERIC_LIVE_FIELDS = [
+    (0, "Index"), (1, "Term"), (2, "TermReading"), (3, "TermKana"),
+    (4, "Meaning"), (5, "Audio"), (6, "Pos"), (7, "Note"),
+    (8, "Phrase"), (9, "PhraseReading"), (10, "PhraseKana"), (11, "SentenceMeaning"),
+    (12, "SentenceClozed"), (13, "SentenceAudio"), (14, "Extra"), (15, "RefIndex"),
+    (16, "SentIndex"), (17, "Freq"),
 ]
+
+GENERIC_PROFILE_DATA = {
+    "id": "generic_rich",
+    "title": "Generic rich test profile",
+    "version": 1,
+    "target_language": "en",
+    "native_language": "ja",
+    "notetype": "Generic",
+    "binds_to": {
+        "notetype_names": ["Generic"],
+        "field_fingerprint": [name for _, name in GENERIC_LIVE_FIELDS],
+    },
+    "fields": [
+        {"name": "Index", "ord": 0, "hidden": True},
+        {"name": "Term", "ord": 1, "hidden": True},
+        {"name": "TermReading", "ord": 2, "filter": "furigana", "css_class": "japanese"},
+        {"name": "TermKana", "ord": 3, "hidden": True},
+        {"name": "Meaning", "ord": 4},
+        {"name": "Audio", "ord": 5},
+        {"name": "Pos", "ord": 6},
+        {"name": "Note", "ord": 7},
+        {"name": "Phrase", "ord": 8, "hidden": True},
+        {"name": "PhraseReading", "ord": 9, "filter": "furigana", "css_class": "japanese"},
+        {"name": "PhraseKana", "ord": 10, "hidden": True},
+        {"name": "SentenceMeaning", "ord": 11},
+        {"name": "SentenceClozed", "ord": 12},
+        {"name": "SentenceAudio", "ord": 13},
+        {"name": "Extra", "ord": 14, "hidden": True},
+        {"name": "RefIndex", "ord": 15, "hidden": True},
+        {"name": "SentIndex", "ord": 16, "hidden": True},
+        {"name": "Freq", "ord": 17, "hidden": True},
+    ],
+    "roles": {
+        "TargetTerm": ["Meaning"],
+        "TargetSentence": ["SentenceMeaning"],
+        "TargetAudio": ["Audio"],
+        "TargetSentenceAudio": ["SentenceAudio"],
+        "NativeTerm": ["TermReading"],
+        "NativeSentence": ["PhraseReading"],
+        "Pos": ["Pos"],
+        "Notes": ["Note"],
+        "ClozeText": ["SentenceClozed"],
+    },
+}
+
+
+def _generic_mapping(live_fields=None):
+    return RoleMapping.from_profile(GENERIC_PROFILE_DATA, live_fields=live_fields)
 
 
 def simple_mapping(field_names, roles, **kw):
@@ -57,9 +103,9 @@ def referenced(html):
 
 class TestNoDanglingReferences(unittest.TestCase):
     def test_every_reference_exists_on_the_notetype(self):
-        mapping = load_profile_file(CORE2000_JSON).to_mapping(live_fields=CORE2000_LIVE_FIELDS)
+        mapping = _generic_mapping(live_fields=GENERIC_LIVE_FIELDS)
         result = generate_templates(mapping)
-        known = {name for _, name in CORE2000_LIVE_FIELDS}
+        known = {name for _, name in GENERIC_LIVE_FIELDS}
         self.assertTrue(referenced(result.front_html) <= known)
         self.assertTrue(referenced(result.back_html) <= known)
 
@@ -119,7 +165,7 @@ class TestGracefulDegradation(unittest.TestCase):
             simple_mapping(["A", "B"], {Role.TARGET_TERM: "A", Role.NATIVE_TERM: "B"})
         )
         rich = generate_templates(
-            load_profile_file(CORE2000_JSON).to_mapping(live_fields=CORE2000_LIVE_FIELDS)
+            _generic_mapping(live_fields=GENERIC_LIVE_FIELDS)
         )
         self.assertGreater(len(rich.referenced_fields), len(minimal.referenced_fields))
 
@@ -280,54 +326,54 @@ class TestGeneralisesBeyondTheStartingDeck(unittest.TestCase):
         self.assertNotIn("{{#TargetSent}}", result.front_html)
 
 
-class TestCore2000Golden(unittest.TestCase):
-    """Pin the actual output for the starting deck, so layout changes are deliberate."""
+class TestGoldenRichProfile(unittest.TestCase):
+    """Pin the actual output for a rich, real-shaped mapping, so layout changes are
+    deliberate rather than accidental."""
 
     def setUp(self):
         self.result = generate_templates(
-            load_profile_file(CORE2000_JSON).to_mapping(live_fields=CORE2000_LIVE_FIELDS)
+            _generic_mapping(live_fields=GENERIC_LIVE_FIELDS)
         )
 
     def test_front_is_the_target_language_prompt(self):
         front = self.result.front_html
-        self.assertIn("{{Vocabulary-English}}", front)
-        self.assertIn("{{Vocabulary-Pos}}", front)
-        self.assertIn("{{Sentence-English}}", front)
+        self.assertIn("{{Meaning}}", front)
+        self.assertIn("{{Pos}}", front)
+        self.assertIn("{{SentenceMeaning}}", front)
         # Nothing from the native side may leak onto the prompt.
-        for leaked in ("Vocabulary-Furigana", "Vocabulary-Kanji", "Reading", "Expression"):
+        for leaked in ("TermReading", "Term", "PhraseReading", "Phrase"):
             self.assertNotIn(leaked, front)
 
     def test_back_reveals_the_native_side(self):
         back = self.result.back_html
-        self.assertIn("{{furigana:Vocabulary-Furigana}}", back)
-        self.assertIn("{{furigana:Reading}}", back)
+        self.assertIn("{{furigana:TermReading}}", back)
+        self.assertIn("{{furigana:PhraseReading}}", back)
         self.assertIn("{{FrontSide}}", back)
 
     def test_demoted_language_audio_is_not_referenced_anywhere(self):
         """M1 drops the old audio from the template; M5 refills the fields with TTS."""
         combined = self.result.front_html + self.result.back_html
-        self.assertNotIn("{{Vocabulary-Audio}}", combined)
-        self.assertNotIn("{{Sentence-Audio}}", combined)
+        self.assertNotIn("{{Audio}}", combined)
+        self.assertNotIn("{{SentenceAudio}}", combined)
 
     def test_bookkeeping_fields_are_not_dumped_onto_the_card(self):
         back = self.result.back_html
-        for noise in ("Optimized-Voc-Index", "Core-Index", "Frequency", "Optimized-Sent-Index"):
+        for noise in ("Index", "RefIndex", "Freq", "SentIndex"):
             self.assertNotIn(noise, back)
 
-    def test_mislabelled_fields_are_excluded(self):
-        """`Notes` holds the Core index string and `Core-Index` holds an integer."""
-        self.assertNotIn("{{Notes}}", self.result.back_html)
+    def test_unbound_hidden_field_is_excluded(self):
+        self.assertNotIn("{{Extra}}", self.result.back_html)
 
-    def test_caution_is_guarded(self):
-        """Empty on 1980 of 1983 notes."""
-        self.assertIn("{{#Caution}}", self.result.back_html)
+    def test_note_is_guarded(self):
+        """An optional field must not leave a stray empty box when blank."""
+        self.assertIn("{{#Note}}", self.result.back_html)
 
 
 class TestProfileRoundTrip(unittest.TestCase):
     def test_to_profile_then_from_profile_is_stable(self):
-        original = load_profile_file(CORE2000_JSON).to_mapping(live_fields=CORE2000_LIVE_FIELDS)
+        original = _generic_mapping(live_fields=GENERIC_LIVE_FIELDS)
         round_tripped = RoleMapping.from_profile(
-            json.loads(json.dumps(original.to_profile())), live_fields=CORE2000_LIVE_FIELDS
+            json.loads(json.dumps(original.to_profile())), live_fields=GENERIC_LIVE_FIELDS
         )
         self.assertEqual(
             generate_templates(original).front_html,
