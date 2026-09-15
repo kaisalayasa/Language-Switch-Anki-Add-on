@@ -1,0 +1,69 @@
+{
+  "notetype_name": "Basic-25eeb",
+  "deck_name": "Top 100 German Verbs",
+  "note_count_in_scope": 100,
+  "fields": [
+    {
+      "ord": 0,
+      "name": "Front"
+    },
+    {
+      "ord": 1,
+      "name": "Back"
+    }
+  ],
+  "qfmt": "{{Front}}",
+  "afmt": "{{FrontSide}}\n\n<hr id=answer>\n\n{{Back}}",
+  "css": ".card {\n font-family: arial;\n font-size: 20px;\n text-align: center;\n color: black;\n background-color: white;\n}\n",
+  "template_name": "Card 1",
+  "samples": [
+    {
+      "note_id": 1443624414631,
+      "fields": {
+        "Front": "stellen [sound:oddcast-072e7647-ef91ad3b-30f433f3-9c340db8-129f2f55.mp3]",
+        "Back": "to place, set<br>"
+      },
+      "tags": []
+    },
+    {
+      "note_id": 1443624141420,
+      "fields": {
+        "Front": "stehen [sound:oddcast-131f7a4d-8027a755-1839d67f-01162464-1b28ccdc.mp3]",
+        "Back": "to stand<br>"
+      },
+      "tags": []
+    },
+    {
+      "note_id": 1443624335130,
+      "fields": {
+        "Front": "sprechen [sound:oddcast-657ce755-64261b5b-da958988-a73c4a19-4276b0c9.mp3]",
+        "Back": "to speak<br>"
+      },
+      "tags": []
+    },
+    {
+      "note_id": 1443624495012,
+      "fields": {
+        "Front": "spielen [sound:oddcast-e82d0e98-82b5c473-38d3a830-89819e5c-902b2d24.mp3]",
+        "Back": "to play<br>"
+      },
+      "tags": []
+    },
+    {
+      "note_id": 1443624074968,
+      "fields": {
+        "Front": "sollen [sound:oddcast-71f3f6c4-7be79cbd-78f6396c-e4ac3578-01201cc9.mp3]",
+        "Back": "should, ought to<br>"
+      },
+      "tags": []
+    },
+    {
+      "note_id": 1443625270588,
+      "fields": {
+        "Front": "sitzen [sound:oddcast-674a265e-8ac0a696-6e7b5aac-93104617-6c20b1d1.mp3]",
+        "Back": "to sit<br>"
+      },
+      "tags": []
+    }
+  ]
+}
