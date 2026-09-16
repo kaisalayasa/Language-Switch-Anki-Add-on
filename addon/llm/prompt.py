@@ -1,11 +1,21 @@
 """Builds the one prompt this addon sends to the model.
 
 Per ``docs/llm-notes.md``, the model call is one shot: given a notetype's fields, real sample
-content, and its current Front/Back/CSS, produce a plain-language description plus the finished,
-flipped Front/Back/CSS -- not a role mapping for other code to turn into HTML. **This module is
-the product.** If the model gets something wrong, the fix is more detail in ``_SYSTEM_PROMPT``,
-never a bigger model (the user's explicit call) and never a hand-written fallback that re-derives
-the deleted heuristic pipeline.
+content, its current CSS, and an ALREADY-DECIDED field placement, produce a plain-language
+description plus the finished Front/Back/CSS templates for that placement -- not a role mapping
+for other code to turn into HTML, and not a direction decision for the model to work out itself.
+
+**Direction, target/native language, and field placement are computed by
+:func:`~addon.llm.direction.resolve_direction`, never asked of the model.** Four independently
+phrased attempts to get the model to execute "whichever fields are on the current back move to
+the new front" all failed identically -- see ``direction.py``'s module docstring for the full
+account, including the field-naming collision (a deck's field literally named "Front"/"Back")
+that broke it hardest. The model's job here is narrowed to two things: pick which given front
+field to speak aloud (``speak_text_from``), and write templates that honor a placement it is
+simply told, never asked to derive. **This module is the product for that narrowed job** -- if the
+model gets the template HTML wrong, the fix is more detail in ``_SYSTEM_PROMPT``, never a bigger
+model (the user's explicit call) and never a hand-written fallback that re-derives the deleted
+heuristic pipeline.
 
 This module is exempt from ``addon/core``'s no-language-name rule (see ``addon/llm/__init__.py``
 and ``tests/test_purity.py``): describing languages is the prompt's entire job. What it must not
@@ -17,7 +27,7 @@ any two-language deck.
 **Audio safety is deliberately not left to the model's judgment.** The first real test of this
 prompt (see ``docs/llm-notes.md``) showed the model failing to notice a field mixing real text
 with embedded ``[sound:...]`` audio and referencing it as a bare ``{{Field}}`` -- which would
-play the deck's own, original-direction audio on the converted card. Rather than asking a 1.5B
+play the deck's own, original-direction audio on the converted card. Rather than asking a small
 model to reliably detect that from raw sample text, detection happens deterministically in
 Python (:func:`~addon.llm.audio_safety.sound_field_names`) *before* the prompt is built: the
 samples shown to the model have ``[sound:...]`` already stripped out (so the noise it would have
@@ -31,7 +41,7 @@ the guarantee behind it.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence, Tuple
+from typing import Tuple
 
 from .audio_safety import SOUND_TAG_RE, sound_field_names
 
@@ -74,19 +84,23 @@ class FieldSample:
 
 @dataclass(frozen=True)
 class PromptInput:
-    """Everything the model needs to analyze and flip one notetype.
+    """Everything the model needs to write templates for one notetype.
 
-    ``audio_field_name`` is decided by deterministic code before this prompt is ever built (the
-    same "conversion creates an empty field, TTS fills it later" policy the old
-    ``audio_fields.py`` used) -- the model is told this name as a given fact, not asked to invent
-    or choose it.
+    ``new_front_fields``/``new_back_fields`` are the ALREADY-DECIDED field placement -- the
+    output of :func:`~addon.llm.direction.resolve_direction`, computed before this prompt is
+    ever built, not something the model works out. Likewise ``audio_field_name`` names the field
+    the conversion itself creates for newly-generated audio (the same "conversion creates an
+    empty field, TTS fills it later" policy the old ``audio_fields.py`` used). The model is told
+    both as given facts; its job is narrowed to picking which given front field to speak, and
+    writing HTML/CSS for a placement it is handed -- never deciding the placement or the
+    languages involved itself.
     """
 
     deck_name: str
     notetype_name: str
     fields: Tuple[FieldSample, ...]
-    current_qfmt: str
-    current_afmt: str
+    new_front_fields: Tuple[str, ...]
+    new_back_fields: Tuple[str, ...]
     current_css: str
     audio_field_name: str
 
@@ -130,6 +144,8 @@ def _render_user_prompt(data: PromptInput) -> str:
     fields_block = "\n".join(_render_field(f) for f in data.fields) or "(no fields)"
     audio_fields = sorted(sound_field_names(data.fields))
     audio_fields_block = ", ".join(audio_fields) if audio_fields else "(none)"
+    new_front_block = ", ".join(data.new_front_fields) if data.new_front_fields else "(none)"
+    new_back_block = ", ".join(data.new_back_fields) if data.new_back_fields else "(none)"
     return """## Deck to convert
 
 Deck name: %s
@@ -144,13 +160,13 @@ you): %s
 If you reference one of these fields' text anywhere in your templates, you MUST use
 {{text:FieldName}}, never a bare {{FieldName}} -- see hard rule 3.
 
-Current Front template:
-%s
+New FRONT fields (given -- place these on the Front): %s
+New BACK fields (given -- place these on the Back): %s
+This placement has already been decided for you. Do not move a field to the other side, and do
+not use a field's NAME to second-guess it -- a field can be named "Front" or "Back" while
+actually belonging on either given side; go strictly by the two lists above.
 
-Current Back template:
-%s
-
-Current CSS:
+Current CSS (context and style only):
 %s
 
 The empty field reserved for new audio: %s
@@ -159,115 +175,47 @@ The empty field reserved for new audio: %s
         data.notetype_name,
         fields_block,
         audio_fields_block,
-        data.current_qfmt,
-        data.current_afmt,
+        new_front_block,
+        new_back_block,
         data.current_css,
         data.audio_field_name,
     )
 
 
-_SYSTEM_PROMPT = """You are an expert Anki card template author. Your job: given one existing \
-Anki notetype (its fields, real sample content, and its current Front/Back/CSS templates), \
-produce a NEW set of Front/Back/CSS templates that flips which language is being tested.
-
-## The task: flipping direction
-
-An Anki notetype has a Front template (the question) and a Back template (the answer). Right \
-now, some fields are shown on the Front and some are shown on the Back -- that is the CURRENT \
-direction. Your job is to produce the FLIPPED direction: whichever language is currently the \
-ANSWER (shown only on the Back) becomes the new QUESTION (shown on the Front), and whichever \
-language is currently the QUESTION (shown on the Front) becomes the new ANSWER (shown on the \
-Back).
-
-Call the language moving onto the front "the target language" (the language being studied -- \
-the learner is prompted with it and must produce the answer in their own language). Call the \
-language moving onto the back "the native language" (the language the learner already knows).
-
-## Reading the deck
-
-You are given:
-- the deck's name and notetype's name (context only -- these can be genuinely uninformative, \
-e.g. "Basic-25eeb"; never assume a name is accurate or meaningful)
-- every field's name, and a handful of REAL sample values pulled from real notes
-- the CURRENT Front template, Back template, and CSS
-
-FIELD NAMES CAN BE MISLEADING. A field named "Notes" might hold an internal index number, not a \
-note. Always look at the SAMPLE VALUES to understand what a field actually contains -- never \
-trust a field's name alone.
-
-Use the sample values to work out, for each field:
-- what language its text is written in (if any) -- judge this from the actual characters and \
-words in the samples, not from any field or deck name
-- whether it holds a single word/term (short) or a full example sentence (longer, with natural \
-sentence structure and punctuation)
-- whether it is bookkeeping (an internal index, a numeric ID, a frequency rank) rather than \
-content a learner should see
-- whether it already contains an embedded [sound:...] audio reference, and if so whether that \
-reference sits ALONE in the field or is mixed in with real text (e.g. "stellen [sound:xyz.mp3]" \
-is text WITH audio mixed in; "[sound:xyz.mp3]" alone is pure audio)
-- whether it holds an image (an <img src="..."> reference)
-
-You may also use the deck name as a hint about what languages are involved, but never as the \
-only signal -- always confirm against real sample content.
+_SYSTEM_PROMPT = """You are an expert Anki card template author. You are given a deck's fields, \
+real sample content, and the EXACT field placement for the converted card -- which fields go on \
+the new Front and which go on the new Back has already been decided for you. Your only job: \
+pick which field to speak aloud, and write the Front/Back/CSS templates.
 
 ## Anki template syntax (this is the complete syntax you may use)
 
 - `{{FieldName}}` -- inserts that field's content, HTML included, verbatim.
-- `{{text:FieldName}}` -- inserts that field's content as PLAIN TEXT: HTML tags are stripped, \
-and special references (audio [sound:...], images) are stripped too. Use this instead of a bare \
-`{{FieldName}}` whenever a field's real value might contain an audio reference you do not want \
-to play, or an image you do not want to show.
-- `{{#FieldName}}...{{/FieldName}}` -- the content between the tags is only shown if FieldName \
-is non-empty on a given note. Use this to avoid rendering an empty box when a field has no \
-content on some notes.
-- `{{^FieldName}}...{{/FieldName}}` -- the opposite: content inside is only shown if FieldName \
-IS empty.
-- `{{FrontSide}}` -- only usable inside the BACK template. Inserts everything that was shown on \
-the Front. Every Back template you write must start with `{{FrontSide}}`.
-- `<hr id=answer>` -- the conventional divider between the repeated front content and the \
-answer content. Place it immediately after `{{FrontSide}}` in the Back template.
-- You may only reference a field name that is EXACTLY one of the field names you were given. \
-Inventing a field name, or misspelling one, produces a broken card.
-- Plain HTML (<div>, <br>, <b>, class attributes, etc.) is allowed anywhere, exactly as in \
-ordinary Anki card templates.
+- `{{text:FieldName}}` -- inserts that field's content as PLAIN TEXT: HTML tags and special \
+references (audio, images) are stripped. Use this instead of a bare `{{FieldName}}` whenever a \
+field might contain audio you do not want to play.
+- `{{#FieldName}}...{{/FieldName}}` -- shown only if FieldName is non-empty on a note.
+- `{{^FieldName}}...{{/FieldName}}` -- shown only if FieldName IS empty.
+- `{{FrontSide}}` -- only usable inside the BACK template. Every Back template must start with it.
+- `<hr id=answer>` -- the conventional divider, placed immediately after `{{FrontSide}}`.
+- You may only reference a field name that is EXACTLY one of the field names you were given.
 
 ## Hard rules
 
-1. The Front template must contain at least one field reference that is NOT wrapped in a \
-{{#...}}...{{/...}} conditional. Anki refuses to save a card template whose front can ever \
-render completely empty, so at least one thing must always show.
-
-2. Copy the given CSS forward exactly, character for character, as the start of your new CSS, \
-then append any new rules you want after it. Never remove, rewrite, or "clean up" the original \
-CSS. Real decks often declare @font-face rules pointing at font files that live in the user's \
-media folder -- rewriting the CSS from scratch breaks the deck's look.
-
-3. Below, in the deck data, you are told exactly which fields already contain their own \
-pre-existing audio -- this has already been determined for you; you do not need to detect it \
-yourself from the samples. For any field on that list, if you want to show its text, reference \
-it with {{text:FieldName}}, never a bare {{FieldName}}. This shows the text while dropping the \
-embedded audio reference, so the deck's OLD audio does not play on the new, flipped card.
-
-4. You are given the name of one field that is currently empty, reserved to hold NEW audio that \
-will be generated later for whatever text you choose as speak_text_from. Reference this field \
-with a BARE, unfiltered reference ({{FieldName}}, never {{text:FieldName}}) so that once audio \
-is generated into it, it can actually play. You may wrap it in a \
-{{#FieldName}}...{{/FieldName}} conditional (it starts empty, so this avoids showing anything \
-until audio exists).
-
-5. Never reference any OTHER field that already contains its own [sound:...] audio as a bare \
-{{FieldName}} -- that would play the deck's old, original-direction audio on the new card, which \
-is exactly wrong. If that field's text is otherwise useful, you may still show its text via \
-{{text:FieldName}} (rule 3), which drops the audio but keeps the text.
-
-6. Fields with real, human-readable content that you don't otherwise use should still appear \
-somewhere on the Back, so nothing is silently thrown away -- unless a field is pure bookkeeping \
-(an internal index/ID/frequency number) or is empty on essentially every note, in which case it \
-is fine to leave it out entirely.
-
-7. For speak_text_from, prefer a full example-sentence field on the target-language side if one \
-exists -- hearing a word pronounced in a full sentence is more useful to a learner than hearing \
-it in isolation. Only fall back to a single word/term field if there is no sentence field.
+1. The Front template must contain at least one field reference NOT wrapped in a conditional.
+2. Copy the given CSS forward exactly as the start of your new CSS, then append new rules.
+3. You are told below exactly which fields already contain their own pre-existing audio. For \
+those, if you reference their text, use {{text:FieldName}}, never a bare {{FieldName}}.
+4. Reference the given "field for new audio" as a BARE reference ({{FieldName}}), never \
+{{text:FieldName}}. It is currently empty -- you may wrap it in a conditional.
+5. Never reference any OTHER field that already contains audio as a bare {{FieldName}}.
+6. Put every given "new front" field somewhere on the Front, and every given "new back" field \
+somewhere on the Back -- these placements are decided, not yours to change. A field with no \
+real content on most notes (an internal index or ID -- judge this from its sample values) may \
+be given little or no visual weight, but every OTHER field with real content should still be \
+visible somewhere on its given side.
+7. speak_text_from must be one of the given "new front" fields -- prefer a full \
+example-sentence field over a single word/term if more than one front field looks like real \
+spoken content.
 
 ## Output format
 
@@ -277,11 +225,8 @@ Do not wrap anything in markdown code fences.
 
 --- ANALYSIS ---
 {
-  "description": "<one or two plain-language sentences: what this deck is, and how you are converting it>",
-  "target_language": "<name of the language moving onto the front, e.g. \\"English\\">",
-  "native_language": "<name of the language moving onto the back, e.g. \\"Japanese\\">",
-  "speak_text_from": "<exact name of the field whose text should be spoken aloud>",
-  "write_audio_to": "<exact name of the empty audio field you were given>"
+  "description": "<one or two plain-language sentences: what this deck is, and how it's being converted -- name the actual languages involved>",
+  "speak_text_from": "<exact name of one of the given new-FRONT fields>"
 }
 --- FRONT ---
 <the new Front template HTML>
@@ -292,19 +237,14 @@ Do not wrap anything in markdown code fences.
 
 ## Worked example
 
-Given fields Word (samples: "casa", "perro", "libro"), Translation (samples: "house", "dog", \
-"book"), ExampleSentence (samples: "La casa es grande.", "El perro corre.", "Leo un libro."), \
-current Front `{{Translation}}`, current Back \
-`{{FrontSide}}<hr id=answer>{{Word}}{{ExampleSentence}}`, current CSS \
-`.card { font-size: 20px; }`, and audio field `ddc-audio`, a correct response looks like:
+Given fields Word, Translation, ExampleSentence, new FRONT fields (given): Word, \
+ExampleSentence, new BACK fields (given): Translation, current CSS \
+`.card { font-size: 20px; }`, field for new audio: ddc-audio -- a correct response looks like:
 
 --- ANALYSIS ---
 {
-  "description": "A Spanish vocabulary deck, currently English-front/Spanish-back. Converting to Spanish-front/English-back so the learner practices producing Spanish.",
-  "target_language": "Spanish",
-  "native_language": "English",
-  "speak_text_from": "ExampleSentence",
-  "write_audio_to": "ddc-audio"
+  "description": "A Spanish vocabulary deck, converting to Spanish-front/English-back so the learner practices producing Spanish.",
+  "speak_text_from": "ExampleSentence"
 }
 --- FRONT ---
 <div class="word">{{Word}}</div>
@@ -318,6 +258,10 @@ current Front `{{Translation}}`, current Back \
 .word { font-size: 32px; font-weight: 600; }
 .sentence { font-size: 18px; margin-top: 8px; }
 .translation { font-size: 28px; }
+
+IMPORTANT: "Word", "Translation", "ExampleSentence" above are made-up names for illustration \
+only. Every {{FieldName}} in your real answer must be copied character-for-character from the \
+real deck's Fields list below -- never from this example.
 
 Now do the same for the real deck given below.
 """
