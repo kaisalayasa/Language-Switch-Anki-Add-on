@@ -24,6 +24,7 @@ from addon.llm.runtime import (
     asset_url,
     ensure_llama_runtime,
     resolve_asset_name,
+    runtime_is_cached,
 )
 
 
@@ -158,6 +159,33 @@ class TestEnsureLlamaRuntime(unittest.TestCase):
                     cache_dir, system="Linux", machine="armv7l",
                     download_to=fake_download, run=_ok_run,
                 )
+
+
+class TestRuntimeIsCached(unittest.TestCase):
+    """Purely for UI messaging (e.g. "downloading now" vs. "already have it") -- a cheap
+    existence check, never a subprocess run, so it must work with no injected ``run`` at all."""
+
+    def test_false_when_nothing_downloaded_yet(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            self.assertFalse(runtime_is_cached(cache_dir, system="Windows", machine="AMD64"))
+
+    def test_true_once_the_binary_has_been_extracted(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            def fake_download(url, dest):
+                _zip_with_exe(dest, "llama-completion.exe")
+
+            ensure_llama_runtime(cache_dir, system="Windows", machine="AMD64",
+                                  download_to=fake_download, run=_ok_run)
+
+            self.assertTrue(runtime_is_cached(cache_dir, system="Windows", machine="AMD64"))
+
+    def test_does_not_require_a_real_binary_just_the_right_filename(self):
+        """Existence-only by design -- ensure_llama_runtime is what actually verifies it runs."""
+        with tempfile.TemporaryDirectory() as cache_dir:
+            root = Path(cache_dir) / "llama-runtime"
+            root.mkdir(parents=True)
+            (root / "llama-completion.exe").write_bytes(b"not a real binary")
+            self.assertTrue(runtime_is_cached(cache_dir, system="Windows", machine="AMD64"))
 
 
 if __name__ == "__main__":

@@ -67,8 +67,8 @@ from ..core.deck_state import ConversionState, state_from_notetype
 from ..llm.analyze import DeckAnalysis, analyze_deck
 from ..llm.client import call_model
 from ..llm.direction import Direction, resolve_direction
-from ..llm.model_manager import ensure_model
-from ..llm.runtime import ensure_llama_runtime
+from ..llm.model_manager import ensure_model, model_is_cached
+from ..llm.runtime import ensure_llama_runtime, runtime_is_cached
 from ..ops.convert_op import convert_op
 from ..ops.deck_data import addon_config, collect_field_samples, decks_with_notetypes
 from ..ops.notetype_manager import shape_notetype
@@ -250,14 +250,18 @@ class _AIResultPanel(QWidget):
                 "converted Front/Back/CSS templates."
             )
 
-    def show_analyzing(self) -> None:
+    def show_analyzing(self, *, downloading: bool) -> None:
         self.stars_label.setText("")
         self.review_label.setVisible(False)
-        self.description_label.setText("Analyzing…")
-        self.details_label.setText(
-            "This can take a few minutes, especially the first time (downloads a local AI "
-            "model, about 4.3GB, once)."
-        )
+        if downloading:
+            self.description_label.setText("Downloading the local AI model…")
+            self.details_label.setText(
+                "One-time download, about 4.3GB -- how long this takes depends on your "
+                "connection. Every analysis after this one skips straight to analyzing."
+            )
+        else:
+            self.description_label.setText("Analyzing…")
+            self.details_label.setText("The AI model is already downloaded -- usually done in under a minute.")
 
     def show_analysis(self, analysis: DeckAnalysis) -> None:
         stars = "★" * analysis.trust_stars + "☆" * (5 - analysis.trust_stars)
@@ -694,17 +698,27 @@ class MainScreen(QDialog):
         notetype_name = self._notetype_name
         conversion_state = self._conversion_state
 
+        # Checked up front (cheap: local file existence/size, no network, no subprocess) so the
+        # very first message the user sees already says the right thing -- previously this was
+        # one message covering both cases ("can take a few minutes, downloads a model") with no
+        # way to tell which was actually happening. ensure_llama_runtime/ensure_model below are
+        # still what actually download-if-missing and verify; this is only for wording.
+        downloading = not (runtime_is_cached(_cache_dir()) and model_is_cached(_cache_dir()))
+
         self._analyzing = True
         self._html_dirty = False
         self._update_action_state()
-        self.ai_result_panel.show_analyzing()
+        self.ai_result_panel.show_analyzing(downloading=downloading)
         self.status_label.setText("")
-        mw.progress.start(
-            parent=self,
-            immediate=True,
-            label="Analyzing deck… this can take a few minutes, especially on the very "
-                  "first run (downloads a local AI model, about 4.3GB, one time only).",
-        )
+        if downloading:
+            progress_label = (
+                "Downloading the local AI model (about 4.3GB, one time only)… this can take "
+                "a while depending on your connection. Every analysis after this one skips "
+                "straight to analyzing."
+            )
+        else:
+            progress_label = "Analyzing deck… the AI model is already downloaded, usually done in under a minute."
+        mw.progress.start(parent=self, immediate=True, label=progress_label)
 
         result_holder: Dict[str, Any] = {}
 

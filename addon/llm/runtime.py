@@ -42,6 +42,7 @@ __all__ = [
     "resolve_asset_name",
     "asset_url",
     "ensure_llama_runtime",
+    "runtime_is_cached",
 ]
 
 #: Pinned nightly build. Re-verify against the real release asset list before ever bumping this
@@ -148,6 +149,21 @@ def ensure_llama_runtime(
 
     version = _verify(existing, run)
     return LlamaRuntime(path=existing, version=version)
+
+
+def runtime_is_cached(
+    cache_dir: Path, *, system: Optional[str] = None, machine: Optional[str] = None
+) -> bool:
+    """Whether a ``llama-completion`` binary is already extracted under ``cache_dir`` -- a
+    cheap, local, no-subprocess check (existence only, no ``--version`` run). Exists purely so
+    a caller can tell the user "downloading now" vs. "already have it, just running it" *before*
+    committing to either -- ``ensure_llama_runtime`` still does the real, authoritative
+    download-if-missing-and-verify regardless of what this returns.
+    """
+    system = system or platform.system()
+    root = Path(cache_dir) / "llama-runtime"
+    exe_name = "llama-completion.exe" if system.lower() == "windows" else "llama-completion"
+    return _find_executable(root, exe_name) is not None
 
 
 def _find_executable(root: Path, exe_name: str) -> Optional[Path]:

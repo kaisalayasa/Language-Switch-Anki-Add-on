@@ -35,6 +35,7 @@ __all__ = [
     "MODEL_FILES",
     "model_urls",
     "ensure_model",
+    "model_is_cached",
 ]
 
 HF_RESOLVE_BASE = "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/"
@@ -72,6 +73,20 @@ DownloadFn = Callable[[str, Path], None]
 
 def model_urls() -> Tuple[str, ...]:
     return tuple(HF_RESOLVE_BASE + f.filename for f in MODEL_FILES)
+
+
+def model_is_cached(cache_dir: Path) -> bool:
+    """Whether every model file already sits under ``cache_dir`` at its correct size -- a
+    cheap, local check. Exists purely so a caller can tell the user "downloading now" vs.
+    "already have it" *before* committing to either -- ``ensure_model`` still does the real,
+    authoritative download-if-missing-and-verify regardless of what this returns.
+    """
+    model_dir = Path(cache_dir) / "model"
+    return all(
+        (model_dir / spec.filename).exists()
+        and (model_dir / spec.filename).stat().st_size == spec.size_bytes
+        for spec in MODEL_FILES
+    )
 
 
 def ensure_model(cache_dir: Path, *, download_to: Optional[DownloadFn] = None) -> ModelFiles:
