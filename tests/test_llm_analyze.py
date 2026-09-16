@@ -139,6 +139,27 @@ class TestStripPendingAudioHtml(unittest.TestCase):
         self.assertEqual(strip_pending_audio_html(front, ["ddc-audio-Word"]), front)
 
 
+class TestFieldsNotShownOnTheOriginalCardAreHiddenFromThePrompt(unittest.TestCase):
+    """A field resolve_direction excluded from placement (not referenced anywhere in the
+    original qfmt/afmt -- see direction.py and its own tests) must not reach the model at all,
+    not just be left out of the given FRONT/BACK lists -- otherwise nothing stops the model
+    referencing it anyway, since validate.py only checks references against those two lists."""
+
+    def test_a_hidden_fields_content_is_absent_from_the_user_prompt(self):
+        index_field = FieldSample(name="Core-Index", samples=("a distinctive marker value",))
+        _result, caller = _analyze([_GOOD_RESPONSE], fields=FIELDS + [index_field])
+        _system_prompt, user_prompt = caller.calls[0]
+        self.assertNotIn("Core-Index", user_prompt)
+        self.assertNotIn("a distinctive marker value", user_prompt)
+
+    def test_placed_fields_are_still_shown_as_normal(self):
+        index_field = FieldSample(name="Core-Index", samples=("1",))
+        _result, caller = _analyze([_GOOD_RESPONSE], fields=FIELDS + [index_field])
+        _system_prompt, user_prompt = caller.calls[0]
+        self.assertIn("Word", user_prompt)
+        self.assertIn("Translation", user_prompt)
+
+
 class TestKnownStateIsThreadedThrough(unittest.TestCase):
     """``known_state`` (this notetype's recorded conversion state, when re-analyzing one
     already converted) must actually reach ``resolve_direction``, not just be accepted and

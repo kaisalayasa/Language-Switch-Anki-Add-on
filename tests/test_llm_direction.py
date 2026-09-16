@@ -107,6 +107,49 @@ class TestKnownStateMakesReanalyzingIdempotent(unittest.TestCase):
         self.assertEqual(direction.native_language, "es")
 
 
+class TestFieldsNotShownOnTheOriginalCardAreExcluded(unittest.TestCase):
+    """A field never referenced anywhere in the original qfmt/afmt (Core 2000's own
+    Optimized-Voc-Index/Core-Index/etc. -- confirmed against the real deck export, see
+    tests/fixtures/core2000.json) is deck-author bookkeeping, not content the original card
+    ever showed. Placing it on the converted card anyway would be a real behavior change (the
+    field becomes newly visible), not "preserving" anything -- so it's excluded from placement
+    exactly like a not-yet-existing generated-audio field is."""
+
+    def test_a_field_absent_from_both_qfmt_and_afmt_is_placed_nowhere(self):
+        index_field = FieldSample(name="Core-Index", samples=("1", "53", "114"))
+        direction = resolve_direction(
+            [_WORD_ES, _TRANSLATION_EN, index_field], _QFMT_UNCONVERTED, _AFMT_UNCONVERTED
+        )
+        self.assertNotIn("Core-Index", direction.new_front_fields)
+        self.assertNotIn("Core-Index", direction.new_back_fields)
+
+    def test_it_does_not_get_an_audio_target_either(self):
+        index_field = FieldSample(name="Core-Index", samples=("1", "53", "114"))
+        direction = resolve_direction(
+            [_WORD_ES, _TRANSLATION_EN, index_field], _QFMT_UNCONVERTED, _AFMT_UNCONVERTED
+        )
+        self.assertNotIn(
+            "Core-Index", [t.source_field for t in direction.audio_targets]
+        )
+
+    def test_a_field_referenced_only_inside_a_conditional_still_counts_as_visible(self):
+        """{{#Field}}...{{/Field}} genuinely renders when the field is non-empty -- that's a
+        real design choice by the deck author, not the same as never referencing it at all."""
+        caution = FieldSample(name="Caution", samples=("Adios y buena suerte", "", ""))
+        qfmt = _QFMT_UNCONVERTED + "{{#Caution}}{{Caution}}{{/Caution}}"
+        direction = resolve_direction([_WORD_ES, _TRANSLATION_EN, caution], qfmt, _AFMT_UNCONVERTED)
+        self.assertIn("Caution", direction.new_front_fields + direction.new_back_fields)
+
+    def test_normal_placement_is_unaffected_for_fields_that_are_shown(self):
+        """Sanity check against the everyday case -- this whole mechanism must not touch a
+        field that's genuinely part of the original card."""
+        direction = resolve_direction(
+            [_WORD_ES, _TRANSLATION_EN], _QFMT_UNCONVERTED, _AFMT_UNCONVERTED
+        )
+        self.assertEqual(direction.new_front_fields, ("Translation",))
+        self.assertEqual(direction.new_back_fields, ("Word",))
+
+
 class TestGeneratedAudioFieldsAreExcludedFromPlacement(unittest.TestCase):
     """A field this addon already created for audio (recognised via
     ``core.audio_fields.is_generated_field``) is real, sampled data once a notetype has been

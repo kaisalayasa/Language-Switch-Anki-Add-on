@@ -132,7 +132,9 @@ def resolve_direction(
     """Everything about direction, computed -- nothing here is a judgment call.
 
     1. Which fields are currently on the front vs back (``current_sides`` -- pure template
-       parsing). Skipped when ``known_state`` is given -- see step 2.
+       parsing). Their union is also this deck's *visible* field set (step 3) -- computed
+       unconditionally, even when ``known_state`` is given, since that skip only ever applied
+       to target/native language (step 2), not to this.
     2. Target/native language at the deck level. Normally: the dominant language of each
        *current* side (the language currently on the back is being promoted (target), the
        language currently on the front is being demoted (native)) -- correct the first time a
@@ -148,10 +150,20 @@ def resolve_direction(
        target/native pair -- not by relocating its current side wholesale. A field whose
        language doesn't confidently match either (bookkeeping, pure audio, too short to
        detect) falls back to the back, matching the old generator's "never silently drop a
-       field" policy. A field this addon already created for generated audio
-       (``is_generated_field``) is excluded from this placement step entirely -- never shown to
-       the model as a front OR back field to place, since it isn't content, it's a technical
-       detail step 4 already knows how to reconstruct on its own.
+       field" policy -- **provided it was actually shown on the original card at all.** A
+       field this addon already created for generated audio (``is_generated_field``), or a
+       field that isn't referenced anywhere in the given ``qfmt``/``afmt`` (confirmed against
+       a real Core 2000 export: ``Core-Index``, ``Optimized-Voc-Index``, bookkeeping fields
+       like it are never in either template, by the original deck author's own design, not by
+       omission), is excluded from this placement step entirely -- never shown to the model as
+       a front OR back field to place, and never shown to the model's prompt at all (see
+       ``analyze.py``, which filters ``PromptInput.fields`` down to exactly what got placed
+       here). Reproducing a field's *existing* invisibility isn't "silently dropping" it in
+       the sense that policy is about -- the field keeps its data, on the clone, unchanged;
+       only whether it renders on either side of the *card* stays exactly as it already was.
+       A field referenced only inside a conditional (``{{#Field}}...{{/Field}}``) still counts
+       as visible -- ``current_sides``/``referenced_fields`` see through the conditional to the
+       field name, exactly as intended, since that field genuinely does render when non-empty.
     4. Every *other* field now on the new front gets its own paired audio target
        (``core.audio_fields.generated_audio_field_name``) -- deterministic and idempotent, so
        re-analyzing an already-converted notetype always proposes the exact same audio field
@@ -161,11 +173,13 @@ def resolve_direction(
     by_name = {f.name: f for f in field_list}
     field_names = [f.name for f in field_list]
 
+    current_front, current_back = current_sides(field_names, qfmt, afmt)
+    currently_visible = set(current_front) | set(current_back)
+
     if known_state is not None:
         native_language = known_state.native_language
         target_language = known_state.target_language
     else:
-        current_front, current_back = current_sides(field_names, qfmt, afmt)
         native_language = _side_language(current_front, by_name) or "?"
         target_language = _side_language(current_back, by_name) or "?"
 
@@ -173,6 +187,8 @@ def resolve_direction(
     new_back: List[str] = []
     for field in field_list:
         if is_generated_field(field.name):
+            continue
+        if field.name not in currently_visible:
             continue
         language = _field_language(field, by_name)
         if language == target_language:

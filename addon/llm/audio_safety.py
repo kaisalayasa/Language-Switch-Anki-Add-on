@@ -30,6 +30,8 @@ from __future__ import annotations
 import re
 from typing import Iterable, Sequence
 
+from .template_fields import content_reference_pattern
+
 __all__ = ["SOUND_TAG_RE", "field_has_sound", "sound_field_names", "enforce_audio_safety"]
 
 SOUND_TAG_RE = re.compile(r"\[sound:[^\]]*\]")
@@ -50,18 +52,6 @@ def sound_field_names(fields) -> frozenset:
     return frozenset(f.name for f in fields if field_has_sound(f.samples))
 
 
-def _reference_pattern(field_name: str) -> "re.Pattern":
-    """Matches a content-rendering reference to ``field_name`` -- ``{{Field}}`` or
-    ``{{anyfilter:Field}}`` -- but never a conditional guard (``{{#Field}}``, ``{{^Field}}``,
-    ``{{/Field}}``), and never a *different*, longer field name that merely starts with the same
-    text (e.g. ``{{FrontSide}}`` must never match when ``field_name`` is ``"Front"`` -- the
-    pattern anchors ``field_name`` immediately against the closing ``}}``, so a name that
-    continues past it, like "Side", cannot match).
-    """
-    escaped = re.escape(field_name)
-    return re.compile(r"\{\{(?![#^/])(?:[A-Za-z0-9_ .\-]+:)?" + escaped + r"\}\}")
-
-
 def enforce_audio_safety(html: str, *, sound_fields: Iterable[str]) -> str:
     """Rewrite ``html`` so every field in ``sound_fields`` can only ever be referenced via
     ``{{text:Field}}``, never played as audio.
@@ -73,6 +63,6 @@ def enforce_audio_safety(html: str, *, sound_fields: Iterable[str]) -> str:
     """
     out = html
     for name in sound_fields:
-        pattern = _reference_pattern(name)
+        pattern = content_reference_pattern(name)
         out = pattern.sub("{{%s:%s}}" % (_TEXT_FILTER, name), out)
     return out

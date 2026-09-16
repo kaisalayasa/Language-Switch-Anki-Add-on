@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from typing import List, Sequence, Tuple
 
-__all__ = ["referenced_fields", "current_sides"]
+__all__ = ["referenced_fields", "current_sides", "content_reference_pattern"]
 
 _REF_RE = re.compile(r"\{\{([^}]+)\}\}")
 
@@ -65,3 +65,20 @@ def current_sides(
     front = [n for n in known if n in front_raw]
     back = [n for n in known if n in back_raw]
     return front, back
+
+
+def content_reference_pattern(field_name: str) -> "re.Pattern":
+    """Matches a content-rendering reference to ``field_name`` -- ``{{Field}}`` or
+    ``{{anyfilter:Field}}`` -- but never a conditional guard (``{{#Field}}``, ``{{^Field}}``,
+    ``{{/Field}}``), and never a *different*, longer field name that merely starts with the same
+    text (e.g. ``{{FrontSide}}`` must never match when ``field_name`` is ``"Front"`` -- the
+    pattern anchors ``field_name`` immediately against the closing ``}}``, so a name that
+    continues past it, like "Side", cannot match).
+
+    Shared by ``audio_safety.enforce_audio_safety`` (forcing a reference to render as text-only)
+    and ``field_visibility.set_field_hidden`` (wrapping/unwrapping a reference to toggle its
+    display) -- both need exactly this "which references actually render this field's value"
+    distinction, not just "which references mention this field's name at all".
+    """
+    escaped = re.escape(field_name)
+    return re.compile(r"\{\{(?![#^/])(?:[A-Za-z0-9_ .\-]+:)?" + escaped + r"\}\}")
