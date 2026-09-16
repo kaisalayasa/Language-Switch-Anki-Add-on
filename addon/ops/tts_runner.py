@@ -28,7 +28,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..tts.piper_provider import EmptyTextError, PiperProvider
 from .tts_batch import (
@@ -100,22 +100,23 @@ def run_tts_batch(
     note_ids: List[int],
     voice_id: str,
     *,
-    audio_field: str,
-    source_field: str,
+    targets: Sequence[Tuple[str, str]],
     limit: int = 0,
     concurrency: int = 1,
     cancel_event: Optional[threading.Event] = None,
     on_done: Optional[Callable[[BatchOutcome], None]] = None,
 ) -> None:
     """Processes ``note_ids`` (already the "needs audio" set -- see ``notes_needing_audio``)
-    through Piper, synthesizing ``source_field``'s text into ``audio_field`` for each. Must be
+    through Piper, synthesizing each ``(audio_field, source_field)`` pair in ``targets`` for
+    every note (usually 2: a word and a sentence, but always whatever
+    ``llm.direction.Direction.audio_targets`` decided -- see ``ops/tts_batch.py``). Must be
     called from the Qt main thread; ``on_done`` (if given) is called back on the main thread
     when finished.
 
     Unlike the old role-mapping design, there is no template flip at the end of a run: the
-    model already wrote a bare reference to ``audio_field`` into the front template at
-    conversion time (it starts empty, so it renders as nothing until this fills it in), so
-    there is nothing left to turn on once synthesis finishes.
+    analysis step already appended a bare reference to each audio field into the front template
+    (see ``llm.analyze._append_audio_html`` -- each one starts empty, so it renders as nothing
+    until this fills it in), so there is nothing left to turn on once synthesis finishes.
 
     ``limit`` caps how many of ``note_ids`` this run touches -- 0 means no cap, processing
     everything passed in. The rest are simply left untagged, exactly as if the run had been
@@ -157,9 +158,7 @@ def run_tts_batch(
                 outcome.cancelled = True
                 break
             note = col.get_note(nid)
-            result = generate_note_audio(
-                col, note, provider, voice_id, audio_field=audio_field, source_field=source_field
-            )
+            result = generate_note_audio(col, note, provider, voice_id, targets=targets)
             if not result.ok:
                 outcome.failed += 1
             elif result.changed:
@@ -176,9 +175,7 @@ def run_tts_batch(
             if cancel_requested():
                 outcome.cancelled = True
                 return
-            plans[nid] = plan_note_audio(
-                col.get_note(nid), audio_field=audio_field, source_field=source_field
-            )
+            plans[nid] = plan_note_audio(col.get_note(nid), targets=targets)
 
         done_count = 0
         with ThreadPoolExecutor(max_workers=concurrency) as pool:

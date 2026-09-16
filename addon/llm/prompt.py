@@ -5,17 +5,19 @@ content, its current CSS, and an ALREADY-DECIDED field placement, produce a plai
 description plus the finished Front/Back/CSS templates for that placement -- not a role mapping
 for other code to turn into HTML, and not a direction decision for the model to work out itself.
 
-**Direction, target/native language, and field placement are computed by
-:func:`~addon.llm.direction.resolve_direction`, never asked of the model.** Four independently
-phrased attempts to get the model to execute "whichever fields are on the current back move to
-the new front" all failed identically -- see ``direction.py``'s module docstring for the full
-account, including the field-naming collision (a deck's field literally named "Front"/"Back")
-that broke it hardest. The model's job here is narrowed to two things: pick which given front
-field to speak aloud (``speak_text_from``), and write templates that honor a placement it is
-simply told, never asked to derive. **This module is the product for that narrowed job** -- if the
-model gets the template HTML wrong, the fix is more detail in ``_SYSTEM_PROMPT``, never a bigger
-model (the user's explicit call) and never a hand-written fallback that re-derives the deleted
-heuristic pipeline.
+**Direction, target/native language, field placement, and which fields get generated audio are
+all computed by :func:`~addon.llm.direction.resolve_direction`, never asked of the model.** Four
+independently phrased attempts to get the model to execute "whichever fields are on the current
+back move to the new front" all failed identically -- see ``direction.py``'s module docstring for
+the full account, including the field-naming collision (a deck's field literally named
+"Front"/"Back") that broke it hardest. Audio field selection and naming used to be a model
+decision too (``speak_text_from``, picking one front field to read aloud) -- removed once it
+became clear there was nothing left to actually choose: every field placed on the new front
+already carries real target-language content, so every one of them gets its own generated audio
+field, computed and named deterministically. **This module's only remaining job is writing
+Front/Back/CSS HTML for a placement it is simply told** -- if the model gets the template HTML
+wrong, the fix is more detail in ``_SYSTEM_PROMPT``, never a bigger model (the user's explicit
+call) and never a hand-written fallback that re-derives the deleted heuristic pipeline.
 
 This module is exempt from ``addon/core``'s no-language-name rule (see ``addon/llm/__init__.py``
 and ``tests/test_purity.py``): describing languages is the prompt's entire job. What it must not
@@ -35,7 +37,10 @@ had to parse and reason about isn't there in the first place), and the affected 
 handed to the model directly as a given fact, not something to infer. ``audio_safety`` is applied
 again, deterministically, to whatever the model actually writes -- so an instruction the model
 ignores still can't reach a real card. Pre-sanitizing is the primary defense; the post-hoc pass is
-the guarantee behind it.
+the guarantee behind it. This is a separate concern from the *newly generated* audio fields above:
+those aren't mentioned to the model at all, so there's nothing for it to get wrong about them --
+the finished templates get their references appended by Python, after the model's response has
+already been validated (see ``analyze.py``).
 """
 
 from __future__ import annotations
@@ -74,7 +79,7 @@ class FieldSample:
     """One field's name plus a few **raw** (unsanitized) sample values.
 
     Raw on purpose: an embedded ``[sound:...]`` reference or HTML is itself a signal the model
-    needs to see (rules 3-5 in the system prompt depend on being able to tell a field apart from
+    needs to see (rules 3-4 in the system prompt depend on being able to tell a field apart from
     one that only *looks* like content).
     """
 
@@ -88,12 +93,9 @@ class PromptInput:
 
     ``new_front_fields``/``new_back_fields`` are the ALREADY-DECIDED field placement -- the
     output of :func:`~addon.llm.direction.resolve_direction`, computed before this prompt is
-    ever built, not something the model works out. Likewise ``audio_field_name`` names the field
-    the conversion itself creates for newly-generated audio (the same "conversion creates an
-    empty field, TTS fills it later" policy the old ``audio_fields.py`` used). The model is told
-    both as given facts; its job is narrowed to picking which given front field to speak, and
-    writing HTML/CSS for a placement it is handed -- never deciding the placement or the
-    languages involved itself.
+    ever built, not something the model works out. Fields this addon generates its own audio
+    into are excluded from both lists entirely -- the model is never told they exist, since it
+    never needs to reference them (see module docstring).
     """
 
     deck_name: str
@@ -102,7 +104,6 @@ class PromptInput:
     new_front_fields: Tuple[str, ...]
     new_back_fields: Tuple[str, ...]
     current_css: str
-    audio_field_name: str
 
 
 def build_prompt(data: PromptInput) -> Tuple[str, str]:
@@ -168,8 +169,6 @@ actually belonging on either given side; go strictly by the two lists above.
 
 Current CSS (context and style only):
 %s
-
-The empty field reserved for new audio: %s
 """ % (
         data.deck_name,
         data.notetype_name,
@@ -178,14 +177,13 @@ The empty field reserved for new audio: %s
         new_front_block,
         new_back_block,
         data.current_css,
-        data.audio_field_name,
     )
 
 
 _SYSTEM_PROMPT = """You are an expert Anki card template author. You are given a deck's fields, \
 real sample content, and the EXACT field placement for the converted card -- which fields go on \
 the new Front and which go on the new Back has already been decided for you. Your only job: \
-pick which field to speak aloud, and write the Front/Back/CSS templates.
+write the Front/Back/CSS templates for that placement.
 
 ## Anki template syntax (this is the complete syntax you may use)
 
@@ -203,19 +201,14 @@ field might contain audio you do not want to play.
 
 1. The Front template must contain at least one field reference NOT wrapped in a conditional.
 2. Copy the given CSS forward exactly as the start of your new CSS, then append new rules.
-3. You are told below exactly which fields already contain their own pre-existing audio. For \
-those, if you reference their text, use {{text:FieldName}}, never a bare {{FieldName}}.
-4. Reference the given "field for new audio" as a BARE reference ({{FieldName}}), never \
-{{text:FieldName}}. It is currently empty -- you may wrap it in a conditional.
-5. Never reference any OTHER field that already contains audio as a bare {{FieldName}}.
-6. Put every given "new front" field somewhere on the Front, and every given "new back" field \
+3. You are told below exactly which fields already contain their own pre-existing audio. Never \
+reference one of those fields as a bare {{FieldName}} -- if you reference its text anywhere, use \
+{{text:FieldName}} instead, so its embedded audio can never play on the converted card.
+4. Put every given "new front" field somewhere on the Front, and every given "new back" field \
 somewhere on the Back -- these placements are decided, not yours to change. A field with no \
 real content on most notes (an internal index or ID -- judge this from its sample values) may \
 be given little or no visual weight, but every OTHER field with real content should still be \
 visible somewhere on its given side.
-7. speak_text_from must be one of the given "new front" fields -- prefer a full \
-example-sentence field over a single word/term if more than one front field looks like real \
-spoken content.
 
 ## Output format
 
@@ -225,8 +218,7 @@ Do not wrap anything in markdown code fences.
 
 --- ANALYSIS ---
 {
-  "description": "<one or two plain-language sentences: what this deck is, and how it's being converted -- name the actual languages involved>",
-  "speak_text_from": "<exact name of one of the given new-FRONT fields>"
+  "description": "<one or two plain-language sentences: what this deck is, and how it's being converted -- name the actual languages involved>"
 }
 --- FRONT ---
 <the new Front template HTML>
@@ -239,17 +231,15 @@ Do not wrap anything in markdown code fences.
 
 Given fields Word, Translation, ExampleSentence, new FRONT fields (given): Word, \
 ExampleSentence, new BACK fields (given): Translation, current CSS \
-`.card { font-size: 20px; }`, field for new audio: ddc-audio -- a correct response looks like:
+`.card { font-size: 20px; }` -- a correct response looks like:
 
 --- ANALYSIS ---
 {
-  "description": "A Spanish vocabulary deck, converting to Spanish-front/English-back so the learner practices producing Spanish.",
-  "speak_text_from": "ExampleSentence"
+  "description": "A Spanish vocabulary deck, converting to Spanish-front/English-back so the learner practices producing Spanish."
 }
 --- FRONT ---
 <div class="word">{{Word}}</div>
 {{#ExampleSentence}}<div class="sentence">{{ExampleSentence}}</div>{{/ExampleSentence}}
-{{#ddc-audio}}{{ddc-audio}}{{/ddc-audio}}
 --- BACK ---
 {{FrontSide}}<hr id=answer>
 <div class="translation">{{Translation}}</div>

@@ -11,11 +11,18 @@ failure this project's audio policy exists to prevent (see the old `core/audio_f
 prompt: whether a field's audio should ever play is a fact we can determine deterministically from
 its own sample content, so there is no judgment call to hand to a 1.5B model at all.
 
-The rule: every field whose real content contains `[sound:...]`, other than the one field the
-conversion itself creates for new audio, gets every bare or differently-filtered reference to it
-forced to `{{text:Field}}` -- which renders the field's text while stripping any embedded audio
-reference. Conditional guards (`{{#Field}}...{{/Field}}`, `{{^Field}}...{{/Field}}`) are left
-alone; they are presence checks, not renders, and touch nothing themselves.
+The rule: every field whose real content contains `[sound:...]` gets every bare or
+differently-filtered reference to it forced to `{{text:Field}}` -- which renders the field's text
+while stripping any embedded audio reference. Conditional guards (`{{#Field}}...{{/Field}}`,
+`{{^Field}}...{{/Field}}`) are left alone; they are presence checks, not renders, and touch
+nothing themselves.
+
+No exemption is needed for the new fields a conversion itself creates for generated audio: the
+model is never told those names exist at all any more (``llm/direction.py`` computes and appends
+their references itself, after this function and validation have both already run -- see
+``analyze.py``), so there is nothing for the model to legitimately bare-reference here. If a
+response ever did hallucinate a reference to one, this function neutralizing it is the correct,
+safe outcome, not a false positive.
 """
 
 from __future__ import annotations
@@ -55,21 +62,17 @@ def _reference_pattern(field_name: str) -> "re.Pattern":
     return re.compile(r"\{\{(?![#^/])(?:[A-Za-z0-9_ .\-]+:)?" + escaped + r"\}\}")
 
 
-def enforce_audio_safety(html: str, *, sound_fields: Iterable[str], keep: str) -> str:
-    """Rewrite ``html`` so every field in ``sound_fields`` (except ``keep``) can only ever be
-    referenced via ``{{text:Field}}``, never played as audio.
+def enforce_audio_safety(html: str, *, sound_fields: Iterable[str]) -> str:
+    """Rewrite ``html`` so every field in ``sound_fields`` can only ever be referenced via
+    ``{{text:Field}}``, never played as audio.
 
-    ``keep`` is the one field the conversion itself creates to hold newly-generated audio --
-    exempt because it is empty until TTS runs and its entire purpose is to be played. Applied to
-    both the Front and Back template HTML; a leak can happen on either side.
+    Applied to both the Front and Back template HTML; a leak can happen on either side.
 
     Idempotent: a reference already written as ``{{text:Field}}`` matches the same pattern and is
     replaced with itself, not double-wrapped.
     """
     out = html
     for name in sound_fields:
-        if name == keep:
-            continue
         pattern = _reference_pattern(name)
         out = pattern.sub("{{%s:%s}}" % (_TEXT_FILTER, name), out)
     return out

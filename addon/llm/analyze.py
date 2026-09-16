@@ -1,6 +1,7 @@
 """Orchestrates one full "analyze this deck" call: resolve direction, build the prompt, call the
-model, parse and validate its reply, retry on a validation failure, and attach a trust rating
-the user can see before ever touching the preview.
+model, parse and validate its reply, retry on a validation failure, append the (deterministic,
+never AI-authored) generated-audio references, and attach a trust rating the user can see before
+ever touching the preview.
 
 **The trust rating is computed here, not asked of the model.** Same principle as direction and
 audio safety: a number the model reports about its own reliability would be exactly the kind of
@@ -19,6 +20,13 @@ closely at the preview -- and at 1 star specifically, to consider hand-editing t
 rather than trusting them, since the result being returned at that point is simply the last
 attempt's output, unresolved problems and all, never silently discarded.
 
+**Generated-audio field references are never part of what the model writes or what validation
+checks.** ``resolve_direction`` already decides, deterministically, which front fields get their
+own audio field (see ``direction.py``'s module docstring); this module appends the
+``{{#field}}{{field}}{{/field}}`` reference for each one directly onto the model's (validated)
+Front HTML, after every retry loop has already finished -- so there is nothing left for the model
+to get wrong about audio placement, and nothing for validation to need to check there either.
+
 Known limitation, not folded into the rating (kept out deliberately, to match what was actually
 asked for): a deck whose language detection came back uncertain (``direction.py``'s
 ``target_language``/``native_language`` as ``"?"``) does not lower the star count, even though
@@ -30,8 +38,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Callable, List, Optional, Sequence, Tuple
 
+from ..core.deck_state import ConversionState
 from .audio_safety import enforce_audio_safety, sound_field_names
-from .direction import resolve_direction
+from .direction import AudioTarget, resolve_direction
 from .prompt import FieldSample, PromptInput, build_prompt
 from .response import ParsedResponse, ResponseParseError, parse_response
 from .validate import ValidationProblem, validate_response
@@ -54,19 +63,20 @@ CallModelFn = Callable[[str, str], str]
 @dataclass(frozen=True)
 class DeckAnalysis:
     description: str
-    speak_text_from: str
     front: str
     back: str
     css: str
     target_language: str
     native_language: str
-    audio_field_name: str
     #: The given field placement direction.py computed -- not re-derived from the returned
     #: front/back HTML, so this stays accurate even when the model dropped a field the
     #: placement allowed it to omit (e.g. a bookkeeping field), which a UI showing "what was
     #: decided" should still reflect faithfully.
     new_front_fields: Tuple[str, ...]
     new_back_fields: Tuple[str, ...]
+    #: One (source_field, audio_field) pair per real front-content field -- see direction.py.
+    #: ``front`` above already has each one's reference appended.
+    audio_targets: Tuple[AudioTarget, ...]
     trust_stars: int
     attempts_used: int
     unresolved_problems: Tuple[ValidationProblem, ...]
@@ -85,9 +95,9 @@ def analyze_deck(
     qfmt: str,
     afmt: str,
     css: str,
-    audio_field_name: str,
     call_model_fn: CallModelFn,
     max_attempts: int = MAX_ATTEMPTS,
+    known_state: Optional[ConversionState] = None,
 ) -> DeckAnalysis:
     """Run the full analyze pipeline for one notetype and return a :class:`DeckAnalysis`.
 
@@ -95,8 +105,13 @@ def analyze_deck(
     caller-built wrapper around :func:`addon.llm.client.call_model` with the runtime/model
     paths already bound (e.g. via :func:`functools.partial`), so this module knows nothing
     about subprocess details and stays trivially testable with a canned function.
+
+    ``known_state``, when the caller has one (``core.deck_state.state_from_notetype`` on the
+    currently selected notetype), is passed straight through to :func:`~.direction.resolve_direction`
+    so re-analyzing an already-converted notetype is idempotent instead of flipping it back to
+    its original direction -- see that function's docstring for why.
     """
-    direction = resolve_direction(fields, qfmt, afmt, audio_field_name=audio_field_name)
+    direction = resolve_direction(fields, qfmt, afmt, known_state=known_state)
     audio_fields = sound_field_names(fields)
     known_field_names = [f.name for f in fields]
 
@@ -107,7 +122,6 @@ def analyze_deck(
         new_front_fields=direction.new_front_fields,
         new_back_fields=direction.new_back_fields,
         current_css=css,
-        audio_field_name=audio_field_name,
     )
     system_prompt, base_user_prompt = build_prompt(prompt_input)
 
@@ -132,29 +146,27 @@ def analyze_deck(
 
         safe_parsed = replace(
             parsed,
-            front=enforce_audio_safety(parsed.front, sound_fields=audio_fields, keep=audio_field_name),
-            back=enforce_audio_safety(parsed.back, sound_fields=audio_fields, keep=audio_field_name),
+            front=enforce_audio_safety(parsed.front, sound_fields=audio_fields),
+            back=enforce_audio_safety(parsed.back, sound_fields=audio_fields),
         )
         problems = validate_response(
             safe_parsed,
             known_field_names=known_field_names,
             new_front_fields=direction.new_front_fields,
             new_back_fields=direction.new_back_fields,
-            audio_field_name=audio_field_name,
         )
         if not problems:
             stars = _STARS_BY_ATTEMPTS_USED.get(attempt, 1)
             return DeckAnalysis(
                 description=safe_parsed.description,
-                speak_text_from=safe_parsed.speak_text_from,
-                front=safe_parsed.front,
+                front=_append_audio_html(safe_parsed.front, direction.audio_targets),
                 back=safe_parsed.back,
                 css=safe_parsed.css,
                 target_language=direction.target_language,
                 native_language=direction.native_language,
-                audio_field_name=audio_field_name,
                 new_front_fields=direction.new_front_fields,
                 new_back_fields=direction.new_back_fields,
+                audio_targets=direction.audio_targets,
                 trust_stars=stars,
                 attempts_used=attempt,
                 unresolved_problems=(),
@@ -167,21 +179,36 @@ def analyze_deck(
     # discard it silently, but unmistakably flagged: 1 star, and the unresolved problems attached.
     return DeckAnalysis(
         description=safe_parsed.description if safe_parsed else "",
-        speak_text_from=safe_parsed.speak_text_from if safe_parsed else "",
-        front=safe_parsed.front if safe_parsed else "",
+        front=_append_audio_html(safe_parsed.front, direction.audio_targets) if safe_parsed else "",
         back=safe_parsed.back if safe_parsed else "",
         css=safe_parsed.css if safe_parsed else "",
         target_language=direction.target_language,
         native_language=direction.native_language,
-        audio_field_name=audio_field_name,
         new_front_fields=direction.new_front_fields,
         new_back_fields=direction.new_back_fields,
+        audio_targets=direction.audio_targets,
         trust_stars=1,
         attempts_used=max_attempts,
         unresolved_problems=tuple(problems),
         last_raw_response=raw_response,
         review_message=_review_message(1, max_attempts, tuple(problems)),
     )
+
+
+def _append_audio_html(front: str, audio_targets: Sequence[AudioTarget]) -> str:
+    """Append one ``{{#field}}{{field}}{{/field}}`` reference per audio target to ``front``.
+
+    Deterministic, not model-authored -- see module docstring. Always wrapped in a conditional
+    so a not-yet-synthesized (empty) audio field renders as nothing rather than a broken player,
+    matching what the model used to be told to do by hand for the single field this replaces.
+    """
+    if not audio_targets:
+        return front
+    snippets = "".join(
+        "{{#%s}}{{%s}}{{/%s}}" % (t.audio_field, t.audio_field, t.audio_field)
+        for t in audio_targets
+    )
+    return front.rstrip() + "\n" + snippets
 
 
 def _retry_prompt(base_user_prompt: str, problems: Sequence[ValidationProblem]) -> str:

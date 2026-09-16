@@ -1,17 +1,21 @@
 """``llm.analyze``: the orchestration loop (direction -> prompt -> model -> parse -> validate ->
-retry) and the trust-star rating computed from how much trouble that loop had.
+retry -> append generated-audio references) and the trust-star rating computed from how much
+trouble that loop had.
 
 ``call_model_fn`` is always a canned fake here -- no subprocess, no real model. The direction
 resolution itself is real (not mocked), same as ``direction.py``'s own tests, using sample text
 unambiguous enough to detect consistently: Spanish sentences for "Word", English for
-"Translation", which resolve_direction places as new_front=(Word,), new_back=(Translation,).
+"Translation", which resolve_direction places as new_front=(Word,), new_back=(Translation,),
+audio_targets=(AudioTarget("Word", "ddc-audio-Word"),).
 """
 
 from __future__ import annotations
 
 import unittest
 
+from addon.core.deck_state import ConversionState
 from addon.llm.analyze import DeckAnalysis, MAX_ATTEMPTS, analyze_deck
+from addon.llm.direction import AudioTarget
 from addon.llm.prompt import ANALYSIS_MARKER, BACK_MARKER, CSS_MARKER, FRONT_MARKER, FieldSample
 
 FIELDS = [
@@ -22,15 +26,16 @@ QFMT = "{{Translation}}"
 AFMT = "{{FrontSide}}<hr id=answer>{{Word}}"
 
 
-def _response(front, back, css=".card {}", speak_text_from="Word", description="d"):
+def _response(front, back, css=".card {}", description="d"):
     return (
-        '%s\n{"description": "%s", "speak_text_from": "%s"}\n%s\n%s\n%s\n%s\n%s\n%s'
-        % (ANALYSIS_MARKER, description, speak_text_from, FRONT_MARKER, front,
-           BACK_MARKER, back, CSS_MARKER, css)
+        '%s\n{"description": "%s"}\n%s\n%s\n%s\n%s\n%s\n%s'
+        % (ANALYSIS_MARKER, description, FRONT_MARKER, front, BACK_MARKER, back, CSS_MARKER, css)
     )
 
 
-_GOOD_FRONT = "<div>{{Word}}</div>{{#ddc-audio}}{{ddc-audio}}{{/ddc-audio}}"
+# No audio reference here -- the model never writes one any more (see analyze._append_audio_html,
+# which adds it after the fact). TestAudioTargetsAreComputedAndAppended checks it actually lands.
+_GOOD_FRONT = "<div>{{Word}}</div>"
 _GOOD_BACK = "{{FrontSide}}<hr id=answer><div>{{Translation}}</div>"
 _GOOD_RESPONSE = _response(_GOOD_FRONT, _GOOD_BACK)
 
@@ -56,7 +61,7 @@ class FakeCaller:
 def _analyze(responses, **overrides):
     kwargs = dict(
         deck_name="Test Deck", notetype_name="Basic", fields=FIELDS, qfmt=QFMT, afmt=AFMT,
-        css=".card { font-size: 20px; }", audio_field_name="ddc-audio",
+        css=".card { font-size: 20px; }",
     )
     kwargs.update(overrides)
     caller = FakeCaller(responses)
@@ -77,6 +82,58 @@ class TestDirectionIsWiredIn(unittest.TestCase):
         result, _ = _analyze([_GOOD_RESPONSE])
         self.assertEqual(result.new_front_fields, ("Word",))
         self.assertEqual(result.new_back_fields, ("Translation",))
+
+
+class TestAudioTargetsAreComputedAndAppended(unittest.TestCase):
+    """Which fields get audio, and their names, is no longer something the model decides or
+    writes -- see llm/direction.py. This is the other half of that: analyze_deck exposes the
+    computed targets and appends their references to the front it returns."""
+
+    def test_audio_targets_reflects_the_given_placement(self):
+        result, _ = _analyze([_GOOD_RESPONSE])
+        self.assertEqual(result.audio_targets, (AudioTarget("Word", "ddc-audio-Word"),))
+
+    def test_the_audio_reference_is_appended_not_written_by_the_model(self):
+        """_GOOD_RESPONSE's front has no audio reference in it at all -- if one appears in the
+        result, analyze_deck put it there itself."""
+        result, _ = _analyze([_GOOD_RESPONSE])
+        self.assertIn("{{#ddc-audio-Word}}{{ddc-audio-Word}}{{/ddc-audio-Word}}", result.front)
+        self.assertIn("<div>{{Word}}</div>", result.front)
+
+    def test_the_audio_reference_is_appended_even_on_total_failure(self):
+        """The last attempt's own (still-broken) output is never silently discarded -- and
+        that includes still getting the deterministic audio reference appended, since that
+        part was never in question regardless of what the model got wrong."""
+        result, _ = _analyze([_BAD_RESPONSE, _BAD_RESPONSE, _BAD_RESPONSE])
+        self.assertIn("{{#ddc-audio-Word}}{{ddc-audio-Word}}{{/ddc-audio-Word}}", result.front)
+
+
+class TestKnownStateIsThreadedThrough(unittest.TestCase):
+    """``known_state`` (this notetype's recorded conversion state, when re-analyzing one
+    already converted) must actually reach ``resolve_direction``, not just be accepted and
+    dropped -- see ``test_llm_direction.py`` for what goes wrong without it."""
+
+    def test_known_state_overrides_the_structurally_derived_direction(self):
+        """This fixture's own qfmt/afmt structurally resolve to target=es/native=en (see
+        TestDirectionIsWiredIn) -- a known_state claiming the deck was already converted the
+        other way around must win instead."""
+        known_state = ConversionState(target_language="en", native_language="es")
+        flipped_front = "<div>{{Translation}}</div>"
+        flipped_back = "{{FrontSide}}<hr id=answer><div>{{Word}}</div>"
+        response = _response(flipped_front, flipped_back)
+
+        result, caller = _analyze([response], known_state=known_state)
+
+        self.assertEqual(len(caller.calls), 1)
+        self.assertEqual(result.target_language, "en")
+        self.assertEqual(result.native_language, "es")
+        self.assertEqual(result.new_front_fields, ("Translation",))
+        self.assertEqual(result.new_back_fields, ("Word",))
+
+    def test_omitting_known_state_keeps_the_original_structural_behavior(self):
+        result, _ = _analyze([_GOOD_RESPONSE])
+        self.assertEqual(result.target_language, "es")
+        self.assertEqual(result.native_language, "en")
 
 
 class TestTrustStars(unittest.TestCase):

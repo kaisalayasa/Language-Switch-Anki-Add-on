@@ -18,12 +18,17 @@ Whether the *currently selected* pair was already converted by a previous sessio
 via ``core.deck_state.state_from_notetype`` -- a recorded fact (a note tag and a css comment
 written at conversion time), never re-derived by inspecting the live templates the way the old
 role-mapping system did (which is exactly what broke on a deck this addon had already
-converted, reading the same templates backwards a second time). That said, this screen still
-requires a fresh Analyze once per session even for an already-converted pair, because
-``speak_text_from`` (which field to read aloud for TTS) is a per-analysis decision that
-``deck_state`` deliberately does not persist -- only "converted, and which direction" is
-recorded. Re-analyzing an already-converted notetype is cheap to reason about (the model just
-proposes the same shape again) even if it costs the same LLM call.
+converted, reading the same templates backwards a second time -- see ``llm.direction``'s
+``known_state`` parameter, which this screen feeds from ``self._conversion_state`` on every
+Analyze specifically so a re-Analyze can never flip an already-converted deck back).
+
+Convert always needs a fresh Analyze -- there is no other source for the templates it writes.
+Generate TTS audio does not, for a pair already known to be converted: which fields to speak and
+which (empty or already-filled) fields their audio goes into is entirely deterministic
+(``llm.direction.resolve_direction``'s ``audio_targets`` -- see that module), so this screen just
+recomputes it directly (a fast, local, non-AI call) rather than requiring a fresh Analyze --
+``self._recomputed_direction``, refreshed on every pair change. Only Convert needs the AI; once a
+deck is converted, adding more TTS to it later never does.
 """
 
 from __future__ import annotations
@@ -57,15 +62,16 @@ from aqt.qt import (
 from aqt.sound import av_player
 from aqt.utils import askUser, showInfo, showWarning
 
-from ..core.audio_fields import GENERATED_AUDIO_FIELD, generated_field_name
 from ..core.conversion import ConversionMode, build_plan, scope_query
 from ..core.deck_state import ConversionState, state_from_notetype
 from ..llm.analyze import DeckAnalysis, analyze_deck
 from ..llm.client import call_model
+from ..llm.direction import Direction, resolve_direction
 from ..llm.model_manager import ensure_model
 from ..llm.runtime import ensure_llama_runtime
 from ..ops.convert_op import convert_op
 from ..ops.deck_data import addon_config, collect_field_samples, decks_with_notetypes
+from ..ops.notetype_manager import shape_notetype
 from ..ops.tts_batch import notes_needing_audio
 from ..ops.tts_runner import BatchOutcome, default_concurrency, run_tts_batch
 from ..tts.piper_provider import PiperProvider
@@ -75,8 +81,8 @@ from .preview_panel import PreviewPanel
 __all__ = ["MainScreen", "show_main_screen"]
 
 #: Fallback only -- used before a deck/notetype is picked, or before an analysis exists.
-#: Once an analysis is available, the sample button speaks *that note's* own
-#: ``speak_text_from`` field instead (see ``MainScreen._sample_text``).
+#: Once an analysis is available, the sample button speaks *that note's* own audio-target
+#: field content instead (see ``MainScreen._sample_text``).
 _SAMPLE_TEXT = "This is a sample sentence for testing."
 
 _DEFAULT_VOICE_ID = "en_GB-alba-medium"
@@ -212,7 +218,12 @@ class _AIResultPanel(QWidget):
 
         layout.addStretch(1)
 
-    def show_not_analyzed(self, conversion_state: Optional[ConversionState]) -> None:
+    def show_not_analyzed(
+        self,
+        conversion_state: Optional[ConversionState],
+        *,
+        can_generate_tts: bool = False,
+    ) -> None:
         self.stars_label.setText("")
         self.review_label.setVisible(False)
         if conversion_state is not None:
@@ -221,10 +232,17 @@ class _AIResultPanel(QWidget):
                 "previous conversion)."
                 % (conversion_state.target_language, conversion_state.native_language)
             )
-            self.details_label.setText(
-                "Click Analyze to re-check it -- needed once per session before Convert or "
-                "Generate TTS audio can run."
-            )
+            if can_generate_tts:
+                self.details_label.setText(
+                    "You can click \"Generate TTS audio\" directly -- no AI call needed for "
+                    "that any more. Click Analyze only if you want to review or change the "
+                    "templates themselves."
+                )
+            else:
+                self.details_label.setText(
+                    "This notetype has no real front-side field to generate audio from yet. "
+                    "Click Analyze to re-check it."
+                )
         else:
             self.description_label.setText("Not analyzed yet.")
             self.details_label.setText(
@@ -250,13 +268,14 @@ class _AIResultPanel(QWidget):
         else:
             self.review_label.setVisible(False)
         self.description_label.setText(analysis.description)
+        speaks = ", ".join(t.source_field for t in analysis.audio_targets) or "(nothing to speak)"
         self.details_label.setText(
             "Speaks: %s\n"
             "Target language: %s      Native language: %s\n\n"
             "New Front: %s\n"
             "New Back: %s"
             % (
-                analysis.speak_text_from,
+                speaks,
                 analysis.target_language,
                 analysis.native_language,
                 ", ".join(analysis.new_front_fields) or "(none)",
@@ -287,25 +306,30 @@ class MainScreen(QDialog):
         #: doesn't by itself unlock Convert/Generate TTS audio).
         self._conversion_state: Optional[ConversionState] = None
         #: This session's analysis of the currently selected pair, if any. Drives both
-        #: Convert (front/back/css come from the html editor, which this populates) and
-        #: Generate TTS audio (needs speak_text_from, which only an analysis carries).
+        #: Convert (front/back/css come from the html editor, which this populates) and,
+        #: when present, Generate TTS audio (its audio_targets names which fields to speak).
         self._analysis: Optional[DeckAnalysis] = None
-        self._audio_field_name: Optional[str] = None
+        #: Recomputed (not stored anywhere) whenever the selected pair is already converted --
+        #: a fast, local, non-AI call to ``llm.direction.resolve_direction`` against the live
+        #: notetype's own current fields, giving ``audio_targets`` without needing an analysis.
+        #: ``None`` when the pair has never been converted (nothing to recompute) or has no
+        #: notes to sample. See module docstring / ``_generate_tts_ready``.
+        self._recomputed_direction: Optional[Direction] = None
         self._html_mode = False
         self._html_dirty = False
         self._target_deck_dirty = False
         self._tts_cancel_event: Optional[threading.Event] = None
         self._convert_running = False
         self._analyzing = False
-        #: (clone_notetype_name, analysis, audio_field_name) set right after a successful
-        #: Convert, so the very next pair-change (auto-selecting that clone) can carry the
-        #: just-used analysis forward instead of resetting to "not analyzed". Needed because
-        #: Generate TTS audio requires speak_text_from, which core.deck_state deliberately
-        #: does not record (it only answers "converted, and which direction", not per-field
-        #: decisions) -- without this, Generate TTS audio would look locked immediately after
-        #: a Convert that just succeeded. Consumed once, whether or not it ends up matching --
-        #: see _on_pair_changed.
-        self._post_convert_carry: Optional[Tuple[str, DeckAnalysis, str]] = None
+        #: (clone_notetype_name, analysis) set right after a successful Convert, so the very
+        #: next pair-change (auto-selecting that clone) can carry the just-used analysis
+        #: forward instead of resetting to "not analyzed" -- lets the AI Result panel keep
+        #: showing what Convert actually used, and the HTML editor keep its content, without a
+        #: redundant re-Analyze (Generate TTS audio itself no longer needs this carry to work,
+        #: since it can recompute audio_targets on its own -- see _recomputed_direction -- but
+        #: the panel/editor still benefit from showing the real analysis rather than nothing).
+        #: Consumed once, whether or not it ends up matching -- see _on_pair_changed.
+        self._post_convert_carry: Optional[Tuple[str, DeckAnalysis]] = None
 
         layout = QVBoxLayout(self)
 
@@ -421,10 +445,10 @@ class MainScreen(QDialog):
         # Three steps, in order: Analyze asks the AI to propose a converted deck (writes
         # nothing); Convert actually clones the notetype and writes the templates Analyze
         # proposed (or that were hand-edited afterward); Generate TTS audio fills in the
-        # audio field Convert created. Convert/Generate TTS audio stay disabled
-        # (see _update_action_state) until an analysis exists for the currently selected
-        # pair -- both need facts (front/back/css; speak_text_from) that only Analyze
-        # produces.
+        # audio field(s) Convert created. Convert stays disabled (see _update_action_state)
+        # until an analysis exists for the currently selected pair -- there's no other source
+        # for the front/back/css it writes. Generate TTS audio can unlock without one too, for
+        # a pair already known to be converted (see _generate_tts_ready).
         self.flow_hint_label = QLabel("")
         self.flow_hint_label.setWordWrap(True)
         layout.addWidget(self.flow_hint_label)
@@ -508,21 +532,22 @@ class MainScreen(QDialog):
         self._note_ids = mw.col.find_notes(scope_query(notetype_name, deck))
         sample_tags = mw.col.get_note(self._note_ids[0]).tags if self._note_ids else []
         self._conversion_state = state_from_notetype(self._notetype.get("css", ""), sample_tags)
+        self._recomputed_direction = self._recompute_direction()
 
         if (
             self._post_convert_carry is not None
             and self._post_convert_carry[0] == notetype_name
         ):
-            _clone_name, analysis, audio_field_name = self._post_convert_carry
+            _clone_name, analysis = self._post_convert_carry
             self._analysis = analysis
-            self._audio_field_name = audio_field_name
             self.html_editor.set_content(analysis.front, analysis.back, analysis.css)
             self.ai_result_panel.show_analysis(analysis)
         else:
             self._analysis = None
-            self._audio_field_name = None
             self.html_editor.set_content("", "", "")
-            self.ai_result_panel.show_not_analyzed(self._conversion_state)
+            self.ai_result_panel.show_not_analyzed(
+                self._conversion_state, can_generate_tts=self._generate_tts_ready()
+            )
         self._post_convert_carry = None
 
         self._html_mode = False
@@ -582,12 +607,38 @@ class MainScreen(QDialog):
     def _is_busy(self) -> bool:
         return self._convert_running or self._analyzing or self._tts_cancel_event is not None
 
+    def _recompute_direction(self) -> Optional[Direction]:
+        """A fast, local, non-AI call to ``llm.direction.resolve_direction`` against the live
+        notetype's own current fields -- gives ``audio_targets`` for an already-converted pair
+        without needing an analysis. ``None`` when this pair was never converted (nothing
+        recorded to resolve against) or has no notes to sample."""
+        if self._conversion_state is None or not self._note_ids or self._notetype is None:
+            return None
+        fields = collect_field_samples(mw.col, self._note_ids[:_ANALYZE_SAMPLE_NOTES])
+        tmpls = self._notetype.get("tmpls") or [{}]
+        qfmt = tmpls[0].get("qfmt", "")
+        afmt = tmpls[0].get("afmt", "")
+        return resolve_direction(fields, qfmt, afmt, known_state=self._conversion_state)
+
+    def _generate_tts_ready(self) -> bool:
+        """Whether Generate TTS audio has everything it needs (which fields to speak, and the
+        fields to write into) without requiring this session's own Analyze -- either because it
+        just ran (``self._analysis``), or because this pair is already converted and recomputing
+        direction against its live fields found at least one real field to generate audio for.
+        See module docstring."""
+        if self._analysis is not None:
+            return True
+        return self._recomputed_direction is not None and bool(
+            self._recomputed_direction.audio_targets
+        )
+
     def _update_action_state(self) -> None:
         busy = self._is_busy()
         has_analysis = self._analysis is not None
+        can_generate = self._generate_tts_ready()
         self.analyze_button.setEnabled(not busy and bool(self._note_ids))
         self.convert_button.setEnabled(has_analysis and not busy)
-        self.generate_button.setEnabled(has_analysis and not busy)
+        self.generate_button.setEnabled(can_generate and not busy)
         if busy:
             return
         if has_analysis:
@@ -596,14 +647,22 @@ class MainScreen(QDialog):
                 "Review the AI's result on the left (or edit the HTML directly), then "
                 "click Convert. Once converted, come back and click Generate TTS audio."
             )
+        elif can_generate:
+            self.generate_button.setToolTip("")
+            self.flow_hint_label.setText(
+                "This deck is already converted (%s → %s). Click Generate TTS audio to "
+                "continue adding audio -- no AI call needed. Click Analyze only if you want "
+                "to review or change the templates."
+                % (self._conversion_state.target_language, self._conversion_state.native_language)
+            )
         else:
             self.generate_button.setToolTip(
-                "Run Analyze first -- Generate TTS audio needs to know which field to speak."
+                "Run Analyze first -- Generate TTS audio needs to know which field(s) to speak."
             )
             if self._conversion_state is not None:
                 self.flow_hint_label.setText(
-                    "This deck already looks converted (%s → %s). Click Analyze to "
-                    "re-check it before Convert or Generate TTS audio."
+                    "This deck already looks converted (%s → %s), but has no real front-side "
+                    "field to generate audio from. Click Analyze to re-check it."
                     % (self._conversion_state.target_language, self._conversion_state.native_language)
                 )
             else:
@@ -633,8 +692,7 @@ class MainScreen(QDialog):
         css = self._notetype.get("css", "")
         deck_name = self._deck_name
         notetype_name = self._notetype_name
-        existing_names = [f["name"] for f in self._notetype.get("flds", [])]
-        audio_field_name = generated_field_name(taken=existing_names)
+        conversion_state = self._conversion_state
 
         self._analyzing = True
         self._html_dirty = False
@@ -663,8 +721,8 @@ class MainScreen(QDialog):
                 qfmt=qfmt,
                 afmt=afmt,
                 css=css,
-                audio_field_name=audio_field_name,
                 call_model_fn=call_fn,
+                known_state=conversion_state,
             )
 
         def on_future_done(future: Any) -> None:
@@ -672,13 +730,18 @@ class MainScreen(QDialog):
             self._analyzing = False
             exc = future.exception()
             if exc is not None:
-                self.ai_result_panel.show_not_analyzed(self._conversion_state)
+                # A failed Analyze doesn't touch _recomputed_direction -- if Generate TTS audio
+                # was already usable without an analysis before this attempt (an
+                # already-converted deck), it still is; reflect that here too, not just in the
+                # button state _update_action_state sets right below.
+                self.ai_result_panel.show_not_analyzed(
+                    self._conversion_state, can_generate_tts=self._generate_tts_ready()
+                )
                 self._update_action_state()
                 showWarning("Analysis failed: %r" % (exc,), parent=self)
                 return
             analysis: DeckAnalysis = result_holder["analysis"]
             self._analysis = analysis
-            self._audio_field_name = audio_field_name
             self.html_editor.set_content(analysis.front, analysis.back, analysis.css)
             self.ai_result_panel.show_analysis(analysis)
             self._html_mode = False
@@ -718,24 +781,60 @@ class MainScreen(QDialog):
             self.preview.clear("Click Analyze to see a preview of the converted card.")
             return
         note = mw.col.get_note(self._note_ids[0])
-        self.preview.set_content(note, self._notetype, 0, front_html=front, back_html=back, css=css)
+        preview_notetype = self._preview_notetype(front, back, css)
+        self.preview.set_content(note, preview_notetype, 0, front_html=front, back_html=back, css=css)
         self.preview.refresh()
+
+    def _preview_notetype(self, front: str, back: str, css: str) -> dict:
+        """The notetype dict to preview the current Front/Back/CSS against.
+
+        Before Convert has actually run, these templates (fresh from Analyze, or hand-edited)
+        may already reference the pending audio field(s) Convert itself will add -- see
+        ``ops.notetype_manager.shape_notetype``. Previewing straight against the live,
+        not-yet-converted notetype would then make Anki's own template compiler reject those
+        references as unknown fields ("Found '{{#ddc-audio-Word}}', but there is no field
+        called 'ddc-audio-Word'") -- a real Anki error that reads as this addon being broken,
+        when the actual answer is just "that field doesn't exist until you Convert". Shaping a
+        throwaway copy the exact same way Convert will (same fields, appended the same way)
+        keeps the preview accurate instead: each field renders as present-but-empty, so
+        ``{{#field}}...{{/field}}`` correctly shows as hidden, matching what a real,
+        not-yet-synthesized card actually looks like. Never saved to the collection.
+        """
+        if self._analysis is None:
+            return self._notetype
+        existing = {f["name"] for f in self._notetype.get("flds", [])}
+        missing = [
+            t.audio_field for t in self._analysis.audio_targets if t.audio_field not in existing
+        ]
+        if not missing:
+            return self._notetype
+        return shape_notetype(
+            self._notetype,
+            name=(self._notetype.get("name") or "") + " (preview)",
+            front=front,
+            back=back,
+            css=css,
+            template_name=(self._notetype.get("tmpls") or [{}])[0].get("name") or "Card 1",
+            extra_fields=missing,
+        )
 
     # -- voice sampling (no collection write -- QueryOp, not CollectionOp) ----------
 
     def _sample_text(self) -> str:
-        """The text a real batch run would actually speak for the currently-previewed
-        note, so "Sample" previews this deck's real content instead of a generic phrase.
-        Falls back to ``_SAMPLE_TEXT`` if there's no analysis yet, no note, or the
-        speak_text_from field is empty on this particular note."""
+        """The text a real batch run would actually speak for the currently-previewed note, so
+        "Sample" previews this deck's real content instead of a generic phrase -- the first
+        audio target whose source field actually has content on this note. Falls back to
+        ``_SAMPLE_TEXT`` if there's no analysis yet, no note, or every target field is empty on
+        this particular note."""
         if self._note_ids and self._analysis is not None:
             note = mw.col.get_note(self._note_ids[0])
-            try:
-                text = note[self._analysis.speak_text_from]
-            except (KeyError, IndexError, ValueError):
-                text = ""
-            if text.strip():
-                return text
+            for target in self._analysis.audio_targets:
+                try:
+                    text = note[target.source_field]
+                except (KeyError, IndexError, ValueError):
+                    continue
+                if text.strip():
+                    return text
         return _SAMPLE_TEXT
 
     def _on_sample_voice(self) -> None:
@@ -785,7 +884,6 @@ class MainScreen(QDialog):
 
         target_language = self._analysis.target_language
         native_language = self._analysis.native_language
-        audio_field_name = self._audio_field_name or GENERATED_AUDIO_FIELD
 
         config = addon_config()
         mode = self.mode_box.currentData()
@@ -804,7 +902,7 @@ class MainScreen(QDialog):
             dry_run=False,
         )
         plan.strip_tags = list(config.get("strip_tags", ["leech"]))
-        plan.new_fields = [audio_field_name]
+        plan.new_fields = [t.audio_field for t in self._analysis.audio_targets]
         plan.note_ids = list(mw.col.find_notes(plan.scope_query))
 
         validation = plan.validate()
@@ -816,7 +914,6 @@ class MainScreen(QDialog):
         self._update_action_state()
 
         carried_analysis = self._analysis
-        carried_audio_field = audio_field_name
 
         def done(result: Any) -> None:
             self._convert_running = False
@@ -835,9 +932,7 @@ class MainScreen(QDialog):
                 else source_deck_at_start
             )
             if carried_analysis is not None:
-                self._post_convert_carry = (
-                    result.clone_notetype_name, carried_analysis, carried_audio_field
-                )
+                self._post_convert_carry = (result.clone_notetype_name, carried_analysis)
             self._refresh_pairs()
             # _select_pair (via _on_pair_changed) already calls _update_action_state, and
             # the notetype it now points at is the freshly-converted clone -- Generate TTS
@@ -857,22 +952,37 @@ class MainScreen(QDialog):
     # -- generate TTS audio -------------------------------------------------------------
 
     def _on_generate_tts(self) -> None:
-        if self._notetype is None or self._analysis is None:
+        if self._notetype is None:
+            showWarning("No notetype selected.", parent=self)
+            return
+        if self._analysis is not None:
+            # This session's own analysis, either just run or carried forward from a Convert
+            # that just happened (_post_convert_carry) -- always the freshest answer.
+            audio_targets = self._analysis.audio_targets
+        elif self._recomputed_direction is not None:
+            # No analysis this session, but this pair is already converted -- recomputing
+            # direction against its live fields is enough, no AI call needed. See module
+            # docstring / _generate_tts_ready.
+            audio_targets = self._recomputed_direction.audio_targets
+        else:
+            audio_targets = ()
+
+        if not audio_targets:
             showWarning(
                 "Run Analyze on this notetype first -- Generate TTS audio needs to know "
-                "which field to speak.",
+                "which field(s) to speak.",
                 parent=self,
             )
             return
 
-        audio_field = self._audio_field_name or GENERATED_AUDIO_FIELD
-        source_field = self._analysis.speak_text_from
         live_field_names = [f["name"] for f in self._notetype.get("flds", [])]
-        if audio_field not in live_field_names:
+        missing = [t.audio_field for t in audio_targets if t.audio_field not in live_field_names]
+        if missing:
             showWarning(
-                "This notetype has no field named %r yet.\n\nConvert the deck first -- the "
+                "This notetype has no field named %s yet.\n\nConvert the deck first -- the "
                 "conversion creates that field. Generating audio into a field the deck "
-                "already had would overwrite the original recordings." % audio_field,
+                "already had would overwrite the original recordings."
+                % ", ".join(repr(m) for m in missing),
                 parent=self,
             )
             return
@@ -903,7 +1013,8 @@ class MainScreen(QDialog):
             if not proceed:
                 return
 
-        self._run_tts_batch(self._notetype, audio_field, source_field, note_ids, voice_id, limit)
+        targets = [(t.audio_field, t.source_field) for t in audio_targets]
+        self._run_tts_batch(self._notetype, targets, note_ids, voice_id, limit)
 
     def _on_stop_clicked(self) -> None:
         if self._tts_cancel_event is not None:
@@ -917,8 +1028,7 @@ class MainScreen(QDialog):
     def _run_tts_batch(
         self,
         notetype: dict,
-        audio_field: str,
-        source_field: str,
+        targets: List[Tuple[str, str]],
         note_ids: List[int],
         voice_id: str,
         limit: int,
@@ -972,8 +1082,7 @@ class MainScreen(QDialog):
             notetype,
             note_ids,
             voice_id,
-            audio_field=audio_field,
-            source_field=source_field,
+            targets=targets,
             limit=limit,
             concurrency=concurrency,
             cancel_event=self._tts_cancel_event,

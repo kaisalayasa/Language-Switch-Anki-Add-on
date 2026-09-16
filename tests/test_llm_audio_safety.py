@@ -25,11 +25,10 @@ class TestTheCardNeverPlaysTheOldAudio(unittest.TestCase):
         # prompt.py pre-sanitized the samples it was shown.
         front = (
             '<div class="word">{{Front}}</div>\n'
-            "{{#ddc-audio}}{{ddc-audio}}{{/ddc-audio}}\n"
             '{{#Front}}<hr id=answer>{{FrontSide}}</div>{{/Front}}'
         )
 
-        fixed = enforce_audio_safety(front, sound_fields={"Front"}, keep="ddc-audio")
+        fixed = enforce_audio_safety(front, sound_fields={"Front"})
 
         self.assertIn("{{text:Front}}", fixed)
         self.assertNotIn("{{Front}}", fixed)
@@ -39,50 +38,54 @@ class TestTheCardNeverPlaysTheOldAudio(unittest.TestCase):
         # the model outright which fields need {{text:Field}}, the model *still* wrote a bare
         # {{Front}}. This is why the backstop exists unconditionally rather than only as a
         # fallback for cases the model wasn't told about: it isn't reliable even when told.
-        front = '<div class="word">{{Front}}</div>\n{{#ddc-audio}}{{ddc-audio}}{{/ddc-audio}}'
+        front = '<div class="word">{{Front}}</div>'
 
-        fixed = enforce_audio_safety(front, sound_fields={"Front"}, keep="ddc-audio")
+        fixed = enforce_audio_safety(front, sound_fields={"Front"})
 
         self.assertIn("{{text:Front}}", fixed)
         self.assertNotIn("{{Front}}", fixed)
 
     def test_conditional_guards_are_left_alone(self):
         front = "{{#Front}}{{Front}}{{/Front}}"
-        fixed = enforce_audio_safety(front, sound_fields={"Front"}, keep="ddc-audio")
+        fixed = enforce_audio_safety(front, sound_fields={"Front"})
         self.assertIn("{{#Front}}", fixed)
         self.assertIn("{{/Front}}", fixed)
         self.assertIn("{{text:Front}}", fixed)
 
     def test_inverted_conditional_guard_is_left_alone(self):
         html = "{{^Front}}<i>no audio yet</i>{{/Front}}"
-        fixed = enforce_audio_safety(html, sound_fields={"Front"}, keep="ddc-audio")
+        fixed = enforce_audio_safety(html, sound_fields={"Front"})
         self.assertEqual(html, fixed)
 
-    def test_the_generated_audio_field_is_never_rewritten(self):
-        html = "{{#ddc-audio}}{{ddc-audio}}{{/ddc-audio}}"
-        # Even if ddc-audio somehow ended up in sound_fields, `keep` must win.
-        fixed = enforce_audio_safety(html, sound_fields={"Front", "ddc-audio"}, keep="ddc-audio")
-        self.assertIn("{{ddc-audio}}", fixed)
-        self.assertNotIn("{{text:ddc-audio}}", fixed)
+    def test_there_is_no_special_case_for_any_particular_field_name(self):
+        """An earlier version exempted the one field the conversion itself creates for new
+        audio (a ``keep`` parameter). That's gone: the model is never told a generated-audio
+        field's name any more (see analyze.py, which appends those references itself, after
+        this function has already run), so there's nothing left to exempt -- if a response
+        ever did hallucinate a reference to one, neutralizing it here is the correct, safe
+        outcome, not a false positive."""
+        html = "{{#ddc-audio-Word}}{{ddc-audio-Word}}{{/ddc-audio-Word}}"
+        fixed = enforce_audio_safety(html, sound_fields={"ddc-audio-Word"})
+        self.assertIn("{{text:ddc-audio-Word}}", fixed)
 
     def test_a_field_with_no_audio_is_untouched(self):
         html = "<div>{{Back}}</div>"
-        fixed = enforce_audio_safety(html, sound_fields={"Front"}, keep="ddc-audio")
+        fixed = enforce_audio_safety(html, sound_fields={"Front"})
         self.assertEqual(html, fixed)
 
     def test_already_text_filtered_is_idempotent(self):
         html = "<div>{{text:Front}}</div>"
-        fixed = enforce_audio_safety(html, sound_fields={"Front"}, keep="ddc-audio")
+        fixed = enforce_audio_safety(html, sound_fields={"Front"})
         self.assertEqual("<div>{{text:Front}}</div>", fixed)
 
     def test_a_different_filter_is_overridden_to_text(self):
         html = "<div>{{furigana:Front}}</div>"
-        fixed = enforce_audio_safety(html, sound_fields={"Front"}, keep="ddc-audio")
+        fixed = enforce_audio_safety(html, sound_fields={"Front"})
         self.assertEqual("<div>{{text:Front}}</div>", fixed)
 
     def test_applies_equally_to_the_back_template(self):
         back = "{{FrontSide}}<hr id=answer>{{Front}}"
-        fixed = enforce_audio_safety(back, sound_fields={"Front"}, keep="ddc-audio")
+        fixed = enforce_audio_safety(back, sound_fields={"Front"})
         self.assertIn("{{text:Front}}", fixed)
 
 
@@ -94,13 +97,13 @@ class TestFrontFieldNameNeverCollidesWithFrontSide(unittest.TestCase):
 
     def test_frontside_keyword_is_never_matched_as_the_front_field(self):
         html = "{{FrontSide}}<hr id=answer>{{Front}}"
-        fixed = enforce_audio_safety(html, sound_fields={"Front"}, keep="ddc-audio")
+        fixed = enforce_audio_safety(html, sound_fields={"Front"})
         self.assertIn("{{FrontSide}}", fixed)
         self.assertIn("{{text:Front}}", fixed)
 
     def test_a_field_name_that_is_a_prefix_of_another_field_is_not_confused(self):
         html = "{{Term}}{{TermExtended}}"
-        fixed = enforce_audio_safety(html, sound_fields={"Term"}, keep="ddc-audio")
+        fixed = enforce_audio_safety(html, sound_fields={"Term"})
         self.assertEqual("{{text:Term}}{{TermExtended}}", fixed)
 
 
