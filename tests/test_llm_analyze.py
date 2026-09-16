@@ -14,7 +14,7 @@ from __future__ import annotations
 import unittest
 
 from addon.core.deck_state import ConversionState
-from addon.llm.analyze import DeckAnalysis, MAX_ATTEMPTS, analyze_deck
+from addon.llm.analyze import DeckAnalysis, MAX_ATTEMPTS, analyze_deck, strip_pending_audio_html
 from addon.llm.direction import AudioTarget
 from addon.llm.prompt import ANALYSIS_MARKER, BACK_MARKER, CSS_MARKER, FRONT_MARKER, FieldSample
 
@@ -106,6 +106,37 @@ class TestAudioTargetsAreComputedAndAppended(unittest.TestCase):
         part was never in question regardless of what the model got wrong."""
         result, _ = _analyze([_BAD_RESPONSE, _BAD_RESPONSE, _BAD_RESPONSE])
         self.assertIn("{{#ddc-audio-Word}}{{ddc-audio-Word}}{{/ddc-audio-Word}}", result.front)
+
+
+class TestStripPendingAudioHtml(unittest.TestCase):
+    """The inverse of _append_audio_html -- for previewing a Front before Convert has created
+    the audio field(s) it references. See ui/main_screen.py's _preview_front."""
+
+    def test_removes_the_exact_block_append_audio_html_would_add(self):
+        front = "<div>{{Word}}</div>\n{{#ddc-audio-Word}}{{ddc-audio-Word}}{{/ddc-audio-Word}}"
+        self.assertEqual(
+            strip_pending_audio_html(front, ["ddc-audio-Word"]), "<div>{{Word}}</div>\n"
+        )
+
+    def test_removes_only_the_named_pending_fields_not_every_audio_block(self):
+        """A field already on the live notetype (e.g. re-previewing an already-converted pair)
+        is not passed in -- its block must survive untouched."""
+        front = (
+            "<div>{{Word}}</div>"
+            "{{#ddc-audio-Word}}{{ddc-audio-Word}}{{/ddc-audio-Word}}"
+            "{{#ddc-audio-Sentence}}{{ddc-audio-Sentence}}{{/ddc-audio-Sentence}}"
+        )
+        result = strip_pending_audio_html(front, ["ddc-audio-Word"])
+        self.assertNotIn("ddc-audio-Word", result)
+        self.assertIn("{{#ddc-audio-Sentence}}{{ddc-audio-Sentence}}{{/ddc-audio-Sentence}}", result)
+
+    def test_no_pending_fields_is_a_no_op(self):
+        front = "<div>{{Word}}</div>"
+        self.assertEqual(strip_pending_audio_html(front, []), front)
+
+    def test_a_field_not_present_in_front_at_all_is_a_no_op(self):
+        front = "<div>{{Word}}</div>"
+        self.assertEqual(strip_pending_audio_html(front, ["ddc-audio-Word"]), front)
 
 
 class TestKnownStateIsThreadedThrough(unittest.TestCase):
