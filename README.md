@@ -8,15 +8,14 @@ newly-fronted language using [Piper](https://github.com/rhasspy/piper), locally 
 Both models run entirely on-device — nothing about a deck's content, or how it gets converted,
 is ever sent anywhere.
 
-**Status:** the core pipeline — Analyze, Convert (both modes), Generate TTS audio, and
-reopening an already-converted deck to generate more audio without a fresh AI call — is built,
-covered by 289 unit tests (`python -m unittest discover -s tests -t .`, no Anki or network
-required), and confirmed working end-to-end against a real Anki profile. Three known items are
-still open, tracked in [`TODO.md`](TODO.md): a live-preview template error that shows right
-after Analyze and before Convert (cosmetic — Convert and Generate TTS audio both work correctly
-regardless); a placement-compliance check `llm/validate.py` doesn't yet make (one specific test
-deck is occasionally flaky on direction); and this documentation pass. License (MIT vs. GPL) is
-still an open, deliberately deferred decision — see Milestones below.
+**Status:** the core pipeline — Analyze, Convert (both modes), Generate TTS audio, live preview
+(including right after Analyze and before Convert), reopening an already-converted deck to
+generate more audio without a fresh AI call, and hiding/showing individual fields without
+touching HTML — is built, covered by 316 unit tests (`python -m unittest discover -s tests -t .`,
+no Anki or network required), and confirmed working end-to-end against a real Anki profile. One
+known item is still open, tracked in [`TODO.md`](TODO.md): a placement-compliance check
+`llm/validate.py` doesn't yet make (one specific test deck is occasionally flaky on direction).
+License (MIT vs. GPL) is still an open, deliberately deferred decision — see Milestones below.
 
 ## Why a local LLM instead of a hand-written mapping system
 
@@ -140,12 +139,24 @@ exactly as originally planned.)
    card Analyze just produced. The left-hand pane defaults to a read-only summary of the analysis;
    toggling "HTML" swaps it for a raw Front/Back/Styling text editor pre-filled with the same
    content — whatever that editor holds is exactly what Convert uses, whether it came straight
-   from Analyze or was hand-edited afterward.
-   **Known bug, not yet fixed:** the preview can show Anki's own template error
-   (`Found '{{#ddc-audio-<Field>}}', but there is no field called ...`) instead of the card, right
-   after Analyze and before Convert — because the AI's Front HTML already references a
-   generated-audio field that doesn't exist on the live notetype until Convert actually creates
-   it. Convert and Generate TTS audio are unaffected. See `TODO.md`.
+   from Analyze, hand-edited, or changed via "Hide fields" below.
+   **Only fields the original card actually showed are placed at all:** a field never referenced
+   anywhere in the *original* `qfmt`/`afmt` (a deck's own bookkeeping/index columns — Core 2000's
+   `Core-Index`, `Optimized-Voc-Index`, etc., confirmed against the real deck export never being
+   referenced in its own template) is excluded from placement entirely by `llm/direction.py`, the
+   same way a not-yet-existing generated-audio field already was — and never shown to the model at
+   all (`llm/analyze.py` filters the prompt down to exactly what got placed). Fixing this stopped a
+   real, observed bug where every one of a deck's hidden bookkeeping fields was rendering on the
+   converted card's back, something the original card never did.
+   **Hide fields** — a third left-pane mode, next to "HTML", for turning an already-placed field's
+   display on or off without touching HTML at all: a checkbox list of exactly the fields currently
+   referenced on the Front/Back (`llm/field_visibility.py`'s `visible_fields`), split by side.
+   Unchecking one wraps its `{{Field}}` reference in a small, reversible `<span class="ddc-hidden">`
+   (paired with one `display: none` CSS rule, the same technique the real Core 2000 CSS already
+   uses for its own `.ios-only`/`.mac-only` toggles) — the field's data and its surrounding markup
+   are untouched, only whether it renders changes, and re-checking the box restores the exact
+   original HTML. A field the deck never showed in the first place (per the paragraph above) isn't
+   listed — there's nothing to toggle for a field that was never part of the card.
 4. **Convert** — writes the reviewed templates via a clone-notetype flow (`ops/notetype_manager`,
    `ops/convert_op`) in the chosen mode, always resetting scheduling, and records the conversion
    (`core/deck_state`) so this pair is recognised as converted from now on.

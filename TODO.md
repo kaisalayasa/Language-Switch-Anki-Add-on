@@ -3,7 +3,7 @@
 Known open items, not yet worked. See `docs/llm-notes.md` and the LLM overhaul commit history
 for full background on the pipeline these refer to.
 
-## Preview error right after Analyze, before Convert — fixed, pending real-Anki confirmation
+## Preview error right after Analyze, before Convert — fixed, confirmed in real Anki
 
 Repro was: pick a deck, click Analyze, look at the preview pane (before ever clicking Convert).
 Anki's own template error showed instead of the card:
@@ -37,7 +37,64 @@ each not-yet-existing audio field's block from the Front HTML handed to `Preview
 notetype directly — no throwaway notetype shaping, no collection interaction at all, matching
 the project's existing "preview writes nothing" invariant. Covered by
 `tests/test_llm_analyze.py::TestStripPendingAudioHtml`; the full 293-test pure suite passes.
-**Not yet re-tested in real Anki** — do that before considering this fully closed.
+**Confirmed fixed in real Anki testing.**
+
+## Original deck's own audio is still audible on the converted card
+
+Found in real Anki testing (2026-09-17), not yet diagnosed -- needs a real repro (which mode,
+which field, before or after Generate TTS audio has run) before attempting a fix, per
+`claude.md`'s own "don't guess twice" rule.
+
+Not yet confirmed which of these it is, in rough order of likelihood:
+
+- **Sample-based false negative in `sound_field_names`.** `llm/analyze.py` decides which fields
+  need `{{text:Field}}` forcing (`llm/audio_safety.py`'s `enforce_audio_safety`) from
+  `sound_field_names(fields)`, which only looks at the handful of real notes sampled for the
+  prompt (`ops/deck_data.collect_field_samples`, `_ANALYZE_SAMPLE_NOTES = 6` in
+  `ui/main_screen.py`). A field that carries audio on most notes but happens to be empty on
+  all of the sampled ones would never get flagged, and the model would then be free to bare-
+  reference it -- correct on the sampled notes, silently wrong on every other one. Low
+  likelihood specifically for Core 2000 (its audio fields are populated on nearly every note,
+  so a sampling miss is unlikely there), but the mechanism itself is a real gap regardless of
+  how likely it is to trigger.
+- **Flip-in-place field-mapping risk, already flagged as unconfirmed in `docs/api-notes.md`**
+  ("Adding fields to the clone" section): the appended generated-audio field is assumed to
+  land at the correct (empty) position in Anki's prefilled change-notetype field map "by
+  construction," but this has never actually been exercised against a real Flip-in-place
+  conversion with an added field -- if the map is wrong, a new audio field could start out
+  holding a *different* field's old content instead of being empty, which would explain
+  "original audio still plays" without `enforce_audio_safety` being wrong at all. Only
+  possible if this was tested in Flip-in-place mode, not New-deck mode -- worth checking first,
+  since it narrows this down immediately.
+- Something not yet considered -- get an exact repro (mode, deck, which audio is heard: the
+  original field's own audio, or a generated field playing the wrong note's audio) before
+  picking one of the above over the other.
+
+## Hiding an audio-bearing field silences its play button, not the actual audio
+
+Found in real Anki testing (2026-09-17), alongside the bug above. Root cause is understood, not
+just theorized: `llm/field_visibility.py`'s hide mechanism wraps a field's reference in
+`<span class="ddc-hidden">{{Field}}</span>` and hides it with CSS `display: none` -- but Anki
+extracts which `[sound:...]` tags to autoplay by scanning the *rendered text* of the card
+(`anki/template.py`: `self.col()._backend.extract_av_tags(text=qtext, ...)`, confirmed against
+real `anki==26.8.1` source during the preview-bug investigation above), entirely independent of
+CSS or DOM visibility. `{{Field}}` still substitutes in the field's real value -- `[sound:...]`
+tag included -- before that scan ever happens; CSS only hides the *play-button icon* the
+webview renders for it afterward, in the browser. This is exactly why the button disappears but
+the sound keeps playing -- CSS hiding is real, sufficient, and correct for a text field
+(nothing about a plain string is affected by whether it's autoplay-scanned), but it is the
+wrong mechanism for a field carrying `[sound:...]`, where visual hiding and audio silencing are
+two different things.
+
+**Likely fix direction, not yet implemented or verified:** hiding a field already known to
+carry audio (`llm/audio_safety.sound_field_names`, the same detection `enforce_audio_safety`
+already uses) should route through `{{text:Field}}` instead of, or in addition to, the
+`ddc-hidden` span -- `{{text:...}}` genuinely strips a `[sound:...]` reference out of the
+*rendered text itself*, before `extract_av_tags` ever runs, which is what actually stops
+autoplay rather than just hiding a button for it. Needs deciding whether "hide" on an audio
+field should mean text-strip (silent, but an empty box may still render depending on
+surrounding HTML) or something else -- worth discussing before implementing, not just picking
+one.
 
 ## Extend `validate.py` to check placement compliance
 
