@@ -118,10 +118,19 @@ def analyze_deck(
     audio_fields = sound_field_names(fields)
     known_field_names = [f.name for f in fields]
 
+    # Only fields resolve_direction actually placed somewhere -- never a field it excluded
+    # (a not-yet-existing generated-audio field, or one that isn't shown anywhere on the
+    # *original* card, e.g. a deck's own bookkeeping/index fields; see direction.py). The
+    # model has no way to reference an excluded field's name if it's never shown its content
+    # at all, closing what would otherwise be a real gap: validate.py only checks a reference
+    # against the given FRONT/BACK lists, so a field in neither would go unchecked.
+    placed = set(direction.new_front_fields) | set(direction.new_back_fields)
+    visible_fields = tuple(f for f in fields if f.name in placed)
+
     prompt_input = PromptInput(
         deck_name=deck_name,
         notetype_name=notetype_name,
-        fields=tuple(fields),
+        fields=visible_fields,
         new_front_fields=direction.new_front_fields,
         new_back_fields=direction.new_back_fields,
         current_css=css,
