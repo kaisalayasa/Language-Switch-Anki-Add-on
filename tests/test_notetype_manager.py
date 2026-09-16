@@ -11,7 +11,6 @@ import unittest
 
 from addon.core.audio_fields import AUDIO_DONE_TAG
 from addon.core.conversion import ConversionMode, build_plan
-from addon.core.role_schema import FieldBinding, Role, RoleMapping
 from addon.ops.notetype_manager import ApiMismatch, apply_plan
 
 from tests.fake_collection import FakeCollection
@@ -34,21 +33,14 @@ def make_collection():
     return col, src, deck
 
 
-def make_mapping():
-    fields = [FieldBinding(n, i) for i, n in enumerate(FIELDS)]
-    fields[3] = FieldBinding("Bookkeeping", 3, hidden=True)
-    mapping = RoleMapping(notetype_name="Starter", fields=fields,
-                          target_language="xx", native_language="yy")
-    mapping.bind(Role.TARGET_TERM, fields[0])
-    mapping.bind(Role.NATIVE_TERM, fields[1])
-    mapping.bind(Role.TARGET_AUDIO, fields[2])
-    return mapping
-
-
 def make_plan(col, mode, **kw):
+    kw.setdefault("front", "{{Word}}")
+    kw.setdefault("back", "{{FrontSide}}{{Meaning}}")
+    kw.setdefault("css", ".card { color: White; }")
+    kw.setdefault("target_language", "xx")
+    kw.setdefault("native_language", "yy")
     plan = build_plan(
         mode=mode,
-        mapping=make_mapping(),
         source_notetype="Starter",
         source_deck="Starter",
         suffix="Flipped",
@@ -375,6 +367,37 @@ class TestStaleDoneTagIsNeverCarriedOntoADuplicate(unittest.TestCase):
         self.assertTrue(
             any("keepme" in n.tags for n in copies), "unrelated tags must still carry over"
         )
+
+
+class TestConversionTagIsWritten(unittest.TestCase):
+    """core.deck_state's note-tag mark, written at conversion time so reopening the deck
+    later reads direction back instead of re-deriving it from template structure."""
+
+    def test_new_deck_mode_tags_every_duplicated_note(self):
+        col, _src, _deck = make_collection()
+        plan = make_plan(col, ConversionMode.NEW_DECK, target_language="es", native_language="en")
+        result = run(col, plan)
+        clone_notes = [n for n in col.notes.values() if n.mid == result.clone_notetype_id]
+        self.assertEqual(len(clone_notes), 5)
+        for note in clone_notes:
+            self.assertIn("ddc-converted::es::en", note.tags)
+
+    def test_flip_in_place_mode_tags_every_moved_note(self):
+        col, _src, _deck = make_collection()
+        plan = make_plan(
+            col, ConversionMode.FLIP_IN_PLACE, target_language="ja", native_language="en"
+        )
+        run(col, plan)
+        for nid in plan.note_ids:
+            self.assertIn("ddc-converted::ja::en", col.notes[nid].tags)
+
+    def test_dry_run_tags_nothing(self):
+        col, _src, _deck = make_collection()
+        plan = make_plan(col, ConversionMode.NEW_DECK)
+        plan.dry_run = True
+        run(col, plan)
+        for note in col.notes.values():
+            self.assertFalse(any(t.startswith("ddc-converted::") for t in note.tags))
 
 
 if __name__ == "__main__":

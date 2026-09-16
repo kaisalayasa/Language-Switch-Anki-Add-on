@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ..core.audio_fields import AUDIO_DONE_TAG
 from ..core.conversion import ConversionMode, ConversionPlan
+from ..core.deck_state import conversion_tag
 
 __all__ = ["ConversionResult", "ApiMismatch", "apply_plan", "probe_api", "shape_notetype"]
 
@@ -331,6 +332,22 @@ def _flip_in_place(col: Any, plan: ConversionPlan, clone: Dict[str, Any]) -> int
     return len(plan.note_ids)
 
 
+def _tag_converted_notes(col: Any, note_ids: Sequence[int], tag: str) -> None:
+    """Add ``tag`` to every note in ``note_ids``, for the record ``core.deck_state`` reads
+    back on reopen.
+
+    Only needed by Flip-in-place: the notes already existed before this conversion, and
+    ``change_notetype_of_notes`` (a bulk schema-level repoint) does not touch tags. New-deck
+    mode instead adds the tag inline while building each duplicated note in
+    :func:`_new_deck`, since that note is already being written anyway.
+    """
+    for nid in note_ids:
+        note = col.get_note(nid)
+        if tag not in note.tags:
+            note.tags.append(tag)
+            col.update_note(note)
+
+
 def _copy_fields_by_name(source_note: Any, target_note: Any, field_names: Sequence[str]) -> None:
     """Fill ``target_note``'s fields from ``source_note``, matching by name.
 
@@ -364,12 +381,14 @@ def _new_deck(col: Any, plan: ConversionPlan, clone: Dict[str, Any]) -> int:
     # copied across.
     strip.add(AUDIO_DONE_TAG.lower())
 
+    tag = conversion_tag(plan.target_language, plan.native_language)
     created = 0
     for nid in plan.note_ids:
         source_note = col.get_note(nid)
         new_note = col.new_note(clone)
         _copy_fields_by_name(source_note, new_note, clone_fields)
         new_note.tags = [t for t in source_note.tags if t.lower() not in strip]
+        new_note.tags.append(tag)
         col.add_note(new_note, deck_id)
         created += 1
     return created
@@ -479,6 +498,13 @@ def apply_plan(
     if plan.mode is ConversionMode.FLIP_IN_PLACE:
         result.notes_converted = _flip_in_place(col, plan, clone)
         undo_entry = col.add_custom_undo_entry("Convert deck direction")
+        # After the marker, never before: change_notetype_of_notes just above is a schema
+        # change, and Anki invalidates any custom undo marker set before one (see this
+        # function's own docstring). Tagging is plain per-note writes, so it groups cleanly
+        # into the same undo step as long as it happens after the marker.
+        _tag_converted_notes(
+            col, plan.note_ids, conversion_tag(plan.target_language, plan.native_language)
+        )
     else:
         undo_entry = col.add_custom_undo_entry("Convert deck direction")
         result.notes_converted = _new_deck(col, plan, clone)

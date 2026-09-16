@@ -14,6 +14,14 @@ Two modes, per ``claude.md``:
     in a brand-new deck. The original deck, notetype and notes are untouched.
 
 Scheduling is reset in both modes, unconditionally.
+
+A plan carries plain ``front``/``back``/``css`` strings rather than a role mapping -- the LLM
+overhaul's model produces finished template HTML directly (see ``addon/llm/analyze.py``'s
+``DeckAnalysis``), so there is no mapping left for this module to validate or apply. This module
+deliberately does not import anything from ``addon/llm/`` -- that package already depends on
+``addon/core/`` (``direction.py`` uses ``core.language_detect``), and a dependency back the other
+way would make a cycle. The caller (``ui/main_screen.py``) unpacks a ``DeckAnalysis`` into
+:func:`build_plan`'s plain arguments instead.
 """
 
 from __future__ import annotations
@@ -22,16 +30,34 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional
 
-from .role_schema import RoleMapping, ValidationResult
-
 __all__ = [
     "ConversionMode",
     "ConversionPlan",
     "PreflightSummary",
+    "ValidationError",
+    "ValidationResult",
     "build_plan",
     "escape_search_term",
     "scope_query",
 ]
+
+
+class ValidationError(Exception):
+    """Raised when a plan cannot safely be applied."""
+
+
+@dataclass
+class ValidationResult:
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+    def raise_if_failed(self) -> None:
+        if self.errors:
+            raise ValidationError("; ".join(self.errors))
 
 
 class ConversionMode(Enum):
@@ -139,18 +165,26 @@ class PreflightSummary:
 @dataclass
 class ConversionPlan:
     mode: ConversionMode
-    mapping: RoleMapping
+    front: str
+    back: str
+    css: str
+    #: The two languages this conversion records -- written into the notetype's css and onto
+    #: every note's tags by ``core.deck_state``, so reopening the deck later reads the
+    #: direction back rather than re-deriving it. See ``core/deck_state.py``.
+    target_language: str
+    native_language: str
     source_notetype: str
     source_deck: str
     clone_notetype: str
     target_deck: str
+    template_name: str = "Production"
     note_ids: List[int] = field(default_factory=list)
     strip_tags: List[str] = field(default_factory=lambda: ["leech"])
     reset_scheduling: bool = True
     media_cleanup: bool = False
     dry_run: bool = False
     #: Field names to add to the clone that the source notetype does not have -- in practice
-    #: the audio fields generated TTS is written into, per ``core.audio_fields``. Appended
+    #: the audio field generated TTS is written into, per ``core.audio_fields``. Appended
     #: after the source's own fields, never inserted among them, and always empty to begin
     #: with. Empty is the point: the demoted language's audio is left in its original field
     #: and hidden rather than overwritten, so a card can never play the wrong language while
@@ -162,8 +196,12 @@ class ConversionPlan:
         return scope_query(self.source_notetype, self.source_deck)
 
     def validate(self) -> ValidationResult:
-        result = self.mapping.validate()
+        result = ValidationResult()
 
+        if not self.front.strip():
+            result.errors.append("the front template is empty")
+        if not self.back.strip():
+            result.errors.append("the back template is empty")
         if not self.clone_notetype.strip():
             result.errors.append("the new notetype needs a name")
         if self.clone_notetype == self.source_notetype:
@@ -211,12 +249,17 @@ class ConversionPlan:
 def build_plan(
     *,
     mode: ConversionMode,
-    mapping: RoleMapping,
+    front: str,
+    back: str,
+    css: str,
+    target_language: str,
+    native_language: str,
     source_notetype: str,
     source_deck: str,
     note_ids: Optional[List[int]] = None,
     clone_notetype: Optional[str] = None,
     target_deck: Optional[str] = None,
+    template_name: str = "Production",
     suffix: str = "English Front",
     dry_run: bool = False,
 ) -> ConversionPlan:
@@ -231,11 +274,16 @@ def build_plan(
         deck = target_deck or source_deck
     return ConversionPlan(
         mode=mode,
-        mapping=mapping,
+        front=front,
+        back=back,
+        css=css,
+        target_language=target_language,
+        native_language=native_language,
         source_notetype=source_notetype,
         source_deck=source_deck,
         clone_notetype=clone,
         target_deck=deck,
+        template_name=template_name,
         note_ids=list(note_ids or []),
         dry_run=dry_run,
     )

@@ -26,15 +26,13 @@ from __future__ import annotations
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ..core.role_schema import RoleMapping
 from ..tts.piper_provider import EmptyTextError, PiperProvider
 from .tts_batch import (
     apply_note_audio,
-    finish_audio_batch,
     generate_note_audio,
     notes_needing_audio,
     plan_note_audio,
@@ -99,20 +97,25 @@ def _synth_one(
 def run_tts_batch(
     parent: Any,
     notetype: Dict[str, Any],
-    mapping: RoleMapping,
     note_ids: List[int],
     voice_id: str,
-    config: dict,
     *,
-    template_options_from_config: Callable[[dict], Any],
+    audio_field: str,
+    source_field: str,
     limit: int = 0,
     concurrency: int = 1,
     cancel_event: Optional[threading.Event] = None,
     on_done: Optional[Callable[[BatchOutcome], None]] = None,
 ) -> None:
     """Processes ``note_ids`` (already the "needs audio" set -- see ``notes_needing_audio``)
-    through Piper, then flips the notetype's template on. Must be called from the Qt main
-    thread; ``on_done`` (if given) is called back on the main thread when finished.
+    through Piper, synthesizing ``source_field``'s text into ``audio_field`` for each. Must be
+    called from the Qt main thread; ``on_done`` (if given) is called back on the main thread
+    when finished.
+
+    Unlike the old role-mapping design, there is no template flip at the end of a run: the
+    model already wrote a bare reference to ``audio_field`` into the front template at
+    conversion time (it starts empty, so it renders as nothing until this fills it in), so
+    there is nothing left to turn on once synthesis finishes.
 
     ``limit`` caps how many of ``note_ids`` this run touches -- 0 means no cap, processing
     everything passed in. The rest are simply left untagged, exactly as if the run had been
@@ -154,7 +157,9 @@ def run_tts_batch(
                 outcome.cancelled = True
                 break
             note = col.get_note(nid)
-            result = generate_note_audio(col, note, mapping, provider, voice_id)
+            result = generate_note_audio(
+                col, note, provider, voice_id, audio_field=audio_field, source_field=source_field
+            )
             if not result.ok:
                 outcome.failed += 1
             elif result.changed:
@@ -171,7 +176,9 @@ def run_tts_batch(
             if cancel_requested():
                 outcome.cancelled = True
                 return
-            plans[nid] = plan_note_audio(col.get_note(nid), mapping)
+            plans[nid] = plan_note_audio(
+                col.get_note(nid), audio_field=audio_field, source_field=source_field
+            )
 
         done_count = 0
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -206,19 +213,6 @@ def run_tts_batch(
                 run_concurrent(col)
             else:
                 run_sequential(col)
-
-        # Safe to run unconditionally, including after a partial or cancelled run, because
-        # the field this turns on is one the conversion *created* and left empty (see
-        # core.audio_fields). Notes this run never reached simply render no audio until
-        # their turn comes. That was emphatically not true under the previous design, where
-        # the target audio field was an existing one still holding the demoted language's
-        # audio -- there, flipping the template early made every unprocessed note start
-        # playing exactly the audio the conversion was meant to retire. The hazard is gone
-        # at its source rather than worked around with a "did everything finish?" gate.
-        options = replace(template_options_from_config(config), include_audio=True)
-        finish_audio_batch(
-            col, notetype, mapping, source_css=notetype.get("css", ""), options=options
-        )
         outcome.remaining = len(notes_needing_audio(col, notetype["name"], force=False))
 
     def on_future_done(future: Any) -> None:
