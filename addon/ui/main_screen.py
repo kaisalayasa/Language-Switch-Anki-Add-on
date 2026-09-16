@@ -64,14 +64,13 @@ from aqt.utils import askUser, showInfo, showWarning
 
 from ..core.conversion import ConversionMode, build_plan, scope_query
 from ..core.deck_state import ConversionState, state_from_notetype
-from ..llm.analyze import DeckAnalysis, analyze_deck
+from ..llm.analyze import DeckAnalysis, analyze_deck, strip_pending_audio_html
 from ..llm.client import call_model
 from ..llm.direction import Direction, resolve_direction
 from ..llm.model_manager import ensure_model, model_is_cached
 from ..llm.runtime import ensure_llama_runtime, runtime_is_cached
 from ..ops.convert_op import convert_op
 from ..ops.deck_data import addon_config, collect_field_samples, decks_with_notetypes
-from ..ops.notetype_manager import shape_notetype
 from ..ops.tts_batch import notes_needing_audio
 from ..ops.tts_runner import BatchOutcome, default_concurrency, run_tts_batch
 from ..tts.piper_provider import PiperProvider
@@ -525,6 +524,23 @@ class MainScreen(QDialog):
                 self.pair_box.setCurrentIndex(i)
                 return
 
+    def _live_template_content(self) -> Tuple[str, str, str]:
+        """The live notetype's own current (Front, Back, CSS) -- for a pair already known
+        converted (``self._conversion_state`` is set) where no fresh or carried-forward
+        analysis exists this session.
+
+        Without this, reopening an already-converted deck left the HTML editor -- and
+        therefore the preview -- blank ("Click Analyze to see a preview"), even though the
+        card already exists and renders fine: the live notetype's templates ARE the converted
+        card, real audio field(s) included, so there's nothing to compute or ask the AI for.
+        Forcing a re-Analyze (a real AI call) just to look at or add more audio to a card that
+        already exists would defeat the entire point of ``_generate_tts_ready`` recomputing
+        direction locally for exactly this case -- this extends that same "read it from the
+        live notetype, no AI needed" principle to what's actually shown on screen.
+        """
+        tmpls = self._notetype.get("tmpls") or [{}]
+        return tmpls[0].get("qfmt", ""), tmpls[0].get("afmt", ""), self._notetype.get("css", "")
+
     def _on_pair_changed(self, index: int) -> None:
         if index < 0 or index >= len(self._pairs):
             return
@@ -548,7 +564,11 @@ class MainScreen(QDialog):
             self.ai_result_panel.show_analysis(analysis)
         else:
             self._analysis = None
-            self.html_editor.set_content("", "", "")
+            if self._conversion_state is not None:
+                front, back, css = self._live_template_content()
+                self.html_editor.set_content(front, back, css)
+            else:
+                self.html_editor.set_content("", "", "")
             self.ai_result_panel.show_not_analyzed(
                 self._conversion_state, can_generate_tts=self._generate_tts_ready()
             )
@@ -625,13 +645,20 @@ class MainScreen(QDialog):
         return resolve_direction(fields, qfmt, afmt, known_state=self._conversion_state)
 
     def _generate_tts_ready(self) -> bool:
-        """Whether Generate TTS audio has everything it needs (which fields to speak, and the
-        fields to write into) without requiring this session's own Analyze -- either because it
-        just ran (``self._analysis``), or because this pair is already converted and recomputing
-        direction against its live fields found at least one real field to generate audio for.
-        See module docstring."""
-        if self._analysis is not None:
-            return True
+        """Whether Generate TTS audio can run against the *live* notetype right now.
+
+        Gated on the currently selected pair actually being converted, never on merely having
+        an analysis in hand: ``self._recomputed_direction`` (see ``_recompute_direction``) is
+        only ever non-``None`` when ``self._conversion_state`` is set, which ``_on_pair_changed``
+        derives from the live notetype's own recorded marker -- so this is ``True`` exactly
+        when the live notetype genuinely has the audio field(s) to write into. A fresh Analyze
+        result alone must NOT be enough: Convert is what actually creates those fields on the
+        live notetype (see ``TODO.md``'s preview-bug writeup for the same root cause), so
+        running Generate TTS audio before Convert would try to write into a field that doesn't
+        exist yet. Right after a real Convert this is already ``True`` again with no extra
+        step needed, because ``_on_pair_changed`` re-derives it from the freshly-converted
+        clone the screen just selected -- see ``_on_convert``'s ``_post_convert_carry`` comment.
+        """
         return self._recomputed_direction is not None and bool(
             self._recomputed_direction.audio_targets
         )
@@ -795,42 +822,34 @@ class MainScreen(QDialog):
             self.preview.clear("Click Analyze to see a preview of the converted card.")
             return
         note = mw.col.get_note(self._note_ids[0])
-        preview_notetype = self._preview_notetype(front, back, css)
-        self.preview.set_content(note, preview_notetype, 0, front_html=front, back_html=back, css=css)
+        preview_front = self._preview_front(front)
+        self.preview.set_content(note, self._notetype, 0, front_html=preview_front, back_html=back, css=css)
         self.preview.refresh()
 
-    def _preview_notetype(self, front: str, back: str, css: str) -> dict:
-        """The notetype dict to preview the current Front/Back/CSS against.
+    def _preview_front(self, front: str) -> str:
+        """``front`` with any not-yet-existing generated-audio field's block removed.
 
         Before Convert has actually run, these templates (fresh from Analyze, or hand-edited)
-        may already reference the pending audio field(s) Convert itself will add -- see
-        ``ops.notetype_manager.shape_notetype``. Previewing straight against the live,
-        not-yet-converted notetype would then make Anki's own template compiler reject those
-        references as unknown fields ("Found '{{#ddc-audio-Word}}', but there is no field
-        called 'ddc-audio-Word'") -- a real Anki error that reads as this addon being broken,
-        when the actual answer is just "that field doesn't exist until you Convert". Shaping a
-        throwaway copy the exact same way Convert will (same fields, appended the same way)
-        keeps the preview accurate instead: each field renders as present-but-empty, so
-        ``{{#field}}...{{/field}}`` correctly shows as hidden, matching what a real,
-        not-yet-synthesized card actually looks like. Never saved to the collection.
+        may already reference audio field(s) Convert itself will create -- referencing them
+        against the live, pre-conversion notetype (which ``note`` in ``_refresh_preview`` is
+        always bound to -- it's a real note) makes Anki's own template compiler reject them as
+        unknown fields ("Found '{{#ddc-audio-Word}}', but there is no field called
+        'ddc-audio-Word'"), because ``ephemeral_card(custom_note_type=...)`` does not override
+        which fields are considered to exist for that check (verified against real ``anki``
+        source; see ``docs/api-notes.md``). An earlier fix attempt shaped a throwaway notetype
+        copy with the field appended and passed that as the override instead -- plausible on
+        paper, but ineffective for exactly the reason above, since the override was never what
+        the check was validating against. Removing the block is a safe no-op either way: it's
+        wrapped in a conditional, so it's guaranteed to render as nothing regardless of whether
+        the field exists yet -- see ``llm.analyze.strip_pending_audio_html``.
         """
         if self._analysis is None:
-            return self._notetype
+            return front
         existing = {f["name"] for f in self._notetype.get("flds", [])}
-        missing = [
+        pending = [
             t.audio_field for t in self._analysis.audio_targets if t.audio_field not in existing
         ]
-        if not missing:
-            return self._notetype
-        return shape_notetype(
-            self._notetype,
-            name=(self._notetype.get("name") or "") + " (preview)",
-            front=front,
-            back=back,
-            css=css,
-            template_name=(self._notetype.get("tmpls") or [{}])[0].get("name") or "Card 1",
-            extra_fields=missing,
-        )
+        return strip_pending_audio_html(front, pending)
 
     # -- voice sampling (no collection write -- QueryOp, not CollectionOp) ----------
 

@@ -35,6 +35,7 @@ that is itself a real source of risk. Worth revisiting if it turns out to matter
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -45,7 +46,9 @@ from .prompt import FieldSample, PromptInput, build_prompt
 from .response import ParsedResponse, ResponseParseError, parse_response
 from .validate import ValidationProblem, validate_response
 
-__all__ = ["DeckAnalysis", "CallModelFn", "MAX_ATTEMPTS", "analyze_deck"]
+__all__ = [
+    "DeckAnalysis", "CallModelFn", "MAX_ATTEMPTS", "analyze_deck", "strip_pending_audio_html",
+]
 
 #: One initial attempt plus up to two retries. Matches the plan's "re-prompt once or twice"
 #: from the original design doc.
@@ -209,6 +212,31 @@ def _append_audio_html(front: str, audio_targets: Sequence[AudioTarget]) -> str:
         for t in audio_targets
     )
     return front.rstrip() + "\n" + snippets
+
+
+def strip_pending_audio_html(front: str, pending_audio_fields: Sequence[str]) -> str:
+    """The inverse of :func:`_append_audio_html`, for previewing ``front`` before Convert has
+    created the audio field(s) it references.
+
+    ``pending_audio_fields`` names generated-audio fields that don't exist on the live
+    notetype yet. Each one's whole ``{{#field}}...{{/field}}`` block is guaranteed to render as
+    nothing regardless -- the field either doesn't exist yet, or (once Convert creates it)
+    starts empty and stays that way until TTS runs -- but rendering the reference against a
+    note bound to the real, not-yet-converted notetype makes Anki's own template compiler treat
+    it as an unknown field and error out, rather than silently rendering blank (Anki's
+    ``ephemeral_card(custom_note_type=...)`` does not override which fields are considered to
+    exist for this check -- verified against the real ``anki`` package source; see
+    ``docs/api-notes.md``). Stripping the block for preview purposes only produces the exact
+    same visible result as leaving it in would if it worked, without touching what actually
+    gets saved on Convert.
+    """
+    out = front
+    for field in pending_audio_fields:
+        pattern = re.compile(
+            r"\{\{#%s\}\}.*?\{\{/%s\}\}" % (re.escape(field), re.escape(field)), re.DOTALL
+        )
+        out = pattern.sub("", out)
+    return out
 
 
 def _retry_prompt(base_user_prompt: str, problems: Sequence[ValidationProblem]) -> str:
