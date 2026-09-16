@@ -1,28 +1,37 @@
-"""The single-screen redesign: one dialog replacing the four-entry Tools submenu.
+"""The single-screen UI: pick a deck/notetype pair, click Analyze, review the AI's result
+(or hand-edit the HTML), click Convert, then Generate TTS audio.
 
-Rolled out *alongside* the existing submenu at first, not in place of it -- see the plan
-this was built from. Both entry points call into exactly the same, unmodified core/ops
-logic (``core.conversion``, ``core.template_generator``, ``ops.convert_op``,
-``ops.tts_batch``); nothing about *what* a conversion or a TTS batch does changes here,
-only how you get to it. Once this screen is verified working end to end in a real profile,
-the old submenu and its dialogs (``convert_dialog.py``, ``role_mapper.py``, ``preview.py``,
-``card_preview.py``, ``tts_batch_dialog.py``, ``piper_test_dialog.py``) are removed and
-``entrypoint.py`` drops to this one action.
+Replaces the old role-mapping flow entirely -- there is no field/role list any more, because
+there are no roles: the model (``llm.analyze.analyze_deck``) reads the deck's real content and
+produces the finished Front/Back/CSS templates directly, plus a 1-5 star trust rating computed
+from how much retrying it took (never something the model reports about itself -- see
+``llm/analyze.py``'s docstring). Direction (which language ends up where) is likewise computed
+deterministically by ``llm.direction`` inside that same call, never asked of the user up front.
 
-Layout, top to bottom: deck/mode picker; a language-detection banner with a manual
-override; a left/right split (a field/role list by default, or a raw Front/Back/Styling
-editor when "HTML" is switched on, on the left -- and, on the right, a live preview,
-``preview_panel.PreviewPanel``, an embeddable ``AnkiWebView`` that never writes to the
-collection); a voice picker with a sample button that speaks the current note's own target-
-language text; then Convert / Generate TTS audio.
+Layout, top to bottom: deck/mode picker; a left/right split (an "AI Result" read-only summary
+of the last analysis by default, or a raw Front/Back/Styling editor when "HTML" is switched on,
+on the left -- and, on the right, a live preview, ``preview_panel.PreviewPanel``, an embeddable
+``AnkiWebView`` that never writes to the collection); a voice picker with a sample button; then
+Analyze / Convert / Generate TTS audio, in that order -- each step's output feeds the next.
+
+Whether the *currently selected* pair was already converted by a previous session is read back
+via ``core.deck_state.state_from_notetype`` -- a recorded fact (a note tag and a css comment
+written at conversion time), never re-derived by inspecting the live templates the way the old
+role-mapping system did (which is exactly what broke on a deck this addon had already
+converted, reading the same templates backwards a second time). That said, this screen still
+requires a fresh Analyze once per session even for an already-converted pair, because
+``speak_text_from`` (which field to read aloud for TTS) is a per-analysis decision that
+``deck_state`` deliberately does not persist -- only "converted, and which direction" is
+recorded. Re-analyzing an already-converted notetype is cheap to reason about (the model just
+proposes the same shape again) even if it costs the same LLM call.
 """
 
 from __future__ import annotations
 
+import functools
 import threading
-from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from aqt import mw
 from aqt.operations import QueryOp
@@ -48,52 +57,36 @@ from aqt.qt import (
 from aqt.sound import av_player
 from aqt.utils import askUser, showInfo, showWarning
 
-from ..core.audio_fields import (
-    plan_generated_fields,
-    resolve_audio_fields,
-    sound_field_names,
-)
+from ..core.audio_fields import GENERATED_AUDIO_FIELD, generated_field_name
 from ..core.conversion import ConversionMode, build_plan, scope_query
-from ..core.language_detect import detect_field_language
-from ..core.role_detect import guess_role_mapping
-from ..core.role_schema import (
-    Role,
-    RoleMapping,
-    ValidationError,
-    fields_from_notetype,
-    mapping_from_assignments,
-)
-from ..core.template_generator import (
-    GeneratedTemplates,
-    generate_templates,
-    referenced_fields,
-    split_render_order,
-)
+from ..core.deck_state import ConversionState, state_from_notetype
+from ..llm.analyze import DeckAnalysis, analyze_deck
+from ..llm.client import call_model
+from ..llm.model_manager import ensure_model
+from ..llm.runtime import ensure_llama_runtime
 from ..ops.convert_op import convert_op
+from ..ops.deck_data import addon_config, collect_field_samples, decks_with_notetypes
 from ..ops.tts_batch import notes_needing_audio
 from ..ops.tts_runner import BatchOutcome, default_concurrency, run_tts_batch
 from ..tts.piper_provider import PiperProvider
 from ..tts.piper_voice_manager import CURATED_VOICES
-from .convert_dialog import (
-    _collect_raw_samples,
-    _collect_samples,
-    _decks_with_notetypes,
-    addon_config,
-    template_options_from_config,
-)
-from .field_list import FieldListWidget
 from .preview_panel import PreviewPanel
 
 __all__ = ["MainScreen", "show_main_screen"]
 
-#: Fallback only -- used before a deck/notetype is picked, or if the current note has no
-#: usable target-language text yet. Once a note is available, the sample button speaks
-#: *that note's* own text instead (see ``MainScreen._sample_text``).
+#: Fallback only -- used before a deck/notetype is picked, or before an analysis exists.
+#: Once an analysis is available, the sample button speaks *that note's* own
+#: ``speak_text_from`` field instead (see ``MainScreen._sample_text``).
 _SAMPLE_TEXT = "This is a sample sentence for testing."
 
 _DEFAULT_VOICE_ID = "en_GB-alba-medium"
 
 _BATCH_CHUNK = 500
+
+#: Real sample notes handed to the model per analysis. Matches the cap prompt.py itself
+#: applies (``_MAX_SAMPLES_PER_FIELD = 5``) with a little headroom -- passing more would only
+#: mean reading extra notes for samples the prompt discards anyway.
+_ANALYZE_SAMPLE_NOTES = 6
 
 
 def _cache_dir() -> Path:
@@ -102,9 +95,14 @@ def _cache_dir() -> Path:
 
 class _RawHtmlEditor(QWidget):
     """Front/Back/Styling tabs over one text editor -- mirrors ``aqt.clayout.CardLayout``'s
-    own ``tform`` pattern (see ``addon/ui/preview.py``'s now-superseded
-    ``_inject_generated_templates``), rebuilt here as a plain, standalone widget since this
-    screen doesn't launch CardLayout itself."""
+    own ``tform`` pattern, rebuilt here as a plain, standalone widget since this screen
+    doesn't launch CardLayout itself.
+
+    The single source of truth for the templates a conversion will actually write: populated
+    by Analyze's result, and directly editable by hand afterward. There is no separate
+    "regenerate from a mapping" data path any more -- whatever this widget holds is what
+    Convert uses, unchanged from whichever of those two ways it got there.
+    """
 
     changed = pyqtSignal()
 
@@ -177,6 +175,96 @@ class _RawHtmlEditor(QWidget):
         self.changed.emit()
 
 
+class _AIResultPanel(QWidget):
+    """Read-only display of the model's last analysis for the currently selected pair.
+
+    Never itself editable -- the Front/Back/CSS it describes live in ``_RawHtmlEditor``,
+    which the user can hand-edit after Analyze runs. This panel only ever shows *what the AI
+    decided and how much to trust it*; the trust rating is computed by
+    ``llm.analyze.analyze_deck`` from how much retrying validation took, never something the
+    model reports about itself.
+    """
+
+    def __init__(self, parent: Any = None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        self.stars_label = QLabel("")
+        big_font = self.stars_label.font()
+        big_font.setPointSize(big_font.pointSize() + 3)
+        self.stars_label.setFont(big_font)
+        layout.addWidget(self.stars_label)
+
+        self.review_label = QLabel("")
+        self.review_label.setWordWrap(True)
+        self.review_label.setStyleSheet("color: #9a5b00;")
+        self.review_label.setVisible(False)
+        layout.addWidget(self.review_label)
+
+        self.description_label = QLabel("")
+        self.description_label.setWordWrap(True)
+        layout.addWidget(self.description_label)
+
+        self.details_label = QLabel("")
+        self.details_label.setWordWrap(True)
+        layout.addWidget(self.details_label)
+
+        layout.addStretch(1)
+
+    def show_not_analyzed(self, conversion_state: Optional[ConversionState]) -> None:
+        self.stars_label.setText("")
+        self.review_label.setVisible(False)
+        if conversion_state is not None:
+            self.description_label.setText(
+                "This notetype already looks converted: %s → %s (recorded from a "
+                "previous conversion)."
+                % (conversion_state.target_language, conversion_state.native_language)
+            )
+            self.details_label.setText(
+                "Click Analyze to re-check it -- needed once per session before Convert or "
+                "Generate TTS audio can run."
+            )
+        else:
+            self.description_label.setText("Not analyzed yet.")
+            self.details_label.setText(
+                "Click Analyze to have the AI look at this deck's real content and propose "
+                "converted Front/Back/CSS templates."
+            )
+
+    def show_analyzing(self) -> None:
+        self.stars_label.setText("")
+        self.review_label.setVisible(False)
+        self.description_label.setText("Analyzing…")
+        self.details_label.setText(
+            "This can take a few minutes, especially the first time (downloads a local AI "
+            "model, about 4.3GB, once)."
+        )
+
+    def show_analysis(self, analysis: DeckAnalysis) -> None:
+        stars = "★" * analysis.trust_stars + "☆" * (5 - analysis.trust_stars)
+        self.stars_label.setText("%s   Trust: %d/5" % (stars, analysis.trust_stars))
+        if analysis.review_message:
+            self.review_label.setText(analysis.review_message)
+            self.review_label.setVisible(True)
+        else:
+            self.review_label.setVisible(False)
+        self.description_label.setText(analysis.description)
+        self.details_label.setText(
+            "Speaks: %s\n"
+            "Target language: %s      Native language: %s\n\n"
+            "New Front: %s\n"
+            "New Back: %s"
+            % (
+                analysis.speak_text_from,
+                analysis.target_language,
+                analysis.native_language,
+                ", ".join(analysis.new_front_fields) or "(none)",
+                ", ".join(analysis.new_back_fields) or "(none)",
+            )
+        )
+
+
 class MainScreen(QDialog):
     def __init__(self, parent: Any = None):
         super().__init__(parent or mw)
@@ -193,27 +281,31 @@ class MainScreen(QDialog):
         self._deck_name = ""
         self._notetype_name = ""
         self._notetype: Optional[dict] = None
-        self._live_fields: List[Tuple[int, str]] = []
-        self._samples: Dict[str, List[str]] = {}
-        #: Names of fields whose real content holds ``[sound:...]``, refreshed per pair.
-        #: Feeds core.audio_fields so audio the deck already had is bound to a native role
-        #: (kept, but never rendered) instead of falling through to the back of the card.
-        self._sound_fields: Set[str] = set()
         self._note_ids: List[int] = []
+        #: Recorded conversion state for the *currently selected* pair, read back via
+        #: core.deck_state -- purely informational here (see module docstring for why it
+        #: doesn't by itself unlock Convert/Generate TTS audio).
+        self._conversion_state: Optional[ConversionState] = None
+        #: This session's analysis of the currently selected pair, if any. Drives both
+        #: Convert (front/back/css come from the html editor, which this populates) and
+        #: Generate TTS audio (needs speak_text_from, which only an analysis carries).
+        self._analysis: Optional[DeckAnalysis] = None
+        self._audio_field_name: Optional[str] = None
         self._html_mode = False
         self._html_dirty = False
         self._target_deck_dirty = False
         self._tts_cancel_event: Optional[threading.Event] = None
         self._convert_running = False
-        #: (clone_notetype_name, mapping) set right after a successful Convert, so the very
-        #: next pair-change (auto-selecting that clone) can carry the exact role mapping
-        #: forward rather than re-running content detection against it -- cloning preserves
-        #: field names 1:1, so the same mapping is valid on the clone, and re-detecting could
-        #: land on something else entirely (the clone's own generated CSS marker changes what
-        #: "converted" detection sees). Without this, _direction_is_correct could (wrongly)
-        #: report "not converted yet" immediately after a Convert that just succeeded.
-        #: Consumed once, whether or not it ends up matching -- see _on_pair_changed.
-        self._converted_mapping_override: Optional[Tuple[str, RoleMapping]] = None
+        self._analyzing = False
+        #: (clone_notetype_name, analysis, audio_field_name) set right after a successful
+        #: Convert, so the very next pair-change (auto-selecting that clone) can carry the
+        #: just-used analysis forward instead of resetting to "not analyzed". Needed because
+        #: Generate TTS audio requires speak_text_from, which core.deck_state deliberately
+        #: does not record (it only answers "converted, and which direction", not per-field
+        #: decisions) -- without this, Generate TTS audio would look locked immediately after
+        #: a Convert that just succeeded. Consumed once, whether or not it ends up matching --
+        #: see _on_pair_changed.
+        self._post_convert_carry: Optional[Tuple[str, DeckAnalysis, str]] = None
 
         layout = QVBoxLayout(self)
 
@@ -237,62 +329,39 @@ class MainScreen(QDialog):
         rename_row.addWidget(self.target_deck_edit, stretch=1)
         layout.addLayout(rename_row)
 
-        # -- 2. language banner -----------------------------------------------------
-        lang_row = QHBoxLayout()
-        self.detected_label = QLabel("")
-        self.detected_label.setWordWrap(True)
-        lang_row.addWidget(self.detected_label, stretch=1)
-        self.manual_check = QCheckBox("Set manually")
-        self.manual_check.stateChanged.connect(self._on_manual_toggled)
-        lang_row.addWidget(self.manual_check)
-        self.target_language = QLineEdit()
-        self.target_language.setPlaceholderText("Target (front)")
-        self.target_language.setVisible(False)
-        self.target_language.setMaximumWidth(120)
-        self.target_language.textChanged.connect(self._on_field_or_language_changed)
-        lang_row.addWidget(self.target_language)
-        self.native_language = QLineEdit()
-        self.native_language.setPlaceholderText("Native (back)")
-        self.native_language.setVisible(False)
-        self.native_language.setMaximumWidth(120)
-        self.native_language.textChanged.connect(self._on_field_or_language_changed)
-        lang_row.addWidget(self.native_language)
-        layout.addLayout(lang_row)
-
-        # -- 3. left/right split ------------------------------------------------------
+        # -- 2. left/right split ------------------------------------------------------
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        fields_pane = QWidget()
-        fields_layout = QVBoxLayout(fields_pane)
-        fields_layout.setContentsMargins(0, 0, 0, 0)
+        left_pane = QWidget()
+        left_layout = QVBoxLayout(left_pane)
+        left_layout.setContentsMargins(0, 0, 0, 0)
 
         mode_row = QHBoxLayout()
-        self.fields_button = QPushButton("Fields")
-        self.fields_button.setCheckable(True)
-        self.fields_button.setChecked(True)
+        self.ai_result_button = QPushButton("AI Result")
+        self.ai_result_button.setCheckable(True)
+        self.ai_result_button.setChecked(True)
         self.html_button = QPushButton("HTML")
         self.html_button.setCheckable(True)
         self._mode_group = QButtonGroup(self)
-        self._mode_group.addButton(self.fields_button)
+        self._mode_group.addButton(self.ai_result_button)
         self._mode_group.addButton(self.html_button)
-        self.fields_button.clicked.connect(self._on_fields_mode_clicked)
+        self.ai_result_button.clicked.connect(self._on_ai_result_mode_clicked)
         self.html_button.clicked.connect(self._on_html_mode_clicked)
-        mode_row.addWidget(self.fields_button)
+        mode_row.addWidget(self.ai_result_button)
         mode_row.addWidget(self.html_button)
         mode_row.addStretch(1)
-        fields_layout.addLayout(mode_row)
+        left_layout.addLayout(mode_row)
 
         self.stack = QStackedWidget()
-        self.field_list = FieldListWidget()
-        self.field_list.changed.connect(self._on_field_or_language_changed)
-        self.stack.addWidget(self.field_list)
+        self.ai_result_panel = _AIResultPanel()
+        self.stack.addWidget(self.ai_result_panel)
 
         self.html_editor = _RawHtmlEditor()
         self.html_editor.changed.connect(self._on_html_edited)
         self.stack.addWidget(self.html_editor)
 
-        fields_layout.addWidget(self.stack, stretch=1)
-        splitter.addWidget(fields_pane)
+        left_layout.addWidget(self.stack, stretch=1)
+        splitter.addWidget(left_pane)
 
         self.preview = PreviewPanel()
         splitter.addWidget(self.preview)
@@ -300,7 +369,7 @@ class MainScreen(QDialog):
         splitter.setSizes([1, 1])
         layout.addWidget(splitter, stretch=1)
 
-        # -- 4. voice section --------------------------------------------------------
+        # -- 3. voice section --------------------------------------------------------
         voice_row = QHBoxLayout()
         voice_row.addWidget(QLabel("Voice:"))
         self.voice_box = QComboBox()
@@ -348,14 +417,14 @@ class MainScreen(QDialog):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
-        # -- 5. actions ---------------------------------------------------------------
-        # Two separate steps, on purpose: Convert switches the deck's direction; Generate
-        # TTS audio adds audio for whichever language a card currently shows first. Audio
-        # only ever makes sense to generate *after* the direction is right, so "Generate
-        # TTS audio" stays disabled (see _update_action_state/_direction_is_correct) until
-        # the currently selected notetype's own front template already shows the target
-        # language -- checked against the notetype, not just remembered from a click, so a
-        # deck that was already in the right direction to begin with is never blocked.
+        # -- 4. actions ---------------------------------------------------------------
+        # Three steps, in order: Analyze asks the AI to propose a converted deck (writes
+        # nothing); Convert actually clones the notetype and writes the templates Analyze
+        # proposed (or that were hand-edited afterward); Generate TTS audio fills in the
+        # audio field Convert created. Convert/Generate TTS audio stay disabled
+        # (see _update_action_state) until an analysis exists for the currently selected
+        # pair -- both need facts (front/back/css; speak_text_from) that only Analyze
+        # produces.
         self.flow_hint_label = QLabel("")
         self.flow_hint_label.setWordWrap(True)
         layout.addWidget(self.flow_hint_label)
@@ -366,6 +435,9 @@ class MainScreen(QDialog):
         self.stop_button.setVisible(False)
         self.stop_button.clicked.connect(self._on_stop_clicked)
         action_row.addWidget(self.stop_button)
+        self.analyze_button = QPushButton("Analyze")
+        self.analyze_button.clicked.connect(self._on_analyze)
+        action_row.addWidget(self.analyze_button)
         self.convert_button = QPushButton("Convert")
         self.convert_button.clicked.connect(self._on_convert)
         action_row.addWidget(self.convert_button)
@@ -410,7 +482,7 @@ class MainScreen(QDialog):
         super().closeEvent(event)
 
     def _refresh_pairs(self) -> None:
-        self._pairs = _decks_with_notetypes(mw.col)
+        self._pairs = decks_with_notetypes(mw.col)
         self.pair_box.blockSignals(True)
         self.pair_box.clear()
         for deck, notetype, count in self._pairs:
@@ -432,57 +504,35 @@ class MainScreen(QDialog):
         self._deck_name = deck
         self._notetype_name = notetype_name
         self._notetype = mw.col.models.by_name(notetype_name)
-        self._live_fields = fields_from_notetype(self._notetype["flds"])
 
         self._note_ids = mw.col.find_notes(scope_query(notetype_name, deck))
-        self._samples = _collect_samples(self._note_ids[:3])
-
-        # Which fields actually hold audio, for every branch below -- not just the detected
-        # one. It's what lets audio the deck already had be bound to a native role and so
-        # kept off the card, whether the mapping came from a carry-forward or a fresh guess.
-        # See core.audio_fields.
-        raw_samples = _collect_raw_samples(self._note_ids[:8])
-        self._sound_fields = sound_field_names(raw_samples)
+        sample_tags = mw.col.get_note(self._note_ids[0]).tags if self._note_ids else []
+        self._conversion_state = state_from_notetype(self._notetype.get("css", ""), sample_tags)
 
         if (
-            self._converted_mapping_override is not None
-            and self._converted_mapping_override[0] == notetype_name
+            self._post_convert_carry is not None
+            and self._post_convert_carry[0] == notetype_name
         ):
-            # The pair a Convert just finished on -- see the field's own docstring.
-            mapping = self._converted_mapping_override[1]
-            self._converted_mapping_override = None
+            _clone_name, analysis, audio_field_name = self._post_convert_carry
+            self._analysis = analysis
+            self._audio_field_name = audio_field_name
+            self.html_editor.set_content(analysis.front, analysis.back, analysis.css)
+            self.ai_result_panel.show_analysis(analysis)
         else:
-            tmpls = self._notetype.get("tmpls") or [{}]
-            mapping = guess_role_mapping(
-                notetype_name,
-                self._live_fields,
-                raw_samples,
-                front_html=tmpls[0].get("qfmt", ""),
-                back_html=tmpls[0].get("afmt", ""),
-                css=self._notetype.get("css", ""),
-            )
-        mapping = resolve_audio_fields(mapping, sound_fields=self._sound_fields)
-
-        self.target_language.blockSignals(True)
-        self.native_language.blockSignals(True)
-        self.target_language.setText(mapping.target_language or "")
-        self.native_language.setText(mapping.native_language or "")
-        self.target_language.blockSignals(False)
-        self.native_language.blockSignals(False)
-
-        self.field_list.set_content(
-            self._live_fields, self._samples, mapping, order=mapping.render_order
-        )
+            self._analysis = None
+            self._audio_field_name = None
+            self.html_editor.set_content("", "", "")
+            self.ai_result_panel.show_not_analyzed(self._conversion_state)
+        self._post_convert_carry = None
 
         self._html_mode = False
         self._html_dirty = False
-        self.fields_button.setChecked(True)
-        self.stack.setCurrentWidget(self.field_list)
+        self.ai_result_button.setChecked(True)
+        self.stack.setCurrentWidget(self.ai_result_panel)
 
         self._target_deck_dirty = False
         self._update_target_deck_default()
 
-        self._update_language_banner()
         self._update_tts_limit_options()
         self._update_action_state()
         self._refresh_preview()
@@ -527,274 +577,165 @@ class MainScreen(QDialog):
         else:
             self.tts_limit_chunk_radio.setToolTip(self._tts_chunk_tooltip)
 
-    # -- Convert-before-Audio gate ----------------------------------------------------
-
-    def _direction_is_correct(self) -> bool:
-        """Whether the currently selected notetype's real, on-disk front template already
-        shows target-language content -- i.e. whether Convert has already been run against
-        it (or it was already in the right direction to begin with).
-
-        Checked against the *live* ``qfmt`` (``self._notetype``), not against what
-        ``_current_templates()`` would freshly generate -- that's always computable from
-        the mapping alone, converted or not, so it can't tell the two apart. This can.
-        """
-        if self._notetype is None or not self._notetype.get("tmpls"):
-            return False
-        try:
-            mapping = self._current_mapping()
-        except ValidationError:
-            return False
-        live_front_fields = referenced_fields(self._notetype["tmpls"][0].get("qfmt", ""))
-        for role in (Role.TARGET_TERM, Role.TARGET_SENTENCE):
-            binding = mapping.first(role)
-            if binding is not None and binding.name in live_front_fields:
-                return True
-        return False
+    # -- action gating --------------------------------------------------------------
 
     def _is_busy(self) -> bool:
-        return self._convert_running or self._tts_cancel_event is not None
+        return self._convert_running or self._analyzing or self._tts_cancel_event is not None
 
     def _update_action_state(self) -> None:
         busy = self._is_busy()
-        correct = self._direction_is_correct()
-        self.convert_button.setEnabled(not busy)
-        self.generate_button.setEnabled(correct and not busy)
-        if correct:
+        has_analysis = self._analysis is not None
+        self.analyze_button.setEnabled(not busy and bool(self._note_ids))
+        self.convert_button.setEnabled(has_analysis and not busy)
+        self.generate_button.setEnabled(has_analysis and not busy)
+        if busy:
+            return
+        if has_analysis:
             self.generate_button.setToolTip("")
             self.flow_hint_label.setText(
-                "This deck's direction is already switched -- Generate TTS audio is ready. "
-                "It writes real audio in the background; you can click Stop at any time "
-                "and continue right where you left off later."
+                "Review the AI's result on the left (or edit the HTML directly), then "
+                "click Convert. Once converted, come back and click Generate TTS audio."
             )
         else:
             self.generate_button.setToolTip(
-                "Convert this deck's direction first -- Generate TTS audio only works once "
-                "the target language is already on the front of the card."
+                "Run Analyze first -- Generate TTS audio needs to know which field to speak."
             )
-            self.flow_hint_label.setText(
-                "Step 1: click Convert to switch this deck's direction. Step 2: once "
-                "switched, come back here and click Generate TTS audio -- it writes real "
-                "audio in the background, and you can click Stop at any time and continue "
-                "right where you left off later."
-            )
+            if self._conversion_state is not None:
+                self.flow_hint_label.setText(
+                    "This deck already looks converted (%s → %s). Click Analyze to "
+                    "re-check it before Convert or Generate TTS audio."
+                    % (self._conversion_state.target_language, self._conversion_state.native_language)
+                )
+            else:
+                self.flow_hint_label.setText(
+                    "Step 1: click Analyze to have the AI propose a converted deck. "
+                    "Step 2: review it, then click Convert. Step 3: click Generate TTS audio."
+                )
 
-    # -- language banner ------------------------------------------------------------
+    # -- analyze --------------------------------------------------------------------
 
-    def _on_manual_toggled(self) -> None:
-        manual = self.manual_check.isChecked()
-        self.target_language.setVisible(manual)
-        self.native_language.setVisible(manual)
-        self._update_language_banner()
+    def _on_analyze(self) -> None:
+        if not self._note_ids:
+            showWarning("No notes in the selected deck/notetype.", parent=self)
+            return
+        if self._html_dirty and not askUser(
+            "Running Analyze will replace your manual HTML edits with a fresh result. "
+            "Continue?",
+            parent=self,
+            defaultno=True,
+        ):
+            return
 
-    def _majority_language(self, field_names: set) -> Optional[str]:
-        """The most common confidently-detected language among ``field_names``, or
-        ``None`` if none of them produced a confident guess."""
-        counts: Dict[str, int] = {}
-        for _ord, name in self._live_fields:
-            if name not in field_names:
-                continue
-            guess = detect_field_language(self._samples.get(name, []))
-            if guess.is_confident:
-                counts[guess.code] = counts.get(guess.code, 0) + 1
-        return max(counts.items(), key=lambda kv: kv[1])[0] if counts else None
+        fields = collect_field_samples(mw.col, self._note_ids[:_ANALYZE_SAMPLE_NOTES])
+        tmpls = self._notetype.get("tmpls") or [{}]
+        qfmt = tmpls[0].get("qfmt", "")
+        afmt = tmpls[0].get("afmt", "")
+        css = self._notetype.get("css", "")
+        deck_name = self._deck_name
+        notetype_name = self._notetype_name
+        existing_names = [f["name"] for f in self._notetype.get("flds", [])]
+        audio_field_name = generated_field_name(taken=existing_names)
 
-    def _structural_direction(self) -> Optional[str]:
-        """What's actually on the card *right now*, read straight off the live qfmt/afmt
-        -- an objective fact about the deck as it exists today, independent of any role
-        mapping (which describes what *will* happen once Convert runs, not what already
-        has). ``None`` if there's no notetype yet or neither side yields a confident guess.
-        """
-        if self._notetype is None or not self._notetype.get("tmpls"):
-            return None
-        tmpl = self._notetype["tmpls"][0]
-        front_fields = set(referenced_fields(tmpl.get("qfmt", "")))
-        back_fields = set(referenced_fields(tmpl.get("afmt", ""))) - front_fields
-        front_lang = self._majority_language(front_fields)
-        back_lang = self._majority_language(back_fields)
-        if not front_lang and not back_lang:
-            return None
-        return "%s → %s" % (front_lang or "?", back_lang or "?")
-
-    def _update_language_banner(self) -> None:
-        counts: Dict[str, int] = {}
-        for _ord, name in self._live_fields:
-            guess = detect_field_language(self._samples.get(name, []))
-            if guess.is_confident:
-                counts[guess.code] = counts.get(guess.code, 0) + 1
-        detected = (
-            ", ".join("%s (%d)" % (c, n) for c, n in sorted(counts.items(), key=lambda kv: -kv[1]))
-            or "no confident guess"
-        )
-
-        target = self.target_language.text().strip()
-        native = self.native_language.text().strip()
-        current = self._structural_direction()
-
-        if self._direction_is_correct():
-            # Front already shows target -- "current" and "after converting" are the same
-            # thing, so there's nothing to contrast. Prefer the structural reading; fall
-            # back to the mapping's own target/native strings if detection came up empty.
-            direction = "%s (already converted)" % (
-                current or "%s → %s" % (target or "?", native or "?")
-            )
-        elif target or native:
-            after = "%s → %s" % (target or "?", native or "?")
-            direction = (
-                "Current: %s   |   after converting: %s" % (current, after)
-                if current
-                else "after converting: %s" % after
-            )
-        elif current:
-            direction = "Current: %s   -- map roles (or set manually) to see the direction after converting" % current
-        else:
-            direction = 'not set -- check "Set manually", or map roles yourself'
-
-        self.detected_label.setText("Detected: %s    Direction: %s" % (detected, direction))
-
-    # -- mapping / templates --------------------------------------------------------
-
-    def _current_mapping(self) -> RoleMapping:
-        """What the field list currently says, with the audio policy applied.
-
-        Resolving here rather than at each use means every consumer -- preview, direction
-        check, sample text, Convert -- sees the same thing: generated
-        fields hold the target audio, and any audio the deck already had is bound to a
-        native role so it stays on the note but never reaches a card.
-        """
-        assignments = self.field_list.current_assignments()
-        target = self.target_language.text().strip() or None
-        native = self.native_language.text().strip() or None
-        mapping = mapping_from_assignments(
-            self._notetype_name, assignments, target_language=target, native_language=native
-        )
-        mapping.render_order = self.field_list.current_render_order() or None
-        return resolve_audio_fields(mapping, sound_fields=self._sound_fields)
-
-    def _conversion_mapping(self) -> Tuple[RoleMapping, List[Tuple[Role, str]]]:
-        """``(mapping, [(role, new field name), ...])`` for an actual conversion.
-
-        Differs from :meth:`_current_mapping` in one way: it also accounts for the audio
-        fields the conversion is about to create, so the templates it generates can already
-        reference them. They don't exist on the notetype being looked at -- only on the
-        clone, once ``apply_plan`` has built it.
-        """
-        mapping = self._current_mapping()
-        planned = plan_generated_fields(mapping)
-        if not planned:
-            return mapping, []
-        resolved = resolve_audio_fields(
-            mapping, sound_fields=self._sound_fields, extra_fields=planned
-        )
-        return resolved, planned
-
-    def _current_templates(self, mapping: Optional[RoleMapping] = None) -> GeneratedTemplates:
-        if self._html_mode:
-            front, back, css = self.html_editor.get_content()
-            return GeneratedTemplates(
-                front_html=front,
-                back_html=back,
-                css=css,
-                template_name=addon_config().get("template_name", "Production"),
-            )
-        if mapping is None:
-            mapping = self._current_mapping()
-        opts = template_options_from_config(addon_config())
-        order = self.field_list.current_render_order()
-        front_order, back_order = split_render_order(order, audio_on_front=opts.audio_on_front)
-        opts = replace(opts, front_order=front_order, back_order=back_order)
-        return generate_templates(mapping, source_css=self._notetype.get("css", ""), options=opts)
-
-    # -- field list / language edits -> live preview --------------------------------
-
-    def _on_field_or_language_changed(self) -> None:
-        self._update_language_banner()
+        self._analyzing = True
+        self._html_dirty = False
         self._update_action_state()
+        self.ai_result_panel.show_analyzing()
+        self.status_label.setText("")
+        mw.progress.start(
+            parent=self,
+            immediate=True,
+            label="Analyzing deck… this can take a few minutes, especially on the very "
+                  "first run (downloads a local AI model, about 4.3GB, one time only).",
+        )
+
+        result_holder: Dict[str, Any] = {}
+
+        def task() -> None:
+            runtime = ensure_llama_runtime(_cache_dir())
+            model = ensure_model(_cache_dir())
+            call_fn = functools.partial(
+                call_model, runtime_path=runtime.path, model_path=model.primary_path
+            )
+            result_holder["analysis"] = analyze_deck(
+                deck_name=deck_name,
+                notetype_name=notetype_name,
+                fields=fields,
+                qfmt=qfmt,
+                afmt=afmt,
+                css=css,
+                audio_field_name=audio_field_name,
+                call_model_fn=call_fn,
+            )
+
+        def on_future_done(future: Any) -> None:
+            mw.progress.finish()
+            self._analyzing = False
+            exc = future.exception()
+            if exc is not None:
+                self.ai_result_panel.show_not_analyzed(self._conversion_state)
+                self._update_action_state()
+                showWarning("Analysis failed: %r" % (exc,), parent=self)
+                return
+            analysis: DeckAnalysis = result_holder["analysis"]
+            self._analysis = analysis
+            self._audio_field_name = audio_field_name
+            self.html_editor.set_content(analysis.front, analysis.back, analysis.css)
+            self.ai_result_panel.show_analysis(analysis)
+            self._html_mode = False
+            self.ai_result_button.setChecked(True)
+            self.stack.setCurrentWidget(self.ai_result_panel)
+            self._update_action_state()
+            self._refresh_preview()
+
+        mw.taskman.run_in_background(task, on_future_done)
+
+    # -- HTML / AI Result mode switch ------------------------------------------------
+
+    def _on_html_mode_clicked(self) -> None:
+        if self._html_mode:
+            return
+        self._html_mode = True
+        self.stack.setCurrentWidget(self.html_editor)
+
+    def _on_ai_result_mode_clicked(self) -> None:
+        if not self._html_mode:
+            return
+        self._html_mode = False
+        self.stack.setCurrentWidget(self.ai_result_panel)
+
+    def _on_html_edited(self) -> None:
+        self._html_dirty = True
         self._refresh_preview()
+
+    # -- live preview -----------------------------------------------------------------
 
     def _refresh_preview(self) -> None:
         if not self._note_ids or self._notetype is None:
             self.preview.clear()
             return
-        try:
-            templates = self._current_templates()
-        except ValidationError as exc:
-            self.status_label.setText("Cannot preview yet: %s" % exc)
-            self.preview.clear("Map the fields (or fix the errors above) to see a preview.")
+        front, back, css = self.html_editor.get_content()
+        if not front.strip() or not back.strip():
+            self.preview.clear("Click Analyze to see a preview of the converted card.")
             return
-        self.status_label.setText("")
         note = mw.col.get_note(self._note_ids[0])
-        self.preview.set_content(
-            note,
-            self._notetype,
-            0,
-            front_html=templates.front_html,
-            back_html=templates.back_html,
-            css=templates.css,
-        )
+        self.preview.set_content(note, self._notetype, 0, front_html=front, back_html=back, css=css)
         self.preview.refresh()
-
-    # -- HTML / Fields mode switch ----------------------------------------------------
-
-    def _on_html_mode_clicked(self) -> None:
-        if self._html_mode:
-            return
-        try:
-            templates = self._current_templates()
-        except ValidationError:
-            templates = None
-        if templates is not None:
-            self.html_editor.set_content(templates.front_html, templates.back_html, templates.css)
-        self._html_mode = True
-        self._html_dirty = False
-        self.stack.setCurrentWidget(self.html_editor)
-
-    def _on_fields_mode_clicked(self) -> None:
-        if not self._html_mode:
-            return
-        if self._html_dirty:
-            if not askUser(
-                "Switching back to Fields mode will discard your manual HTML edits and "
-                "regenerate the card from the field list. Continue?",
-                parent=self,
-                defaultno=True,
-            ):
-                self.html_button.setChecked(True)
-                return
-        self._html_mode = False
-        self._html_dirty = False
-        self.stack.setCurrentWidget(self.field_list)
-        self._refresh_preview()
-
-    def _on_html_edited(self) -> None:
-        self._html_dirty = True
-        self._refresh_preview()
 
     # -- voice sampling (no collection write -- QueryOp, not CollectionOp) ----------
 
     def _sample_text(self) -> str:
         """The text a real batch run would actually speak for the currently-previewed
         note, so "Sample" previews this deck's real content instead of a generic phrase.
-        Prefers TargetSentence (closer to real speech than a bare word) and only falls
-        back to TargetTerm when there's no sentence -- e.g. a word-only note -- or no
-        sentence text on this particular note. Falls back to ``_SAMPLE_TEXT`` only if
-        neither role is mapped or has content yet, or a note isn't even selected."""
-        if self._note_ids and self._notetype is not None:
+        Falls back to ``_SAMPLE_TEXT`` if there's no analysis yet, no note, or the
+        speak_text_from field is empty on this particular note."""
+        if self._note_ids and self._analysis is not None:
+            note = mw.col.get_note(self._note_ids[0])
             try:
-                mapping = self._current_mapping()
-            except ValidationError:
-                mapping = None
-            if mapping is not None:
-                note = mw.col.get_note(self._note_ids[0])
-                for role in (Role.TARGET_SENTENCE, Role.TARGET_TERM):
-                    binding = mapping.first(role)
-                    if binding is None:
-                        continue
-                    try:
-                        text = note[binding.name]
-                    except (KeyError, IndexError, ValueError):
-                        continue
-                    if text.strip():
-                        return text
+                text = note[self._analysis.speak_text_from]
+            except (KeyError, IndexError, ValueError):
+                text = ""
+            if text.strip():
+                return text
         return _SAMPLE_TEXT
 
     def _on_sample_voice(self) -> None:
@@ -828,22 +769,34 @@ class MainScreen(QDialog):
         if not self._note_ids:
             showWarning("No notes in the selected deck/notetype.", parent=self)
             return
-        try:
-            # The conversion's own mapping, which knows about the audio fields it is about
-            # to create -- not self._current_mapping(), which describes the notetype as it
-            # stands right now.
-            mapping, planned_fields = self._conversion_mapping()
-            templates = self._current_templates(mapping)
-        except ValidationError as exc:
-            showWarning("Cannot convert: %s" % exc, parent=self)
+        if self._analysis is None:
+            # Convert is only ever enabled once an analysis exists (see
+            # _update_action_state) -- reachable only if something bypassed that gating,
+            # in which case failing loudly beats writing "?" into the permanent record.
+            showWarning("Run Analyze before converting.", parent=self)
             return
+        front, back, css = self.html_editor.get_content()
+        if not front.strip() or not back.strip():
+            showWarning(
+                "Analyze the deck (or write Front/Back HTML by hand) before converting.",
+                parent=self,
+            )
+            return
+
+        target_language = self._analysis.target_language
+        native_language = self._analysis.native_language
+        audio_field_name = self._audio_field_name or GENERATED_AUDIO_FIELD
 
         config = addon_config()
         mode = self.mode_box.currentData()
         source_deck_at_start = self._deck_name
         plan = build_plan(
             mode=mode,
-            mapping=mapping,
+            front=front,
+            back=back,
+            css=css,
+            target_language=target_language,
+            native_language=native_language,
             source_notetype=self._notetype_name,
             source_deck=self._deck_name,
             target_deck=self.target_deck_edit.text().strip() or None,
@@ -851,7 +804,7 @@ class MainScreen(QDialog):
             dry_run=False,
         )
         plan.strip_tags = list(config.get("strip_tags", ["leech"]))
-        plan.new_fields = [name for _role, name in planned_fields]
+        plan.new_fields = [audio_field_name]
         plan.note_ids = list(mw.col.find_notes(plan.scope_query))
 
         validation = plan.validate()
@@ -861,6 +814,9 @@ class MainScreen(QDialog):
 
         self._convert_running = True
         self._update_action_state()
+
+        carried_analysis = self._analysis
+        carried_audio_field = audio_field_name
 
         def done(result: Any) -> None:
             self._convert_running = False
@@ -878,18 +834,15 @@ class MainScreen(QDialog):
                 if mode is ConversionMode.NEW_DECK
                 else source_deck_at_start
             )
-            # The clone keeps every source field at its own name and ord and only appends
-            # the generated audio field(s) -- which this mapping already describes, since
-            # it's the one the conversion ran with. Role bindings don't otherwise change
-            # through a conversion (only which side the template puts them on does), so it
-            # is already correct for the clone. Without this, the new pair would land on a
-            # freshly re-detected mapping and Generate TTS audio could look "not converted
-            # yet" even though it just was.
-            self._converted_mapping_override = (result.clone_notetype_name, mapping)
+            if carried_analysis is not None:
+                self._post_convert_carry = (
+                    result.clone_notetype_name, carried_analysis, carried_audio_field
+                )
             self._refresh_pairs()
             # _select_pair (via _on_pair_changed) already calls _update_action_state, and
             # the notetype it now points at is the freshly-converted clone -- Generate TTS
-            # audio unlocks immediately, no separate re-check needed.
+            # audio unlocks immediately via _post_convert_carry, no separate re-Analyze
+            # needed.
             self._select_pair(deck_name, result.clone_notetype_name)
             # CollectionOp's own mw.col.op_made_changes(changes)-driven refresh doesn't
             # reliably pick up the new deck here (see docs/api-notes.md) -- the deck
@@ -899,28 +852,27 @@ class MainScreen(QDialog):
             # Refresh it explicitly rather than rely on that.
             self._refresh_anki_main_window()
 
-        convert_op(
-            self, plan, templates, expected_note_count=len(plan.note_ids), on_success=done
-        ).run_in_background()
+        convert_op(self, plan, expected_note_count=len(plan.note_ids), on_success=done).run_in_background()
 
     # -- generate TTS audio -------------------------------------------------------------
 
     def _on_generate_tts(self) -> None:
-        if self._notetype is None:
-            return
-        # Whatever the field list currently shows -- already seeded from a carried-forward
-        # override or a fresh content-based guess in _on_pair_changed, and already passed
-        # through the audio policy (resolve_audio_fields) in _current_mapping itself.
-        mapping = self._current_mapping()
-        if not mapping.validate().ok:
-            showWarning("Map the fields (or fix the errors shown) before generating audio.", parent=self)
+        if self._notetype is None or self._analysis is None:
+            showWarning(
+                "Run Analyze on this notetype first -- Generate TTS audio needs to know "
+                "which field to speak.",
+                parent=self,
+            )
             return
 
-        if mapping.first(Role.TARGET_AUDIO) is None and mapping.first(Role.TARGET_SENTENCE_AUDIO) is None:
+        audio_field = self._audio_field_name or GENERATED_AUDIO_FIELD
+        source_field = self._analysis.speak_text_from
+        live_field_names = [f["name"] for f in self._notetype.get("flds", [])]
+        if audio_field not in live_field_names:
             showWarning(
-                "This notetype has no field for generated audio yet.\n\nConvert the deck "
-                "first -- the conversion creates that field. Generating audio into a field "
-                "the deck already had would overwrite the original recordings.",
+                "This notetype has no field named %r yet.\n\nConvert the deck first -- the "
+                "conversion creates that field. Generating audio into a field the deck "
+                "already had would overwrite the original recordings." % audio_field,
                 parent=self,
             )
             return
@@ -951,7 +903,7 @@ class MainScreen(QDialog):
             if not proceed:
                 return
 
-        self._run_tts_batch(self._notetype, mapping, note_ids, voice_id, config, limit)
+        self._run_tts_batch(self._notetype, audio_field, source_field, note_ids, voice_id, limit)
 
     def _on_stop_clicked(self) -> None:
         if self._tts_cancel_event is not None:
@@ -965,10 +917,10 @@ class MainScreen(QDialog):
     def _run_tts_batch(
         self,
         notetype: dict,
-        mapping: RoleMapping,
+        audio_field: str,
+        source_field: str,
         note_ids: List[int],
         voice_id: str,
-        config: dict,
         limit: int,
     ) -> None:
         self._tts_cancel_event = threading.Event()
@@ -976,8 +928,8 @@ class MainScreen(QDialog):
         self.stop_button.setEnabled(True)
         self.stop_button.setVisible(True)
         self.status_label.setText(
-            "Generating audio… click Stop at any time -- audio already generated is kept, "
-            "and you can continue right where you left off later."
+            "Generating audio… click Stop at any time -- audio already generated is "
+            "kept, and you can continue right where you left off later."
         )
         concurrency = default_concurrency() if self.tts_parallel_check.isChecked() else 1
 
@@ -1018,11 +970,10 @@ class MainScreen(QDialog):
         run_tts_batch(
             self,
             notetype,
-            mapping,
             note_ids,
             voice_id,
-            config,
-            template_options_from_config=template_options_from_config,
+            audio_field=audio_field,
+            source_field=source_field,
             limit=limit,
             concurrency=concurrency,
             cancel_event=self._tts_cancel_event,
