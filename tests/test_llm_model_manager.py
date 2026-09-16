@@ -24,6 +24,7 @@ from addon.llm.model_manager import (
     ModelFile,
     ModelVerificationError,
     ensure_model,
+    model_is_cached,
     model_urls,
 )
 
@@ -103,6 +104,46 @@ class TestEnsureModel(unittest.TestCase):
 
             with self.assertRaises(ModelVerificationError):
                 ensure_model(cache_dir, download_to=bad_download)
+
+
+class TestModelIsCached(unittest.TestCase):
+    """Purely for UI messaging (e.g. "downloading now" vs. "already have it") -- a cheap size
+    check, same rule ensure_model itself applies, just without downloading anything missing."""
+
+    @patch("addon.llm.model_manager.MODEL_FILES", _TINY_FILES)
+    def test_false_when_nothing_downloaded_yet(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            self.assertFalse(model_is_cached(cache_dir))
+
+    @patch("addon.llm.model_manager.MODEL_FILES", _TINY_FILES)
+    def test_true_once_every_file_is_present_at_the_right_size(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            def fake_download(url, dest):
+                spec = next(s for s in _TINY_FILES if s.filename == dest.name)
+                dest.write_bytes(b"x" * spec.size_bytes)
+
+            ensure_model(cache_dir, download_to=fake_download)
+
+            self.assertTrue(model_is_cached(cache_dir))
+
+    @patch("addon.llm.model_manager.MODEL_FILES", _TINY_FILES)
+    def test_false_when_a_file_is_present_but_truncated(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            model_dir = Path(cache_dir) / "model"
+            model_dir.mkdir(parents=True)
+            (model_dir / _TINY_FILES[0].filename).write_bytes(b"x" * 3)  # truncated
+            (model_dir / _TINY_FILES[1].filename).write_bytes(b"x" * _TINY_FILES[1].size_bytes)
+
+            self.assertFalse(model_is_cached(cache_dir))
+
+    @patch("addon.llm.model_manager.MODEL_FILES", _TINY_FILES)
+    def test_false_when_only_some_files_are_present(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            model_dir = Path(cache_dir) / "model"
+            model_dir.mkdir(parents=True)
+            (model_dir / _TINY_FILES[0].filename).write_bytes(b"x" * _TINY_FILES[0].size_bytes)
+
+            self.assertFalse(model_is_cached(cache_dir))
 
 
 if __name__ == "__main__":
