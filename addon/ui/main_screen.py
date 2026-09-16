@@ -9,10 +9,12 @@ from how much retrying it took (never something the model reports about itself -
 deterministically by ``llm.direction`` inside that same call, never asked of the user up front.
 
 Layout, top to bottom: deck/mode picker; a left/right split (an "AI Result" read-only summary
-of the last analysis by default, or a raw Front/Back/Styling editor when "HTML" is switched on,
-on the left -- and, on the right, a live preview, ``preview_panel.PreviewPanel``, an embeddable
-``AnkiWebView`` that never writes to the collection); a voice picker with a sample button; then
-Analyze / Convert / Generate TTS audio, in that order -- each step's output feeds the next.
+of the last analysis by default, a raw Front/Back/Styling editor when "HTML" is switched on, or
+a checkbox list of already-placed fields when "Hide fields" is switched on -- see
+``_FieldVisibilityPanel`` -- on the left; and, on the right, a live preview,
+``preview_panel.PreviewPanel``, an embeddable ``AnkiWebView`` that never writes to the
+collection); a voice picker with a sample button; then Analyze / Convert / Generate TTS audio,
+in that order -- each step's output feeds the next.
 
 Whether the *currently selected* pair was already converted by a previous session is read back
 via ``core.deck_state.state_from_notetype`` -- a recorded fact (a note tag and a css comment
@@ -67,6 +69,12 @@ from ..core.deck_state import ConversionState, state_from_notetype
 from ..llm.analyze import DeckAnalysis, analyze_deck, strip_pending_audio_html
 from ..llm.client import call_model
 from ..llm.direction import Direction, resolve_direction
+from ..llm.field_visibility import (
+    ensure_hidden_field_css,
+    is_field_hidden,
+    set_field_hidden,
+    visible_fields,
+)
 from ..llm.model_manager import ensure_model, model_is_cached
 from ..llm.runtime import ensure_llama_runtime, runtime_is_cached
 from ..ops.convert_op import convert_op
@@ -178,6 +186,65 @@ class _RawHtmlEditor(QWidget):
             return
         self._store_active()
         self.changed.emit()
+
+
+def _clear_layout(layout: Any) -> None:
+    while layout.count():
+        item = layout.takeAt(0)
+        widget = item.widget()
+        if widget is not None:
+            widget.deleteLater()
+
+
+class _FieldVisibilityPanel(QWidget):
+    """Front/Back checkbox list for showing or hiding an already-placed field -- the
+    non-technical alternative to the "HTML" tab, for a user who just wants a field off the
+    card without editing template syntax at all.
+
+    Lists exactly what ``llm.field_visibility.visible_fields`` finds referenced on the current
+    Front/Back HTML. A field never placed at all -- a deck's own hidden bookkeeping field
+    ``llm.direction`` already excludes, or a not-yet-existing generated-audio field -- never
+    appears, since toggling something that was never part of the card wouldn't do anything.
+    The list itself does not shrink as fields are hidden: a hidden field's reference is only
+    wrapped, never removed (see the module docstring), so it stays listed with its checkbox
+    simply unchecked -- exactly what "toggled on and off" means.
+    """
+
+    changed = pyqtSignal(str, bool)  #: (field_name, now_visible)
+
+    def __init__(self, parent: Any = None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        layout.addWidget(QLabel("<b>Front</b>"))
+        self._front_layout = QVBoxLayout()
+        layout.addLayout(self._front_layout)
+
+        layout.addSpacing(12)
+        layout.addWidget(QLabel("<b>Back</b>"))
+        self._back_layout = QVBoxLayout()
+        layout.addLayout(self._back_layout)
+
+        layout.addStretch(1)
+
+    def set_content(self, front: str, back: str) -> None:
+        """Rebuild the checkbox list from the current Front/Back HTML. Safe to call as often
+        as the HTML changes -- e.g. every time ``_refresh_preview`` runs."""
+        front_fields, back_fields = visible_fields(front, back)
+        self._rebuild(self._front_layout, front_fields, front, "(no fields on the Front yet)")
+        self._rebuild(self._back_layout, back_fields, back, "(no fields on the Back yet)")
+
+    def _rebuild(self, layout: Any, names: Any, html: str, empty_message: str) -> None:
+        _clear_layout(layout)
+        if not names:
+            layout.addWidget(QLabel(empty_message))
+            return
+        for name in names:
+            box = QCheckBox(name)
+            box.setChecked(not is_field_hidden(html, name))
+            box.toggled.connect(lambda checked, n=name: self.changed.emit(n, checked))
+            layout.addWidget(box)
 
 
 class _AIResultPanel(QWidget):
@@ -318,7 +385,10 @@ class MainScreen(QDialog):
         #: ``None`` when the pair has never been converted (nothing to recompute) or has no
         #: notes to sample. See module docstring / ``_generate_tts_ready``.
         self._recomputed_direction: Optional[Direction] = None
-        self._html_mode = False
+        #: Which of the three left-pane pages is showing: "ai_result", "html", or
+        #: "visibility" (the field-hide panel). Kept as one field rather than three bools so
+        #: "switch to X" can never leave two modes simultaneously marked active.
+        self._left_mode = "ai_result"
         self._html_dirty = False
         self._target_deck_dirty = False
         self._tts_cancel_event: Optional[threading.Event] = None
@@ -369,13 +439,18 @@ class MainScreen(QDialog):
         self.ai_result_button.setChecked(True)
         self.html_button = QPushButton("HTML")
         self.html_button.setCheckable(True)
+        self.hide_fields_button = QPushButton("Hide fields")
+        self.hide_fields_button.setCheckable(True)
         self._mode_group = QButtonGroup(self)
         self._mode_group.addButton(self.ai_result_button)
         self._mode_group.addButton(self.html_button)
+        self._mode_group.addButton(self.hide_fields_button)
         self.ai_result_button.clicked.connect(self._on_ai_result_mode_clicked)
         self.html_button.clicked.connect(self._on_html_mode_clicked)
+        self.hide_fields_button.clicked.connect(self._on_visibility_mode_clicked)
         mode_row.addWidget(self.ai_result_button)
         mode_row.addWidget(self.html_button)
+        mode_row.addWidget(self.hide_fields_button)
         mode_row.addStretch(1)
         left_layout.addLayout(mode_row)
 
@@ -386,6 +461,10 @@ class MainScreen(QDialog):
         self.html_editor = _RawHtmlEditor()
         self.html_editor.changed.connect(self._on_html_edited)
         self.stack.addWidget(self.html_editor)
+
+        self.field_visibility_panel = _FieldVisibilityPanel()
+        self.field_visibility_panel.changed.connect(self._on_field_visibility_changed)
+        self.stack.addWidget(self.field_visibility_panel)
 
         left_layout.addWidget(self.stack, stretch=1)
         splitter.addWidget(left_pane)
@@ -574,7 +653,7 @@ class MainScreen(QDialog):
             )
         self._post_convert_carry = None
 
-        self._html_mode = False
+        self._left_mode = "ai_result"
         self._html_dirty = False
         self.ai_result_button.setChecked(True)
         self.stack.setCurrentWidget(self.ai_result_panel)
@@ -785,7 +864,7 @@ class MainScreen(QDialog):
             self._analysis = analysis
             self.html_editor.set_content(analysis.front, analysis.back, analysis.css)
             self.ai_result_panel.show_analysis(analysis)
-            self._html_mode = False
+            self._left_mode = "ai_result"
             self.ai_result_button.setChecked(True)
             self.stack.setCurrentWidget(self.ai_result_panel)
             self._update_action_state()
@@ -793,31 +872,55 @@ class MainScreen(QDialog):
 
         mw.taskman.run_in_background(task, on_future_done)
 
-    # -- HTML / AI Result mode switch ------------------------------------------------
+    # -- AI Result / HTML / Hide fields mode switch ----------------------------------
 
     def _on_html_mode_clicked(self) -> None:
-        if self._html_mode:
+        if self._left_mode == "html":
             return
-        self._html_mode = True
+        self._left_mode = "html"
         self.stack.setCurrentWidget(self.html_editor)
 
     def _on_ai_result_mode_clicked(self) -> None:
-        if not self._html_mode:
+        if self._left_mode == "ai_result":
             return
-        self._html_mode = False
+        self._left_mode = "ai_result"
         self.stack.setCurrentWidget(self.ai_result_panel)
 
+    def _on_visibility_mode_clicked(self) -> None:
+        if self._left_mode == "visibility":
+            return
+        self._left_mode = "visibility"
+        self.stack.setCurrentWidget(self.field_visibility_panel)
+
     def _on_html_edited(self) -> None:
+        self._html_dirty = True
+        self._refresh_preview()
+
+    def _on_field_visibility_changed(self, field_name: str, now_visible: bool) -> None:
+        """A checkbox in the "Hide fields" panel was toggled -- rewrite whichever side
+        ``field_name`` is on to wrap/unwrap its reference (see ``llm.field_visibility``), same
+        as if the user had hand-edited the HTML themselves, without them ever seeing HTML.
+        """
+        front, back, css = self.html_editor.get_content()
+        front_fields, _back_fields = visible_fields(front, back)
+        hidden = not now_visible
+        if field_name in front_fields:
+            front = set_field_hidden(front, field_name, hidden=hidden)
+        else:
+            back = set_field_hidden(back, field_name, hidden=hidden)
+        css = ensure_hidden_field_css(css)
+        self.html_editor.set_content(front, back, css)
         self._html_dirty = True
         self._refresh_preview()
 
     # -- live preview -----------------------------------------------------------------
 
     def _refresh_preview(self) -> None:
+        front, back, css = self.html_editor.get_content()
+        self.field_visibility_panel.set_content(front, back)
         if not self._note_ids or self._notetype is None:
             self.preview.clear()
             return
-        front, back, css = self.html_editor.get_content()
         if not front.strip() or not back.strip():
             self.preview.clear("Click Analyze to see a preview of the converted card.")
             return

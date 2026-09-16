@@ -284,6 +284,24 @@ fallback that re-derives the deleted heuristic pipeline.
   notetype was already converted once), that recorded fact is used directly
   and fields already on the target-language side simply match again and stay
   put.
+  **A field never referenced anywhere in the original `qfmt`/`afmt` is
+  excluded from placement entirely**, the same way a not-yet-existing
+  generated-audio field already was — confirmed necessary against a real
+  Core 2000 conversion, which was otherwise rendering every one of that
+  deck's bookkeeping/index fields (`Core-Index`, `Optimized-Voc-Index`,
+  `Optimized-Sent-Index`, …) on the converted card's back, even though the
+  original card never showed them at all. Reproducing a field's existing
+  invisibility isn't the "never silently drop a field" policy's concern —
+  the field's data is untouched on the clone either way; only whether it
+  *renders* stays exactly as it already was. A field referenced only inside
+  a conditional (`{{#Field}}...{{/Field}}`) still counts as shown, since it
+  genuinely does render when non-empty — this only catches a field with no
+  reference anywhere. `llm/analyze.py` also filters what the model's prompt
+  shows to exactly the fields that got placed, so an excluded field's
+  content is never shown to the model at all, not merely left out of the
+  given placement lists (closing a real gap: `validate.py` only checks a
+  reference against those two lists, so a field in neither would otherwise
+  go unchecked if referenced).
 - **`llm/prompt.py`** — builds the one system+user prompt sent to the model,
   given a `PromptInput` carrying the deck's fields/samples, the *already-
   decided* new-front/new-back field lists from `direction.py`, and the
@@ -337,6 +355,25 @@ misplaced-field leaks, but not yet full placement compliance against the
 given `new_front_fields`/`new_back_fields` — extending it to catch and retry
 on a placement violation (the same pattern that already worked for audio
 safety) is the intended fix.
+
+### Field visibility (module: llm/field_visibility.py) — post-Analyze, not part of the model call
+
+A user-facing, non-technical way to turn an already-*placed* field's display on or off, without
+hand-editing the HTML at all — for a user who doesn't know Anki template syntax. Distinct from
+placement (`direction.py`, above): a field can legitimately belong on the back and still be
+something the user wants hidden (e.g. a bookkeeping field the AI judged worth "little visual
+weight" rather than omitting outright). Mechanism: wrap the field's rendering reference in
+`<span class="ddc-hidden">...</span>`, paired with one `display: none` CSS rule — the same
+technique real decks already use for their own conditional-display classes (Core 2000's
+`.ios-only`/`.mac-only`), so this is ordinary Anki template behavior, not a new mechanism. Fully
+reversible: un-hiding removes exactly that wrapper, so the HTML is never regenerated or lossy
+either direction. No separate hidden-state is tracked anywhere — the HTML itself is the source
+of truth, read back by `is_field_hidden`, the same "a fact recorded in the artifact itself, not
+a shadow flag" principle `core/deck_state.py` already uses for conversion state. `ui/main_screen.py`'s
+"Hide fields" panel is the only caller; it never touches a generated-audio field (that field's
+visibility is already governed by whether TTS filled it in, a different concern) or a field the
+original card never showed at all (never listed as toggleable in the first place, per the
+placement exclusion above).
 
 ## LANGUAGE DETECTION (module: core/language_detect.py)
 
