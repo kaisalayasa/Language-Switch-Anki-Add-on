@@ -11,7 +11,6 @@ Each check here maps to a real failure captured while testing this prompt agains
   ``{{/Picture}}``).
 - A given field placed on the wrong side (the same field-name-collision deck, run to run,
   sometimes inverts the given placement outright).
-- ``speak_text_from`` naming a field that isn't even one of the given front fields.
 
 This module does not fix anything or retry -- it only reports problems. Deciding what to do
 about them (re-prompt with the specific problem described, give up after N attempts, surface to
@@ -49,11 +48,10 @@ def validate_response(
     known_field_names: Sequence[str],
     new_front_fields: Sequence[str],
     new_back_fields: Sequence[str],
-    audio_field_name: str,
 ) -> List[ValidationProblem]:
     """Return every problem found; an empty list means the response is safe to show the user."""
     problems: List[ValidationProblem] = []
-    all_known = set(known_field_names) | {audio_field_name}
+    all_known = set(known_field_names)
     front_refs = set(referenced_fields(parsed.front))
     back_refs = set(referenced_fields(parsed.back))
 
@@ -88,13 +86,6 @@ def validate_response(
             "misplaced_field",
             "given FRONT field(s) referenced directly on the BACK template (not via {{FrontSide}}): %s"
             % sorted(leaked_front_on_back),
-        ))
-
-    if parsed.speak_text_from not in new_front_fields:
-        problems.append(ValidationProblem(
-            "invalid_speak_text_from",
-            "speak_text_from %r is not one of the given new-front fields %s"
-            % (parsed.speak_text_from, list(new_front_fields)),
         ))
 
     return problems

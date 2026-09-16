@@ -1,8 +1,8 @@
 """Parses the model's raw response text (one big string) into its four declared sections.
 
 ``prompt.py`` asks the model for a fixed shape: an ``--- ANALYSIS ---`` JSON header (holding
-``description`` and ``speak_text_from``) followed by ``--- FRONT ---``, ``--- BACK ---``, and
-``--- CSS ---`` blocks. This module is the other half of that contract -- it does not judge
+``description``) followed by ``--- FRONT ---``, ``--- BACK ---``, and ``--- CSS ---`` blocks.
+This module is the other half of that contract -- it does not judge
 whether the *content* of those sections is any good (a nonexistent field reference, an
 unbalanced conditional, a placement violation are all real failure modes seen while testing this
 prompt, but they're ``validate.py``'s job, not this module's). This module only answers: did the
@@ -30,7 +30,7 @@ _MARKERS_IN_ORDER = (ANALYSIS_MARKER, FRONT_MARKER, BACK_MARKER, CSS_MARKER)
 #: (e.g. a stale key from an older prompt version it was somehow trained/primed toward) is
 #: ignored rather than rejected -- this module's job is extracting what's needed, not policing
 #: the schema beyond that.
-_REQUIRED_ANALYSIS_KEYS = frozenset({"description", "speak_text_from"})
+_REQUIRED_ANALYSIS_KEYS = frozenset({"description"})
 
 
 class ResponseParseError(ValueError):
@@ -40,7 +40,6 @@ class ResponseParseError(ValueError):
 @dataclass(frozen=True)
 class ParsedResponse:
     description: str
-    speak_text_from: str
     front: str
     back: str
     css: str
@@ -93,7 +92,6 @@ def parse_response(text: str) -> ParsedResponse:
 
     return ParsedResponse(
         description=str(analysis["description"]).strip(),
-        speak_text_from=str(analysis["speak_text_from"]).strip(),
         front=front_part.strip(),
         back=back_part.strip(),
         css=css_part.strip(),

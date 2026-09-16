@@ -2,7 +2,8 @@
 which direction -- replacing the old approach of re-deriving direction by parsing a notetype's
 current templates, which broke the moment it was pointed at a notetype the addon had already
 converted (the very same templates, read backwards the second time; see ``addon/llm/direction.py``
-for the fuller account of why direction is no longer inferred from template structure at all).
+for the fuller account of why direction is no longer inferred from template structure at all, and
+for how ``ConversionState`` now feeds back into that resolution to prevent exactly that).
 
 Two independent marks are written at conversion time: a tag added to every converted note, and a
 comment appended to the notetype's CSS. Either alone is conclusive -- each can be lost
@@ -11,9 +12,16 @@ by the user), and both survive ``.apkg`` export/import, moving to a different ma
 reopening the addon much later. Reading either one back is enough to answer: has this notetype
 already been converted, and if so, what's on the front vs. the back now.
 
-This module only answers that one question. Whether a converted deck *also* still needs audio
-generated is a separate concern (comparing note content against however audio-generation
-progress is tracked) and does not belong here.
+Deliberately minimal: this module only ever records target/native language, nothing else. An
+earlier version also recorded ``speak_text_from`` (which given-front field to read aloud), since
+that used to be the one per-conversion decision with no deterministic source -- removed once
+``llm/direction.py`` stopped needing the model to make that decision at all (every real
+front-content field gets its own generated audio field now, computed the same way every time).
+With nothing left un-derivable, there was nothing left worth the added state to persist.
+
+This module only answers "has this notetype already been converted, and in which direction".
+Whether a converted deck *also* still needs audio generated is a separate concern (comparing note
+content against however audio-generation progress is tracked) and does not belong here.
 """
 
 from __future__ import annotations

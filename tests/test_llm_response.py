@@ -13,14 +13,13 @@ from addon.llm.prompt import ANALYSIS_MARKER, BACK_MARKER, CSS_MARKER, FRONT_MAR
 from addon.llm.response import ParsedResponse, ResponseParseError, parse_response
 
 
-def _make_response(description="A test deck.", speak_text_from="Word", front="<div>{{Word}}</div>",
+def _make_response(description="A test deck.", front="<div>{{Word}}</div>",
                     back="{{FrontSide}}<hr id=answer>", css=".card { font-size: 20px; }"):
     return (
         "%s\n"
-        '{\n  "description": "%s",\n  "speak_text_from": "%s"\n}\n'
+        '{\n  "description": "%s"\n}\n'
         "%s\n%s\n%s\n%s\n%s\n%s"
-    ) % (ANALYSIS_MARKER, description, speak_text_from, FRONT_MARKER, front, BACK_MARKER, back,
-         CSS_MARKER, css)
+    ) % (ANALYSIS_MARKER, description, FRONT_MARKER, front, BACK_MARKER, back, CSS_MARKER, css)
 
 
 class TestParseResponseHappyPath(unittest.TestCase):
@@ -29,7 +28,6 @@ class TestParseResponseHappyPath(unittest.TestCase):
         result = parse_response(text)
         self.assertEqual(result, ParsedResponse(
             description="A test deck.",
-            speak_text_from="Word",
             front="<div>{{Word}}</div>",
             back="{{FrontSide}}<hr id=answer>",
             css=".card { font-size: 20px; }",
@@ -44,15 +42,16 @@ class TestParseResponseHappyPath(unittest.TestCase):
         self.assertEqual(result.description, "A test deck.")
 
     def test_extra_keys_in_analysis_are_ignored_not_rejected(self):
-        """An older prompt version asked for target_language/native_language/write_audio_to;
-        if a model ever emits them anyway, that's harmless noise, not a parse failure."""
+        """Older prompt versions asked for speak_text_from/target_language/native_language/
+        write_audio_to; if a model ever emits one of these anyway (e.g. from stale fine-tuning
+        bias), that's harmless noise, not a parse failure."""
         text = (
             "%s\n"
             '{"description": "d", "speak_text_from": "Word", "target_language": "English"}\n'
             "%s\nfront\n%s\nback\n%s\ncss"
         ) % (ANALYSIS_MARKER, FRONT_MARKER, BACK_MARKER, CSS_MARKER)
         result = parse_response(text)
-        self.assertEqual(result.speak_text_from, "Word")
+        self.assertEqual(result.description, "d")
 
     def test_multiline_front_back_css_are_preserved(self):
         front = "<div>line one</div>\n<div>line two</div>"
@@ -91,22 +90,15 @@ class TestParseResponseFailureModes(unittest.TestCase):
         with self.assertRaises(ResponseParseError):
             parse_response(text)
 
-    def test_analysis_missing_speak_text_from_raises(self):
-        text = '%s\n{"description": "d"}\n%s\nfront\n%s\nback\n%s\ncss' % (
-            ANALYSIS_MARKER, FRONT_MARKER, BACK_MARKER, CSS_MARKER
-        )
-        with self.assertRaises(ResponseParseError):
-            parse_response(text)
-
     def test_analysis_missing_description_raises(self):
-        text = '%s\n{"speak_text_from": "Word"}\n%s\nfront\n%s\nback\n%s\ncss' % (
+        text = '%s\n{}\n%s\nfront\n%s\nback\n%s\ncss' % (
             ANALYSIS_MARKER, FRONT_MARKER, BACK_MARKER, CSS_MARKER
         )
         with self.assertRaises(ResponseParseError):
             parse_response(text)
 
     def test_analysis_that_is_a_json_list_not_object_raises(self):
-        text = '%s\n["d", "Word"]\n%s\nfront\n%s\nback\n%s\ncss' % (
+        text = '%s\n["d"]\n%s\nfront\n%s\nback\n%s\ncss' % (
             ANALYSIS_MARKER, FRONT_MARKER, BACK_MARKER, CSS_MARKER
         )
         with self.assertRaises(ResponseParseError):

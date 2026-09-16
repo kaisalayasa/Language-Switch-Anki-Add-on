@@ -68,8 +68,8 @@ class TestNoLanguageKnowledge(unittest.TestCase):
         "vocabulary-", "sentence-", "core 2000", "core2000",
     ]
 
-    # ``audio_fields.py`` matches on a field name -- but the one it chose itself
-    # (GENERATED_AUDIO_FIELD), not one that came from a deck, which is why that name must
+    # ``audio_fields.py`` matches on a field name -- but the prefix it chose itself
+    # (AUDIO_FIELD_PREFIX), not one that came from a deck, which is why that prefix must
     # stay free of any language: it is written into real collections, and a deck converted
     # to one language must still be recognised after being re-converted to another.
     # ``deck_state.py`` is held to the same bar for the same reason -- its tag/css marker are
