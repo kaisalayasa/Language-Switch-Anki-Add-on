@@ -44,9 +44,11 @@ misplaced-field leaks, but not full placement compliance against `new_front_fiel
 `new_back_fields`. Extending it to catch and retry on a placement violation is the intended fix
 -- the same pattern that already worked for audio safety.
 
-## Documentation pass
+## Documentation pass — done
 
-`CLAUDE.md`, `README.md`, and `docs/api-notes.md` still describe the deleted role-mapping system
-at length (field roles, `role_schema.py`, `template_generator.py`, the old audio-field-demotion
-design, etc.). None of it reflects the current LLM-first pipeline. Needs a full pass once the
-pipeline itself stops changing week to week.
+`CLAUDE.md`, `README.md`, `docs/api-notes.md`, and `docs/llm-notes.md` have been rewritten/
+updated to describe the current LLM-first pipeline instead of the deleted role-mapping system.
+`docs/llm-notes.md`'s model facts were also corrected (it still described the original 1.5B
+model; the addon has shipped the 7B model since early in the LLM overhaul). If the pipeline
+changes again in a way that makes any of these stale, update them again rather than letting
+drift accumulate a second time.

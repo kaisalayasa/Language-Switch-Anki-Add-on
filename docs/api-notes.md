@@ -3,6 +3,10 @@
 `claude.md` forbids guessing Anki API signatures. This file records what was **verified**,
 how, and what still needs confirming.
 
+Companion file for the local-LLM side of this project (llama.cpp invocation contract, GGUF
+model facts, HuggingFace/GitHub asset names): `docs/llm-notes.md`. Same discipline, different
+API surface.
+
 Target build: **Anki 26.08.1** (build `39e4b0b4`), bundled Python 3.13, collection schema 18.
 Verified by string-inspecting the compiled modules under
 `%LOCALAPPDATA%\Programs\Anki\app_packages\`.
@@ -206,28 +210,43 @@ looks for. Rather than chase the exact flag, `main_screen.py` now calls
 `MainScreen._refresh_anki_main_window`), since `deckBrowser.refresh` is stable/long-standing
 but not worth a hard crash if a future build ever renames it.
 
-## The `text:` field modifier (role_detect's mixed text+audio field fix)
+## The `text:` field modifier (audio-safety enforcement)
 
-`FieldBinding.filter` (already used for Core 2000's `furigana` filter) is now also set to
-`"text"` for a field that mixes real content with an embedded `[sound:...]` reference in the
-same field (see `core/role_detect.py`'s `_filter_for`). This relies on `{{text:Field}}`
-stripping special references (sound, images) and HTML from a field's rendered value.
+`{{text:Field}}` strips special references (sound, images) and HTML from a field's rendered
+value. This addon force-rewrites any bare or differently-filtered reference to a field with
+known pre-existing audio into this form — see `llm/audio_safety.py`'s `enforce_audio_safety`.
+
+**Superseded home, same underlying fact:** this used to be owned by the deleted role-mapping
+system's `core/role_detect.py` (`_filter_for`, applied selectively per field during role
+detection). The LLM overhaul moved the same mechanism to `llm/audio_safety.py`, where it's
+applied uniformly and deterministically to whatever the model wrote, regardless of what the
+model itself referenced or how — see `CLAUDE.md`'s "LOCAL LLM DECK ANALYSIS" section.
 
 **This is core Anki template syntax, not a Python/aqt API** — documented, long-standing,
 part of the template-rendering language itself rather than something that has shifted across
 `aqt`/`anki` releases the way Python method signatures have (see the traps below). It was not
-independently re-verified against a real running Anki 26.08.1 instance this pass; confirmed
-only by documentation and by the reproduction in `tests/test_role_detect.py`. **Verify it
-visually** the first time a mixed-field deck (the German test deck) goes through the live
-preview: the term should render as plain text with no leftover play icon for its own
-original-language audio. If `{{text:Field}}` behaves differently than documented on this
-build, that would show up immediately there, before any real note is touched.
+independently re-verified against a real running Anki 26.08.1 instance; confirmed only by
+documentation and by the reproduction in `tests/test_llm_audio_safety.py`. **Verify it
+visually** the first time a mixed-field deck (the German test deck, `"Hund [sound:hund.mp3]"`
+in one field) goes through the live preview: the term should render as plain text with no
+leftover play icon for its own original-language audio. If `{{text:Field}}` behaves
+differently than documented on this build, that would show up immediately there, before any
+real note is touched.
 
 ## Adding fields to the clone (generated audio fields)
 
-A conversion now creates the field its generated audio will live in, rather than reusing
+A conversion creates the field(s) its generated audio will live in, rather than reusing
 one the deck already had (see `addon/core/audio_fields.py` for why). That makes this the
 first place the addon changes a notetype's **field list**, not just its templates.
+
+**Naming, current scheme:** one field per real front-content field, named
+`core.audio_fields.generated_audio_field_name(source_field_name)` — e.g.
+`generated_audio_field_name("Example Sentence")` → `"ddc-audio-Example Sentence"`. Decided by
+`llm.direction.resolve_direction` (one `AudioTarget` per new-front field), not a single
+shared `ddc-audio` field per notetype the way an earlier design had it — see `CLAUDE.md`.
+`ConversionPlan.new_fields` (built by `ui/main_screen.py` from `DeckAnalysis.audio_targets`)
+is what actually reaches `build_clone` below; everything in this section about *how* those
+names get onto the saved notetype is unchanged by that history.
 
 **What it does, and why this shape:**
 
@@ -261,12 +280,13 @@ first place the addon changes a notetype's **field list**, not just its template
    appended-at-the-end reasoning above is a *deduction* from how such a map can be built,
    not something verified against this build. Check that converting in Flip-in-place mode
    leaves every original field's content intact on the notes.
-2. **The generated field name contains a space and parentheses** (`ddc-audio (EN)`), which
-   is ordinary for Anki field names and renders as `{{ddc-audio (EN)}}` /
-   `{{#ddc-audio (EN)}}` — neither character is special to the template parser, and no
-   forbidden character (`:`, `"`, `{`, `}`) is used. If Anki nonetheless rejects or renames
-   it, `build_clone`'s verification raises `ApiMismatch` immediately, and the fix is to
-   change `_ROLE_STEM` in `addon/core/audio_fields.py`.
+2. **A generated field name can contain a space** whenever the source field's own name does
+   (e.g. `ddc-audio-Example Sentence`), which is ordinary for Anki field names and renders as
+   `{{ddc-audio-Example Sentence}}` / `{{#ddc-audio-Example Sentence}}` — no character
+   `generated_audio_field_name` produces is special to the template parser, and no forbidden
+   character (`:`, `"`, `{`, `}`) is used. If Anki nonetheless rejects or renames it,
+   `build_clone`'s verification raises `ApiMismatch` immediately, and the fix is in
+   `addon/core/audio_fields.py`'s `generated_audio_field_name`.
 
 ## Still to confirm (exact signatures, not just presence)
 
@@ -314,18 +334,24 @@ _(not yet run)_
 
 ## `aqt.clayout.CardLayout` — pulled forward from M3, now verified against real source
 
-**RESOLVED. Current architecture (read this first): `addon/ui/preview.py`'s
-`open_live_preview()` opens `CardLayout` directly on a real, existing note (its own real,
-current notetype) and injects the generated Front/Back/CSS by driving `CardLayout`'s own
-live-editing widgets (`tform.front_button`/`back_button`/`style_button` + `tform.edit_area`)
-exactly as a human typing into it would. Confirmed from real source: this never writes
-anything to the collection -- `CardLayout._renderPreview()` always renders an *ephemeral*
-card from its own in-memory model, and nothing reaches the collection unless the user
-explicitly clicks the dialog's own Save button. There is no scratch notetype, no
-`CollectionOp`, no undo entry, nothing to reset. `addon/ui/card_preview.py` is the Tools-menu
-entry point (`show_card_preview`) that picks a note and calls this.**
+**SUPERSEDED AGAIN, by the single-screen redesign (current architecture, read this first):**
+`addon/ui/preview_panel.py`'s `PreviewPanel` doesn't launch `CardLayout` at all any more --
+`addon/ui/preview.py` and `addon/ui/card_preview.py`, described in the "RESOLVED" paragraph
+below, were both deleted along with the rest of the role-mapping-era UI. `PreviewPanel` is an
+*embedded* widget (the single screen's own right-hand pane) built by reading `CardLayout`'s own
+internal preview implementation (`setup_preview`/`_renderPreview` in the real `aqt` 26.8.1
+source) and reproducing just the part it needed: a plain `AnkiWebView` fed via
+`note.ephemeral_card(ord, custom_note_type=model, custom_template=template, fill_empty=False)`
+-- nothing about that rendering path requires `CardLayout`'s dialog chrome, so there was no
+need to open `CardLayout` as a separate window at all. Same safety property either way:
+`ephemeral_card()` never writes to the collection, so the hang bug documented below (a
+collection *write* racing a newly-opened *modal dialog*) structurally cannot recur -- this
+widget is not a dialog, and it never writes anything. See `CLAUDE.md`'s "ANKI DATA MODEL"
+section for the one *new* preview bug this current architecture has (a template error shown
+right after Analyze, before Convert, tracked in `TODO.md` -- unrelated to anything below).
 
-The section below is the investigation trail that got here, kept because it explains *why*
+The rest of this section, including the now-superseded "RESOLVED" paragraph directly below,
+is kept as the investigation trail that got here, because it explains *why*
 this design was chosen over the much more elaborate one that preceded it (a scratch
 notetype/deck/note built via `CollectionOp`, in `notetype_manager.py`'s now-deleted
 `ensure_preview_scaffold`/`write_preview_note`/`build_preview_note`). That approach caused a
