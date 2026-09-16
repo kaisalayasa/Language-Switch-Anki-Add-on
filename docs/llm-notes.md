@@ -5,11 +5,37 @@ checked by actually running the real binary/model or hitting the real GitHub/Hug
 
 ## The model
 
+**Bumped from the originally-verified 1.5B model to `Qwen/Qwen2.5-7B-Instruct-GGUF`** once
+real prompt testing (see the "Why the model doesn't decide direction" account in `CLAUDE.md`)
+showed the smaller model wasn't reliable enough at even the narrowed job it's asked to do now
+(writing template HTML for a given placement). Facts below for the 7B model are verified the
+same way the 1.5B facts originally were (`?blobs=true` against the real HuggingFace API); the
+1.5B facts are kept in the collapsed section below only as a record of what was checked first,
+not as a fallback this addon can currently load.
+
+Q4_K_M quantization, split into two files -- HuggingFace's standard convention once a GGUF
+exceeds ~4GB. Confirmed exact byte sizes (`addon/llm/model_manager.py`'s `MODEL_FILES`):
+
+| file | bytes |
+|---|---|
+| `qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf` | 3,993,201,344 |
+| `qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf` | 689,872,288 |
+
+Repo tagged `license:apache-2.0`. Download base:
+`https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/`. llama.cpp loads a split
+GGUF automatically from just the first part's path (`-m` needs only file 1 of 2) -- no merge
+step, confirmed this session (see `model_manager.py`'s module docstring).
+
+<details>
+<summary>Superseded: original 1.5B facts, kept for the record</summary>
+
 `Qwen/Qwen2.5-1.5B-Instruct-GGUF`, file `qwen2.5-1.5b-instruct-q4_k_m.gguf`, confirmed via the
 HuggingFace API (`?blobs=true`) at **exactly 1,117,320,736 bytes** (≈1.04 GB). Repo tagged
 `license:apache-2.0`.
 
 Download URL: `https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf`
+
+</details>
 
 ## The runtime: llama.cpp
 
@@ -101,13 +127,21 @@ model file, corrupt GGUF, OOM) looks like on exit code / stderr — confirm this
 
 ## Performance (this dev machine, CPU only, Q4_K_M)
 
+**These numbers are from the original 1.5B model and have not been re-measured against the 7B
+model this addon actually ships now** -- flag this if performance ever needs re-justifying; per
+`CLAUDE.md`'s "never guess" rule, don't assume the 7B numbers scale down proportionally from
+these without actually timing a real run.
+
 - Prompt processing: ~200-230 tokens/sec
 - Generation: ~34-38 tokens/sec
 - Model load time: <1 second (subsequent runs; mmap)
 
-Fast enough that a single per-notetype analysis call (expected: a few hundred tokens of prompt, a
-few hundred tokens of generated templates) should complete in well under a minute even on modest
-hardware. Confirms the "one call per notetype, not per note" design is not a performance risk.
+At 1.5B, fast enough that a single per-notetype analysis call (expected: a few hundred tokens of
+prompt, a few hundred tokens of generated templates) completed in well under a minute even on
+modest hardware. Real use with the 7B model (see the LLM overhaul commit history and
+`CLAUDE.md`) confirms analysis calls still complete in reasonable time on the dev machine, but no
+exact tokens/sec figure has been captured for it the way it was for 1.5B -- worth doing once
+performance on lower-end hardware becomes a real question rather than a theoretical one.
 
 ## Grammar-constrained decoding: available, not used
 
