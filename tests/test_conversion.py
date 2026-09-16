@@ -1,4 +1,8 @@
-"""Conversion planning: scoping, mode safety rules, and the preflight summary."""
+"""Conversion planning: scoping, mode safety rules, and the preflight summary.
+
+A plan carries plain front/back/css strings (what the LLM produced) rather than a role mapping
+-- see ``addon/core/conversion.py``'s module docstring.
+"""
 
 from __future__ import annotations
 
@@ -11,19 +15,16 @@ from addon.core.conversion import (
     scope_query,
 )
 
-from tests.test_template_generator import GENERIC_LIVE_FIELDS, _generic_mapping, simple_mapping
-from addon.core.role_schema import Role
-
 # An arbitrary but fixed note count, standing in for "however many notes a real deck has".
 _SAMPLE_NOTE_COUNT = 500
 
 
-def generic_mapping():
-    return _generic_mapping(live_fields=GENERIC_LIVE_FIELDS)
-
-
 def plan(mode=ConversionMode.NEW_DECK, **kw):
-    kw.setdefault("mapping", generic_mapping())
+    kw.setdefault("front", "<div>{{Word}}</div>")
+    kw.setdefault("back", "{{FrontSide}}<hr id=answer><div>{{Translation}}</div>")
+    kw.setdefault("css", ".card { font-size: 20px; }")
+    kw.setdefault("target_language", "es")
+    kw.setdefault("native_language", "en")
     kw.setdefault("source_notetype", "Generic")
     kw.setdefault("source_deck", "Generic")
     kw.setdefault("note_ids", list(range(_SAMPLE_NOTE_COUNT)))
@@ -81,6 +82,18 @@ class TestModeSafetyRules(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertTrue(any("not optional" in e for e in result.errors))
 
+    def test_an_empty_front_template_is_rejected(self):
+        p = plan(front="")
+        result = p.validate()
+        self.assertFalse(result.ok)
+        self.assertTrue(any("front template is empty" in e for e in result.errors))
+
+    def test_an_empty_back_template_is_rejected(self):
+        p = plan(back="")
+        result = p.validate()
+        self.assertFalse(result.ok)
+        self.assertTrue(any("back template is empty" in e for e in result.errors))
+
     def test_a_valid_new_deck_plan_passes(self):
         self.assertTrue(plan(ConversionMode.NEW_DECK).validate().ok)
 
@@ -107,6 +120,16 @@ class TestDefaultNaming(unittest.TestCase):
         self.assertIn("Produccion", p.clone_notetype)
 
 
+class TestPlanRecordsTheConversionDirection(unittest.TestCase):
+    """target_language/native_language ride along on the plan so convert_op.py can write
+    core.deck_state's marks without needing anything beyond the plan itself."""
+
+    def test_languages_are_carried_on_the_plan(self):
+        p = plan(target_language="ja", native_language="en")
+        self.assertEqual(p.target_language, "ja")
+        self.assertEqual(p.native_language, "en")
+
+
 class TestPreflight(unittest.TestCase):
     def test_summary_states_the_note_count_and_reset(self):
         text = plan(ConversionMode.NEW_DECK).preflight().as_text()
@@ -124,24 +147,6 @@ class TestPreflight(unittest.TestCase):
 
     def test_media_cleanup_is_reported_as_off_by_default(self):
         self.assertIn("nothing deleted", plan().preflight().as_text())
-
-
-class TestPlanCarriesAnyMapping(unittest.TestCase):
-    """Planning is language-agnostic too -- a two-field deck plans fine."""
-
-    def test_minimal_deck(self):
-        mapping = simple_mapping(
-            ["Front", "Back"], {Role.TARGET_TERM: "Front", Role.NATIVE_TERM: "Back"}
-        )
-        p = build_plan(
-            mode=ConversionMode.NEW_DECK,
-            mapping=mapping,
-            source_notetype="Basic",
-            source_deck="Spanish",
-            note_ids=[1, 2, 3],
-        )
-        self.assertTrue(p.validate().ok)
-        self.assertEqual(p.preflight().note_count, 3)
 
 
 if __name__ == "__main__":

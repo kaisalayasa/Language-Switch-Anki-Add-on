@@ -8,10 +8,14 @@ means this module only ever reports a language *per field*; deciding which detec
 is Target (front, being studied) vs Native (back, already known) is a pedagogical/directional
 choice only a human can make, and is deliberately left to the UI layer, not decided here.
 
-Unlike ``role_schema.py``/``template_generator.py``, this module is *not* required to be
+Unlike ``audio_fields.py``/``deck_state.py``, this module is *not* required to be
 language-agnostic (see ``tests/test_purity.py``) -- naming real languages is its entire job.
 It does still avoid ``anki``/``aqt`` imports, like the rest of ``core/``, so it stays testable
 with stock Python.
+
+Its main consumer today is ``addon/llm/direction.py``, not a UI mapper -- see that module's
+docstring for why direction/target/native-language decisions moved out of a human-in-the-loop
+UI step and into a deterministic computation the LLM prompt is simply given.
 
 ``langdetect`` is vendored (see ``addon/vendor/README.md``) rather than pip-installed, since
 Anki addons run inside Anki's own bundled interpreter with no ``pip`` at runtime, and

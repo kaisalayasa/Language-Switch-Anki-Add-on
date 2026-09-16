@@ -1,8 +1,8 @@
 """Enforce the structural promises made in claude.md.
 
 1. ``addon/core/`` never imports anki or aqt, so it stays unit-testable with stock Python.
-2. ``role_schema`` and ``template_generator`` contain no language name, no script name and
-   no deck-specific field name -- all of that belongs in profile JSON.
+2. ``audio_fields`` and ``deck_state`` contain no language name, no script name and no
+   deck-specific field name -- languages are opaque values callers pass in, never named here.
 3. ``addon/tts/`` never imports anki or aqt either (M2) -- same reasoning as ``core/``: the
    binary/voice managers and the sanitizer should be testable without a running Anki process,
    and the only Anki-facing bridge is ``addon/ui/piper_test_dialog.py``.
@@ -68,15 +68,15 @@ class TestNoLanguageKnowledge(unittest.TestCase):
         "vocabulary-", "sentence-", "core 2000", "core2000",
     ]
 
-    # The one permitted exception: "furigana" names an Anki *template filter*, and appears
-    # only in prose explaining that filters are opaque strings supplied by the profile.
-    #
-    # ``audio_fields.py`` is held to the same bar even though it is the one module that
-    # matches on a field name at all. What it matches is the name *it* chose, which is why
-    # that name must stay free of any language: it is written into real collections, and a
-    # deck converted to one language must still be recognised after being re-converted to
-    # another. ``role_detect.py`` is deliberately absent -- naming languages is its job.
-    PURE_MODULES = ["audio_fields.py", "role_schema.py", "template_generator.py", "deck_state.py"]
+    # ``audio_fields.py`` matches on a field name -- but the one it chose itself
+    # (GENERATED_AUDIO_FIELD), not one that came from a deck, which is why that name must
+    # stay free of any language: it is written into real collections, and a deck converted
+    # to one language must still be recognised after being re-converted to another.
+    # ``deck_state.py`` is held to the same bar for the same reason -- its tag/css marker are
+    # also written into real collections and read back regardless of which languages a given
+    # conversion involved. ``addon/llm/`` is deliberately exempt -- naming languages is its
+    # job (see ``addon/llm/__init__.py``).
+    PURE_MODULES = ["audio_fields.py", "deck_state.py"]
 
     def test_pure_modules_are_language_agnostic(self):
         for name, source in _core_sources():
@@ -92,28 +92,6 @@ class TestNoLanguageKnowledge(unittest.TestCase):
                         "knowledge belongs in a profile, not in the pure layer"
                         % (name, term, hits),
                     )
-
-    def test_furigana_appears_only_as_an_example_filter_name(self):
-        """Guard the exception so it cannot silently widen into real logic."""
-        for name, source in _core_sources():
-            if name not in self.PURE_MODULES:
-                continue
-            for lineno, line in enumerate(source.splitlines(), 1):
-                if "furigana" not in line.lower():
-                    continue
-                stripped = line.strip()
-                is_comment_or_doc = (
-                    stripped.startswith("#")
-                    or stripped.startswith("*")
-                    or '"""' in source[: source.find(line)].rsplit("\n", 1)[0]
-                )
-                with self.subTest(module=name, line=lineno):
-                    self.assertTrue(
-                        is_comment_or_doc or stripped.startswith("``"),
-                        "addon/core/%s:%d uses 'furigana' outside prose: %s"
-                        % (name, lineno, stripped),
-                    )
-
 
 if __name__ == "__main__":
     unittest.main()

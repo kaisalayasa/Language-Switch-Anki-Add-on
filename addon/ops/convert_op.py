@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any, Callable, Optional, Tuple
 
 from ..core.conversion import ConversionPlan
-from ..core.template_generator import GeneratedTemplates
+from ..core.deck_state import append_css_marker
 from .notetype_manager import ConversionResult, apply_plan
 
 __all__ = ["run_conversion", "convert_op"]
@@ -23,7 +23,6 @@ __all__ = ["run_conversion", "convert_op"]
 def run_conversion(
     col: Any,
     plan: ConversionPlan,
-    templates: GeneratedTemplates,
     *,
     expected_note_count: Optional[int] = None,
 ) -> Tuple[ConversionResult, Any]:
@@ -43,13 +42,14 @@ def run_conversion(
 
     Safe to call off the Qt main thread: it touches no widgets.
     """
+    css = append_css_marker(plan.css, plan.target_language, plan.native_language)
     result = apply_plan(
         col,
         plan,
-        front=templates.front_html,
-        back=templates.back_html,
-        css=templates.css,
-        template_name=templates.template_name,
+        front=plan.front,
+        back=plan.back,
+        css=css,
+        template_name=plan.template_name,
         expected_note_count=expected_note_count,
     )
     return result, result.op_changes
@@ -58,7 +58,6 @@ def run_conversion(
 def convert_op(
     parent: Any,
     plan: ConversionPlan,
-    templates: GeneratedTemplates,
     *,
     expected_note_count: Optional[int] = None,
     on_success: Optional[Callable[[ConversionResult], None]] = None,
@@ -73,9 +72,7 @@ def convert_op(
     holder: dict = {}
 
     def _op(col):
-        result, changes = run_conversion(
-            col, plan, templates, expected_note_count=expected_note_count
-        )
+        result, changes = run_conversion(col, plan, expected_note_count=expected_note_count)
         holder["result"] = result
         return changes
 

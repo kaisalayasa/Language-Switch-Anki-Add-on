@@ -1,28 +1,34 @@
-"""Batch-generate Piper TTS audio into real notes (M5).
+"""Batch-generate Piper TTS audio into real notes.
 
-Connects M2's standalone, already-proven Piper pipeline (``addon/tts/``) to real notes for
-the first time. The ``TARGET_AUDIO``/``TARGET_SENTENCE_AUDIO`` template blocks have existed
-since M1 (deliberately left unreferenced -- ``TemplateOptions.include_audio=False`` --
-until this module could actually fill the fields they point at).
+Connects the LLM overhaul's ``analyze_deck()`` result to real notes: the model already decided
+which field to speak (``DeckAnalysis.speak_text_from``) and which empty field to write audio
+into (``DeckAnalysis.audio_field_name``, always ``core.audio_fields.GENERATED_AUDIO_FIELD``)
+at conversion time, so this module's only job is running Piper over that one source field for
+every note that still needs it.
+
+The old ``finish_audio_batch`` step -- flipping the template to reference audio fields only
+once a whole batch had finished -- no longer exists. It existed because the previous template
+generator only started referencing an audio field once ``TemplateOptions.include_audio`` was
+turned on, which created a real hazard: a partial run could flip the switch for notes it hadn't
+reached yet, which still held their *original* audio. The model now writes
+``{{#ddc-audio}}{{ddc-audio}}{{/ddc-audio}}`` directly into the front at conversion time --
+the field starts empty and renders as nothing until TTS actually fills it, so there is no
+switch left to flip and no window in which the wrong audio could play.
 
 Every note-processing function here takes an injected ``provider`` (a
 :class:`~addon.tts.provider_base.TTSProvider`), so this module is unit-testable against
-``tests/fake_collection.py`` exactly the way ``notetype_manager.py`` already is -- no real
-Anki, no real Piper, in the test suite.
+``tests/fake_collection.py`` -- no real Anki, no real Piper, in the test suite.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from ..core.audio_fields import AUDIO_DONE_TAG
-from ..core.role_schema import AUDIO_SOURCE_ROLES, RoleMapping
-from ..core.template_generator import TemplateOptions, generate_templates
 from ..tts.piper_provider import EmptyTextError
 from ..tts.provider_base import TTSProvider
-from .notetype_manager import shape_notetype
 
 __all__ = [
     "AUDIO_DONE_TAG",
@@ -32,20 +38,15 @@ __all__ = [
     "generate_note_audio",
     "plan_note_audio",
     "apply_note_audio",
-    "finish_audio_batch",
 ]
-
-# AUDIO_DONE_TAG is defined in core.audio_fields (imported above) and re-exported here,
-# where it has always been imported from. It moved so the conversion layer can strip it off
-# duplicated notes without ops/ importing ops/ in a circle.
 
 
 @dataclass
 class NoteAudioResult:
     note_id: int
     fields_written: List[str] = field(default_factory=list)
-    #: Audio fields that had nothing to synthesize -- the source field was empty, or held
-    #: only characters the chosen voice cannot speak. Counted and reported rather than
+    #: Set when the source field sanitized to nothing to synthesize -- empty on this note, or
+    #: held only characters the chosen voice cannot speak. Counted and reported rather than
     #: passed over in silence: a whole run of these looks exactly like success (no errors,
     #: finishes fast) while producing no audio whatsoever, which is a confusing way to
     #: discover a voice/deck mismatch.
@@ -84,58 +85,54 @@ def notes_needing_audio(col: Any, notetype_name: str, *, force: bool = False) ->
 def generate_note_audio(
     col: Any,
     note: Any,
-    mapping: RoleMapping,
     provider: TTSProvider,
     voice_id: str,
+    *,
+    audio_field: str,
+    source_field: str,
 ) -> NoteAudioResult:
-    """(Re)synthesize and write every audio field this mapping's roles call for.
+    """(Re)synthesize ``source_field``'s text into ``audio_field`` for one note.
 
-    A source field that sanitizes to empty text (:class:`EmptyTextError`) is skipped for
-    that field only -- not every note has a sentence. Any other synthesis failure aborts
+    A source field that sanitizes to empty text (:class:`EmptyTextError`) is skipped -- not
+    every note necessarily has content in that field. Any other synthesis failure aborts
     *this note only*: it's reported, left untagged, and retried on the next run rather than
     aborting the whole batch over one bad note.
     """
     result = NoteAudioResult(note_id=note.id)
 
-    for audio_role, source_role in AUDIO_SOURCE_ROLES.items():
-        audio_field = mapping.first(audio_role)
-        source_field = mapping.first(source_role)
-        if audio_field is None or source_field is None:
-            continue
-        try:
-            text = note[source_field.name]
-        except (KeyError, IndexError, ValueError):
-            continue
+    try:
+        text = note[source_field]
+    except (KeyError, IndexError, ValueError):
+        return result
 
-        try:
-            wav_path = provider.synthesize(text, voice_id=voice_id)
-        except EmptyTextError:
-            result.skipped.append(audio_field.name)
-            continue
-        except Exception as exc:  # noqa: BLE001 -- one note's failure must not sink the batch
-            result.error = "%s: %s" % (type(exc).__name__, exc)
-            return result
+    try:
+        wav_path = provider.synthesize(text, voice_id=voice_id)
+    except EmptyTextError:
+        result.skipped.append(audio_field)
+        return result
+    except Exception as exc:  # noqa: BLE001 -- one note's failure must not sink the batch
+        result.error = "%s: %s" % (type(exc).__name__, exc)
+        return result
 
-        filename = col.media.add_file(str(wav_path))
-        note[audio_field.name] = "[sound:%s]" % filename
-        result.fields_written.append(audio_field.name)
+    filename = col.media.add_file(str(wav_path))
+    note[audio_field] = "[sound:%s]" % filename
+    result.fields_written.append(audio_field)
 
-    if result.changed:
-        if AUDIO_DONE_TAG not in note.tags:
-            note.tags.append(AUDIO_DONE_TAG)
-        col.update_note(note)
+    if AUDIO_DONE_TAG not in note.tags:
+        note.tags.append(AUDIO_DONE_TAG)
+    col.update_note(note)
     return result
 
 
 @dataclass(frozen=True)
 class PendingSynthesis:
-    """One audio field a note still needs, with the raw source text to speak."""
+    """The one audio field a note still needs, with the raw source text to speak."""
 
     audio_field: str
     text: str
 
 
-def plan_note_audio(note: Any, mapping: RoleMapping) -> List[PendingSynthesis]:
+def plan_note_audio(note: Any, *, audio_field: str, source_field: str) -> List[PendingSynthesis]:
     """The read-only half of :func:`generate_note_audio`: what needs (re)synthesizing for
     this note, without calling a provider or writing anything.
 
@@ -144,21 +141,14 @@ def plan_note_audio(note: Any, mapping: RoleMapping) -> List[PendingSynthesis]:
     touch no shared state -- while still writing every result back into the collection one
     note at a time via :func:`apply_note_audio`, on whichever single thread owns ``col``.
     Anki's collection is not documented as safe for concurrent access from multiple Python
-    threads, so nothing here or in a caller may call a ``col``/``note`` method from more
-    than one thread at once.
+    threads, so nothing here or in a caller may call a ``col``/``note`` method from more than
+    one thread at once.
     """
-    pending: List[PendingSynthesis] = []
-    for audio_role, source_role in AUDIO_SOURCE_ROLES.items():
-        audio_field = mapping.first(audio_role)
-        source_field = mapping.first(source_role)
-        if audio_field is None or source_field is None:
-            continue
-        try:
-            text = note[source_field.name]
-        except (KeyError, IndexError, ValueError):
-            continue
-        pending.append(PendingSynthesis(audio_field.name, text))
-    return pending
+    try:
+        text = note[source_field]
+    except (KeyError, IndexError, ValueError):
+        return []
+    return [PendingSynthesis(audio_field, text)]
 
 
 def apply_note_audio(
@@ -172,9 +162,9 @@ def apply_note_audio(
     """The write-only half of :func:`generate_note_audio`: writes already-synthesized
     ``(audio_field_name, wav_path)`` pairs into ``note``, atomically, exactly like it does.
 
-    Pass ``error`` for a hard synthesis failure (anything but "nothing to say") -- nothing
-    is written and the note is left untagged, so it's retried on the next run, matching
-    "one bad note must not sink the batch, but must not be falsely marked done either."
+    Pass ``error`` for a hard synthesis failure (anything but "nothing to say") -- nothing is
+    written and the note is left untagged, so it's retried on the next run, matching "one bad
+    note must not sink the batch, but must not be falsely marked done either."
     """
     result = NoteAudioResult(note_id=note.id, skipped=list(skipped or []))
     if error is not None:
@@ -189,39 +179,3 @@ def apply_note_audio(
             note.tags.append(AUDIO_DONE_TAG)
         col.update_note(note)
     return result
-
-
-def finish_audio_batch(
-    col: Any,
-    clone_notetype: Dict[str, Any],
-    mapping: RoleMapping,
-    *,
-    source_css: str,
-    options: TemplateOptions,
-) -> None:
-    """Flip the clone's template to actually reference the now-populated audio fields.
-
-    A one-time, end-of-batch schema change -- not per note. Audio fields can be silently
-    filled in for the whole batch while the template still doesn't reference them; this is
-    what turns that on. ``options.include_audio`` should already be ``True`` -- this
-    function does not set it, since the caller also controls ``audio_on_front`` and
-    ``include_unmapped``, which should match whatever the original conversion used.
-
-    Reuses :func:`~addon.ops.notetype_manager.shape_notetype` with the clone's own name (so
-    it updates the existing notetype rather than creating a new one) instead of duplicating
-    template-writing logic. ``shape_notetype`` always sets ``id = 0`` -- correct for the
-    fresh-clone case it was built for (a not-yet-added notetype), wrong here: this is an
-    *update* to an existing notetype, so the real id is restored before saving. Getting this
-    backwards would silently update/create the wrong notetype.
-    """
-    templates = generate_templates(mapping, source_css=source_css, options=options)
-    shaped = shape_notetype(
-        clone_notetype,
-        name=clone_notetype["name"],
-        front=templates.front_html,
-        back=templates.back_html,
-        css=templates.css,
-        template_name=options.template_name,
-    )
-    shaped["id"] = clone_notetype["id"]
-    col.models.update_dict(shaped)

@@ -1,5 +1,12 @@
-"""Batch TTS generation (M5), against ``FakeCollection`` and an injected fake provider --
-no real Anki, no real Piper.
+"""Batch TTS generation, against ``FakeCollection`` and an injected fake provider -- no real
+Anki, no real Piper.
+
+There is exactly one audio field and one source field per notetype now -- the model decides
+both once, at conversion time (``DeckAnalysis.audio_field_name``/``speak_text_from``), so
+there is no per-role loop here any more the way the old ``AUDIO_SOURCE_ROLES`` design had.
+There is also no ``finish_audio_batch`` step: the model already writes a bare reference to the
+audio field into the front template it produces, and that field starts empty, so there is
+nothing left to "turn on" once a batch finishes.
 """
 
 from __future__ import annotations
@@ -8,12 +15,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from addon.core.role_schema import FieldBinding, Role, RoleMapping
-from addon.core.template_generator import TemplateOptions
 from addon.ops.tts_batch import (
     AUDIO_DONE_TAG,
     apply_note_audio,
-    finish_audio_batch,
     generate_note_audio,
     notes_needing_audio,
     plan_note_audio,
@@ -22,7 +26,9 @@ from addon.tts.piper_provider import EmptyTextError
 
 from tests.fake_collection import FakeCollection
 
-FIELDS = ["Word", "Meaning", "Sentence", "Audio", "SentenceAudio"]
+FIELDS = ["Word", "Meaning", "Audio"]
+AUDIO_FIELD = "Audio"
+SOURCE_FIELD = "Word"
 VOICE_ID = "en_US-lessac-medium"
 
 
@@ -51,65 +57,58 @@ def make_collection():
     return col, nt, deck
 
 
-def make_mapping():
-    fields = [FieldBinding(n, i) for i, n in enumerate(FIELDS)]
-    mapping = RoleMapping(notetype_name="Clone", fields=fields)
-    mapping.bind(Role.TARGET_TERM, fields[0])
-    mapping.bind(Role.NATIVE_TERM, fields[1])
-    mapping.bind(Role.TARGET_SENTENCE, fields[2])
-    mapping.bind(Role.TARGET_AUDIO, fields[3])
-    mapping.bind(Role.TARGET_SENTENCE_AUDIO, fields[4])
-    return mapping
-
-
 class TestGenerateNoteAudio(unittest.TestCase):
-    def test_writes_both_audio_fields_and_tags_the_note(self):
+    def test_writes_the_audio_field_and_tags_the_note(self):
         col, nt, deck = make_collection()
-        note = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
+        note = col.seed_note(nt, deck, ["hello", "bonjour", ""])
         provider = FakeProvider()
 
-        result = generate_note_audio(col, note, make_mapping(), provider, VOICE_ID)
-
-        self.assertTrue(result.ok)
-        self.assertEqual(set(result.fields_written), {"Audio", "SentenceAudio"})
-        self.assertTrue(note["Audio"].startswith("[sound:"))
-        self.assertTrue(note["SentenceAudio"].startswith("[sound:"))
-        self.assertIn(AUDIO_DONE_TAG, note.tags)
-        self.assertEqual(sorted(provider.calls), ["hello", "hello there"])
-
-    def test_empty_sentence_skips_only_that_field(self):
-        col, nt, deck = make_collection()
-        note = col.seed_note(nt, deck, ["hello", "bonjour", "", "", ""])
-        provider = FakeProvider()
-
-        result = generate_note_audio(col, note, make_mapping(), provider, VOICE_ID)
+        result = generate_note_audio(
+            col, note, provider, VOICE_ID, audio_field=AUDIO_FIELD, source_field=SOURCE_FIELD
+        )
 
         self.assertTrue(result.ok)
         self.assertEqual(result.fields_written, ["Audio"])
-        self.assertEqual(note["SentenceAudio"], "")
+        self.assertTrue(note["Audio"].startswith("[sound:"))
         self.assertIn(AUDIO_DONE_TAG, note.tags)
+        self.assertEqual(provider.calls, ["hello"])
+
+    def test_empty_source_field_is_skipped_not_an_error(self):
+        col, nt, deck = make_collection()
+        note = col.seed_note(nt, deck, ["", "bonjour", ""])
+        provider = FakeProvider()
+
+        result = generate_note_audio(
+            col, note, provider, VOICE_ID, audio_field=AUDIO_FIELD, source_field=SOURCE_FIELD
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.fields_written, [])
+        self.assertEqual(result.skipped, ["Audio"])
+        self.assertEqual(note["Audio"], "")
+        self.assertNotIn(AUDIO_DONE_TAG, note.tags)
 
     def test_synthesis_failure_leaves_note_untagged_and_unwritten(self):
         col, nt, deck = make_collection()
-        note = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
+        note = col.seed_note(nt, deck, ["hello", "bonjour", ""])
         provider = FakeProvider(fail_for=["hello"])
 
-        result = generate_note_audio(col, note, make_mapping(), provider, VOICE_ID)
+        result = generate_note_audio(
+            col, note, provider, VOICE_ID, audio_field=AUDIO_FIELD, source_field=SOURCE_FIELD
+        )
 
         self.assertFalse(result.ok)
         self.assertIn("synthesis exploded", result.error)
         self.assertNotIn(AUDIO_DONE_TAG, note.tags)
         self.assertEqual(note["Audio"], "", "must not write a partial/wrong result")
 
-    def test_unbound_audio_role_is_left_alone(self):
+    def test_a_source_field_that_does_not_exist_on_the_note_is_left_alone(self):
         col, nt, deck = make_collection()
-        note = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
-        fields = [FieldBinding(n, i) for i, n in enumerate(FIELDS)]
-        mapping = RoleMapping(notetype_name="Clone", fields=fields)
-        mapping.bind(Role.TARGET_TERM, fields[0])
-        # No audio roles bound at all.
+        note = col.seed_note(nt, deck, ["hello", "bonjour", ""])
 
-        result = generate_note_audio(col, note, mapping, FakeProvider(), VOICE_ID)
+        result = generate_note_audio(
+            col, note, FakeProvider(), VOICE_ID, audio_field=AUDIO_FIELD, source_field="Nonexistent"
+        )
 
         self.assertTrue(result.ok)
         self.assertEqual(result.fields_written, [])
@@ -138,43 +137,38 @@ class TestPlanAndApplyNoteAudio(unittest.TestCase):
     (only ``provider.synthesize`` -- pure, no ``col``) while keeping every ``col``/``note``
     call on one thread. Composing them must reproduce ``generate_note_audio`` exactly."""
 
-    def test_plan_lists_every_bound_audio_role_with_its_raw_source_text(self):
+    def test_plan_lists_the_source_text_for_the_audio_field(self):
         col, nt, deck = make_collection()
-        note = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
+        note = col.seed_note(nt, deck, ["hello", "bonjour", ""])
 
-        pending = plan_note_audio(note, make_mapping())
+        pending = plan_note_audio(note, audio_field=AUDIO_FIELD, source_field=SOURCE_FIELD)
 
-        self.assertEqual(
-            sorted((p.audio_field, p.text) for p in pending),
-            sorted([("Audio", "hello"), ("SentenceAudio", "hello there")]),
-        )
+        self.assertEqual([(p.audio_field, p.text) for p in pending], [("Audio", "hello")])
 
     def test_plan_includes_empty_source_text_unfiltered(self):
         """Skipping empty text is the provider's job (``EmptyTextError``), not the plan's --
         the plan is purely descriptive of what's bound."""
         col, nt, deck = make_collection()
-        note = col.seed_note(nt, deck, ["hello", "bonjour", "", "", ""])
+        note = col.seed_note(nt, deck, ["", "bonjour", ""])
 
-        pending = plan_note_audio(note, make_mapping())
+        pending = plan_note_audio(note, audio_field=AUDIO_FIELD, source_field=SOURCE_FIELD)
 
-        self.assertIn(("SentenceAudio", ""), [(p.audio_field, p.text) for p in pending])
+        self.assertEqual([(p.audio_field, p.text) for p in pending], [("Audio", "")])
 
-    def test_apply_writes_fields_and_tags_like_generate_note_audio(self):
+    def test_apply_writes_the_field_and_tags_like_generate_note_audio(self):
         col, nt, deck = make_collection()
-        note = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
+        note = col.seed_note(nt, deck, ["hello", "bonjour", ""])
 
-        result = apply_note_audio(
-            col, note, [("Audio", Path("/tmp/a.wav")), ("SentenceAudio", Path("/tmp/b.wav"))]
-        )
+        result = apply_note_audio(col, note, [("Audio", Path("/tmp/a.wav"))])
 
         self.assertTrue(result.ok)
-        self.assertEqual(set(result.fields_written), {"Audio", "SentenceAudio"})
+        self.assertEqual(result.fields_written, ["Audio"])
         self.assertTrue(note["Audio"].startswith("[sound:"))
         self.assertIn(AUDIO_DONE_TAG, note.tags)
 
     def test_apply_with_error_writes_nothing_and_leaves_note_untagged(self):
         col, nt, deck = make_collection()
-        note = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
+        note = col.seed_note(nt, deck, ["hello", "bonjour", ""])
 
         result = apply_note_audio(col, note, [], error="RuntimeError: synthesis exploded")
 
@@ -184,13 +178,14 @@ class TestPlanAndApplyNoteAudio(unittest.TestCase):
 
     def test_plan_then_apply_matches_generate_note_audio_on_the_same_note(self):
         col, nt, deck = make_collection()
-        a = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
-        b = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
-        mapping = make_mapping()
+        a = col.seed_note(nt, deck, ["hello", "bonjour", ""])
+        b = col.seed_note(nt, deck, ["hello", "bonjour", ""])
 
-        sequential = generate_note_audio(col, a, mapping, FakeProvider(), VOICE_ID)
+        sequential = generate_note_audio(
+            col, a, FakeProvider(), VOICE_ID, audio_field=AUDIO_FIELD, source_field=SOURCE_FIELD
+        )
 
-        pending = plan_note_audio(b, mapping)
+        pending = plan_note_audio(b, audio_field=AUDIO_FIELD, source_field=SOURCE_FIELD)
         synthesized, error = _synth_all(pending, FakeProvider(), VOICE_ID)
         split = apply_note_audio(col, b, synthesized, error=error)
 
@@ -200,13 +195,15 @@ class TestPlanAndApplyNoteAudio(unittest.TestCase):
 
     def test_plan_then_apply_matches_generate_note_audio_on_hard_failure(self):
         col, nt, deck = make_collection()
-        a = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
-        b = col.seed_note(nt, deck, ["hello", "bonjour", "hello there", "", ""])
-        mapping = make_mapping()
+        a = col.seed_note(nt, deck, ["hello", "bonjour", ""])
+        b = col.seed_note(nt, deck, ["hello", "bonjour", ""])
 
-        sequential = generate_note_audio(col, a, mapping, FakeProvider(fail_for=["hello"]), VOICE_ID)
+        sequential = generate_note_audio(
+            col, a, FakeProvider(fail_for=["hello"]), VOICE_ID,
+            audio_field=AUDIO_FIELD, source_field=SOURCE_FIELD,
+        )
 
-        pending = plan_note_audio(b, mapping)
+        pending = plan_note_audio(b, audio_field=AUDIO_FIELD, source_field=SOURCE_FIELD)
         synthesized, error = _synth_all(pending, FakeProvider(fail_for=["hello"]), VOICE_ID)
         split = apply_note_audio(col, b, synthesized or [], error=error)
 
@@ -219,23 +216,26 @@ class TestPlanAndApplyNoteAudio(unittest.TestCase):
 class TestNotesNeedingAudio(unittest.TestCase):
     def test_second_run_skips_already_tagged_notes(self):
         col, nt, deck = make_collection()
-        a = col.seed_note(nt, deck, ["hello", "bonjour", "", "", ""])
-        b = col.seed_note(nt, deck, ["goodbye", "au revoir", "", "", ""])
-        mapping = make_mapping()
+        a = col.seed_note(nt, deck, ["hello", "bonjour", ""])
+        b = col.seed_note(nt, deck, ["goodbye", "au revoir", ""])
         provider = FakeProvider()
 
         pending = notes_needing_audio(col, "Clone")
         self.assertEqual(sorted(pending), sorted([a.id, b.id]))
 
-        generate_note_audio(col, a, mapping, provider, VOICE_ID)
+        generate_note_audio(
+            col, a, provider, VOICE_ID, audio_field=AUDIO_FIELD, source_field=SOURCE_FIELD
+        )
 
         pending_after = notes_needing_audio(col, "Clone")
         self.assertEqual(pending_after, [b.id])
 
     def test_force_reprocesses_already_tagged_notes(self):
         col, nt, deck = make_collection()
-        note = col.seed_note(nt, deck, ["hello", "bonjour", "", "", ""])
-        generate_note_audio(col, note, make_mapping(), FakeProvider(), VOICE_ID)
+        note = col.seed_note(nt, deck, ["hello", "bonjour", ""])
+        generate_note_audio(
+            col, note, FakeProvider(), VOICE_ID, audio_field=AUDIO_FIELD, source_field=SOURCE_FIELD
+        )
 
         self.assertEqual(notes_needing_audio(col, "Clone"), [])
         self.assertEqual(notes_needing_audio(col, "Clone", force=True), [note.id])
@@ -243,24 +243,9 @@ class TestNotesNeedingAudio(unittest.TestCase):
     def test_scoped_by_notetype_only_not_deck(self):
         col, nt, deck = make_collection()
         other_deck = col.add_deck("Elsewhere")
-        col.seed_note(nt, deck, ["a", "b", "", "", ""])
-        col.seed_note(nt, other_deck, ["c", "d", "", "", ""])
+        col.seed_note(nt, deck, ["a", "b", ""])
+        col.seed_note(nt, other_deck, ["c", "d", ""])
         self.assertEqual(len(notes_needing_audio(col, "Clone")), 2)
-
-
-class TestFinishAudioBatch(unittest.TestCase):
-    def test_flips_include_audio_on_without_losing_other_content(self):
-        col, nt, deck = make_collection()
-        mapping = make_mapping()
-        options = TemplateOptions(include_audio=True, template_name="Production")
-
-        finish_audio_batch(col, nt, mapping, source_css=".card{color:red}", options=options)
-
-        updated = col.models.by_name("Clone")
-        self.assertIn("Audio", updated["tmpls"][0]["afmt"] + updated["tmpls"][0]["qfmt"])
-        self.assertIn("color:red", updated["css"])
-        self.assertEqual(updated["tmpls"][0]["name"], "Production")
-        self.assertEqual(len(updated["tmpls"]), 1)
 
 
 if __name__ == "__main__":
