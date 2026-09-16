@@ -70,6 +70,14 @@ class TestDirectionIsWiredIn(unittest.TestCase):
         self.assertEqual(result.target_language, "es")
         self.assertEqual(result.native_language, "en")
 
+    def test_the_given_field_placement_is_exposed_not_just_used_internally(self):
+        """A UI showing "what was decided" needs the given placement itself, not just
+        whatever fields happen to appear in the model's returned HTML -- those can
+        legitimately differ (e.g. an omitted bookkeeping field)."""
+        result, _ = _analyze([_GOOD_RESPONSE])
+        self.assertEqual(result.new_front_fields, ("Word",))
+        self.assertEqual(result.new_back_fields, ("Translation",))
+
 
 class TestTrustStars(unittest.TestCase):
     def test_clean_pass_on_first_attempt_is_five_stars_with_no_review_message(self):

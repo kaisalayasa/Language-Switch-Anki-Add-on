@@ -10,7 +10,11 @@ notes, duplicating notes, resetting scheduling) can be exercised without a real 
 from __future__ import annotations
 
 import itertools
+from collections import namedtuple
 from typing import Any, Dict, List, Optional, Sequence
+
+#: Matches the shape of real Anki's NotetypeNameId/DeckNameId -- a plain .id/.name pair.
+_NameId = namedtuple("_NameId", ["id", "name"])
 
 
 class FakeNote:
@@ -71,6 +75,9 @@ class FakeModels:
             if nt["name"] == name:
                 return nt
         return None
+
+    def all_names_and_ids(self) -> List[_NameId]:
+        return [_NameId(nt["id"], nt["name"]) for nt in self.col.notetypes.values()]
 
     def ensure_name_unique(self, notetype: dict) -> None:
         """Matches real Anki: mutates ``notetype["name"]`` in place, returns nothing.
@@ -160,6 +167,9 @@ class FakeDecks:
     def id_for_name(self, name: str) -> Optional[int]:
         deck = self.by_name(name)
         return deck["id"] if deck else None
+
+    def all_names_and_ids(self) -> List[_NameId]:
+        return [_NameId(d["id"], d["name"]) for d in self.col.decks_by_id.values()]
 
 
 class FakeSched:

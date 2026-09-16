@@ -2,12 +2,17 @@
 few real sample values per field for each.
 
 Relocated out of the old ``ui/convert_dialog.py``, where these lived as private helpers for
-the now-deleted role-mapping dialog -- the new ``ui/main_screen.py`` needs the same raw data,
-just to build an ``llm.analyze.analyze_deck()`` call instead of a role mapping. Upgraded along
-the way to take ``col`` explicitly rather than importing ``mw`` at module scope, matching every
-other file in ``ops/`` -- these are pure reads, and doing it this way makes them callable
-against ``tests/fake_collection.py`` like the rest of this layer, not only against a running
-Anki process.
+the now-deleted role-mapping dialog -- ``ui/main_screen.py`` needs the same raw data, just to
+build an ``llm.analyze.analyze_deck()`` call instead of a role mapping. Upgraded along the way
+to take ``col`` explicitly rather than importing ``mw`` at module scope, matching every other
+file in ``ops/`` -- these are pure reads, and doing it this way makes them callable against
+``tests/fake_collection.py`` like the rest of this layer, not only against a running Anki
+process.
+
+The old ``collect_samples`` (an HTML-stripped, sanitized version used for a per-field sample
+column in the now-deleted role-mapping field list) has no caller in the new design and was
+removed rather than kept unused -- the only surviving consumer of note-field samples is
+``collect_field_samples``, feeding the model directly.
 """
 
 from __future__ import annotations
@@ -15,12 +20,10 @@ from __future__ import annotations
 from typing import Any, Dict, List, Sequence, Tuple
 
 from ..llm.prompt import FieldSample
-from ..tts.sanitize import sanitize_text
 
 __all__ = [
     "addon_config",
     "decks_with_notetypes",
-    "collect_samples",
     "collect_raw_samples",
     "collect_field_samples",
 ]
@@ -56,39 +59,13 @@ def decks_with_notetypes(col: Any) -> List[Tuple[str, str, int]]:
     return sorted(out, key=lambda row: (-row[2], row[0]))
 
 
-def collect_samples(
-    col: Any, note_ids: Sequence[int], *, limit_per_field: int = 3, max_len: int = 60
-) -> Dict[str, List[str]]:
-    """A few real, HTML-stripped sample values per field, for display in a UI list.
-
-    Field names lie (see CLAUDE.md's "Field names are untrusted input"), so showing what a
-    field actually *contains* is the only way a human can make sense of it at a glance.
-    Reuses the TTS sanitizer in strip-markup-only mode (``allowed_ranges=()``) rather than
-    writing a second HTML stripper for display purposes.
-    """
-    samples: Dict[str, List[str]] = {}
-    for nid in note_ids:
-        note = col.get_note(nid)
-        for name in note.keys():
-            bucket = samples.setdefault(name, [])
-            if len(bucket) >= limit_per_field:
-                continue
-            value = sanitize_text(note[name], allowed_ranges=())[:max_len]
-            if value:
-                bucket.append(value)
-    return samples
-
-
 def collect_raw_samples(
     col: Any, note_ids: Sequence[int], *, limit_per_field: int = 8, max_len: int = 400
 ) -> Dict[str, List[str]]:
-    """Unsanitized per-field samples, keeping markup (``[sound:...]``, HTML) intact.
-
-    Unlike :func:`collect_samples` (the HTML-stripped version used for display), this is for
-    anything that needs to see a field's real content verbatim -- ``llm.prompt`` and
-    ``llm.direction`` both need to see whether ``[sound:...]`` is present before it's stripped
-    for display. Blank values are kept (not skipped) so the bucket's length reflects notes
-    actually scanned.
+    """Unsanitized per-field samples, keeping markup (``[sound:...]``, HTML) intact --
+    ``llm.prompt`` and ``llm.direction`` both need to see whether ``[sound:...]`` is present
+    before either strips it for display or detection. Blank values are kept (not skipped) so
+    the bucket's length reflects notes actually scanned.
     """
     samples: Dict[str, List[str]] = {}
     for nid in note_ids:

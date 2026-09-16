@@ -61,6 +61,12 @@ class DeckAnalysis:
     target_language: str
     native_language: str
     audio_field_name: str
+    #: The given field placement direction.py computed -- not re-derived from the returned
+    #: front/back HTML, so this stays accurate even when the model dropped a field the
+    #: placement allowed it to omit (e.g. a bookkeeping field), which a UI showing "what was
+    #: decided" should still reflect faithfully.
+    new_front_fields: Tuple[str, ...]
+    new_back_fields: Tuple[str, ...]
     trust_stars: int
     attempts_used: int
     unresolved_problems: Tuple[ValidationProblem, ...]
@@ -147,6 +153,8 @@ def analyze_deck(
                 target_language=direction.target_language,
                 native_language=direction.native_language,
                 audio_field_name=audio_field_name,
+                new_front_fields=direction.new_front_fields,
+                new_back_fields=direction.new_back_fields,
                 trust_stars=stars,
                 attempts_used=attempt,
                 unresolved_problems=(),
@@ -166,6 +174,8 @@ def analyze_deck(
         target_language=direction.target_language,
         native_language=direction.native_language,
         audio_field_name=audio_field_name,
+        new_front_fields=direction.new_front_fields,
+        new_back_fields=direction.new_back_fields,
         trust_stars=1,
         attempts_used=max_attempts,
         unresolved_problems=tuple(problems),
