@@ -3,15 +3,13 @@ schema-invalidation rule, and writing the ``core.deck_state`` css marker.
 
 Before this file existed, only the inner ``apply_plan`` was tested directly -- which bypasses
 the undo-entry wrapping entirely. That gap is exactly how a "target undo op not found" bug sat
-latent in both real conversion modes (not just the Preview feature, where it was first
-noticed) until these tests were written. See ``docs/api-notes.md``.
+latent until these tests were written. See ``docs/api-notes.md``.
 """
 
 from __future__ import annotations
 
 import unittest
 
-from addon.core.conversion import ConversionMode
 from addon.core.deck_state import state_from_css
 from addon.ops.convert_op import run_conversion
 
@@ -21,25 +19,19 @@ from tests.test_notetype_manager import make_collection, make_plan
 
 class TestRunConversionDoesNotHitTheUndoTrap(unittest.TestCase):
     """The actual regression: this used to raise ``RuntimeError: target undo op not
-    found`` on every real (non-dry) run, in both modes, because the undo marker was set
-    before ``apply_plan``'s schema-changing ``build_clone`` call.
+    found`` on every real (non-dry) run, because the undo marker was set before
+    ``apply_plan``'s schema-changing ``build_clone`` call.
     """
 
-    def test_new_deck_mode_does_not_raise(self):
+    def test_does_not_raise(self):
         col, _src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK)
-        result, _changes = run_conversion(col, plan)
-        self.assertEqual(result.notes_converted, 5)
-
-    def test_flip_in_place_mode_does_not_raise(self):
-        col, _src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.FLIP_IN_PLACE)
+        plan = make_plan(col)
         result, _changes = run_conversion(col, plan)
         self.assertEqual(result.notes_converted, 5)
 
     def test_dry_run_still_writes_nothing(self):
         col, _src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK)
+        plan = make_plan(col)
         plan.dry_run = True
         before = len(col.notetypes)
         result, changes = run_conversion(col, plan)
@@ -66,24 +58,12 @@ class TestUndoEntryNeverSpansASchemaChange(unittest.TestCase):
             col.merge_undo_entries(token)
 
     def test_apply_plan_places_the_marker_after_build_clone(self):
-        """The specific ordering fix: for new-deck mode, the marker must be set after
-        ``build_clone`` (schema change) and before ``_new_deck`` (pure data).
-        """
+        """The specific ordering fix: the marker must be set after ``build_clone`` (schema
+        change) and before ``_new_deck`` (pure data)."""
         col, _src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK)
+        plan = make_plan(col)
         result, _ = run_conversion(col, plan)
         self.assertIsNotNone(result.clone_notetype_id)
-
-    def test_apply_plan_places_the_marker_after_change_notetype_of_notes(self):
-        """For flip-in-place mode, ``change_notetype_of_notes`` is treated as schema-level
-        too (see FakeModels.change_notetype_of_notes), so the marker must be set after it,
-        not merely after ``build_clone``.
-        """
-        col, _src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.FLIP_IN_PLACE)
-        result, _ = run_conversion(col, plan)
-        for nid in plan.note_ids:
-            self.assertEqual(col.notes[nid].mid, result.clone_notetype_id)
 
 
 class TestOpChangesFlowsThroughForCollectionOp(unittest.TestCase):
@@ -93,13 +73,13 @@ class TestOpChangesFlowsThroughForCollectionOp(unittest.TestCase):
 
     def test_op_changes_is_populated_on_a_real_run(self):
         col, _src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK)
+        plan = make_plan(col)
         result, changes = run_conversion(col, plan)
         self.assertIs(changes, result.op_changes)
 
     def test_op_changes_is_none_for_a_dry_run(self):
         col, _src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK)
+        plan = make_plan(col)
         plan.dry_run = True
         result, changes = run_conversion(col, plan)
         self.assertIsNone(changes)
@@ -112,7 +92,7 @@ class TestConversionCssMarkerIsWritten(unittest.TestCase):
 
     def test_the_clones_css_carries_the_marker(self):
         col, _src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK, target_language="es", native_language="en")
+        plan = make_plan(col, target_language="es", native_language="en")
         result, _changes = run_conversion(col, plan)
         clone = col.models.by_name(result.clone_notetype_name)
         state = state_from_css(clone["css"])
@@ -122,14 +102,14 @@ class TestConversionCssMarkerIsWritten(unittest.TestCase):
 
     def test_the_original_css_content_is_preserved_alongside_the_marker(self):
         col, _src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK, css=".card { color: White; }")
+        plan = make_plan(col, css=".card { color: White; }")
         result, _changes = run_conversion(col, plan)
         clone = col.models.by_name(result.clone_notetype_name)
         self.assertIn(".card { color: White; }", clone["css"])
 
     def test_a_dry_run_writes_no_marker_anywhere(self):
         col, _src, _ = make_collection()
-        plan = make_plan(col, ConversionMode.NEW_DECK)
+        plan = make_plan(col)
         plan.dry_run = True
         run_conversion(col, plan)
         for nt in col.notetypes.values():

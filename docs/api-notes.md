@@ -137,11 +137,11 @@ This was first noticed via the "Preview card…" flow (an earlier fix moved that
 `CollectionOp`, which was a real improvement on its own merits but **did not address this**
 — the marker was still being set before the notetype write). Investigating properly turned
 up that the **exact same bug was latent in the real Apply flow** (`apply_plan` in
-`notetype_manager.py`), in both conversion modes, via `run_conversion` in
-`convert_op.py` — it had simply not been exercised by a real (non-dry) run yet.
-`tests/test_convert_op.py` (previously nonexistent — only the inner `apply_plan` was
-tested, which bypasses the undo wrapping entirely) now covers `run_conversion` directly
-in both modes.
+`notetype_manager.py`), in both conversion modes that existed at the time (Flip-in-place
+was later removed entirely — see below), via `run_conversion` in `convert_op.py` — it had
+simply not been exercised by a real (non-dry) run yet. `tests/test_convert_op.py`
+(previously nonexistent — only the inner `apply_plan` was tested, which bypasses the undo
+wrapping entirely) now covers `run_conversion` directly.
 
 **The fix, applied everywhere `add_custom_undo_entry`/`merge_undo_entries` is used in this
 addon:** the marker may only span calls that are *not* notetype-schema-level.
@@ -151,17 +151,18 @@ addon:** the marker may only span calls that are *not* notetype-schema-level.
   `col.sched.schedule_cards_as_new` — not schema-level (deck creation has never required a
   full resync, unlike notetype changes), safe to wrap.
 
-Concretely: `apply_plan` now creates the clone (schema change) *before* setting the marker,
-and for Flip-in-place also runs `change_notetype_of_notes` (also schema change) *before*
-setting the marker; only the scheduling reset (and, in New-deck mode, the note
-duplication) sit inside the wrapped span. `ConvertDialog._preview` was restructured the
-same way: `ensure_preview_scaffold` (schema change) runs unwrapped, then the marker is set,
-then `write_preview_note` (pure data) is wrapped.
+Concretely: `apply_plan` now creates the clone (schema change) *before* setting the marker;
+only the scheduling reset and the note duplication sit inside the wrapped span.
+`ConvertDialog._preview` was restructured the same way: `ensure_preview_scaffold` (schema
+change) runs unwrapped, then the marker is set, then `write_preview_note` (pure data) is
+wrapped. (At the time this was written there was also a Flip-in-place mode, which ran
+`change_notetype_of_notes` -- also a schema change -- before setting its own marker the
+same way. That mode has since been removed entirely; see `core/conversion.py`'s module
+docstring.)
 
-**Consequence for the UI:** a conversion is no longer a single undo step. It's two (New
-deck) or three (Flip in place) separate ones — see `apply_plan`'s comments for exactly
-where the boundaries fall. `claude.md` §8 has been corrected to state this rather than
-promise single-keystroke undo.
+**Consequence for the UI:** a conversion is no longer a single undo step. It's two separate
+ones — see `apply_plan`'s comments for exactly where the boundary falls. `claude.md` §8 has
+been corrected to state this rather than promise single-keystroke undo.
 
 `tests/fake_collection.py` now simulates this: `add_dict`/`update_dict`/
 `change_notetype_of_notes` bump a `_schema_generation` counter, and
@@ -210,28 +211,74 @@ looks for. Rather than chase the exact flag, `main_screen.py` now calls
 `MainScreen._refresh_anki_main_window`), since `deckBrowser.refresh` is stable/long-standing
 but not worth a hard crash if a future build ever renames it.
 
-## The `text:` field modifier (audio-safety enforcement)
+## The `text:` field modifier — CORRECTED: does not strip `[sound:...]`, confirmed against real source
 
-`{{text:Field}}` strips special references (sound, images) and HTML from a field's rendered
-value. This addon force-rewrites any bare or differently-filtered reference to a field with
-known pre-existing audio into this form — see `llm/audio_safety.py`'s `enforce_audio_safety`.
+**This section originally claimed `{{text:Field}}` strips special references including sound —
+that claim was never independently verified (see the original text preserved below) and turned
+out to be wrong.** Confirmed by reading the actual `ankitects/anki` Rust source (`rslib/src/
+template_filters.rs`, `rslib/src/text.rs`, `rslib/src/card_rendering/mod.rs`) during a real
+Anki bug investigation (2026-09-17), not guessed:
 
-**Superseded home, same underlying fact:** this used to be owned by the deleted role-mapping
-system's `core/role_detect.py` (`_filter_for`, applied selectively per field during role
-detection). The LLM overhaul moved the same mechanism to `llm/audio_safety.py`, where it's
-applied uniformly and deterministically to whatever the model wrote, regardless of what the
-model itself referenced or how — see `CLAUDE.md`'s "LOCAL LLM DECK ANALYSIS" section.
+- `{{text:Field}}` compiles to exactly `"text" => strip_html(text)`.
+- `strip_html`'s regex is `(<!--.*?-->)|(<style.*?>.*?</style>)|(<script.*?>.*?</script>)|(<.*?>)`
+  — HTML tags/comments/style/script blocks only. It never matches `[sound:...]`, which is
+  Anki's own bracket notation, not HTML syntax.
+- A *different* function, `html_to_text_line` (used for things like the browser's preview
+  column, not template rendering), does strip `[sound:...]` first via `SOUND_TAG.replace_all()`
+  — but `{{text:Field}}` does not call it. The two are easy to conflate; only one is what the
+  `text:` template filter actually runs.
+- Separately, `extract_av_tags` (`rslib/src/card_rendering/mod.rs`) is what decides what
+  autoplays. It runs on the *fully rendered* card text, after all field filters have already
+  applied, and finds `[sound:...]`/`[anki:tts...]` patterns by plain regex match — completely
+  unconditional, with no awareness of what filter referenced the field or what HTML/CSS
+  surrounds it.
+- The complete Anki template filter list was checked for anything that does strip
+  `[sound:...]`: `text`, `furigana`/`kanji`/`kana`, `cloze`/`cloze-only`, `type`/`type-cloze`/
+  `type-nc`, `hint`, `tts`. None of them do.
 
-**This is core Anki template syntax, not a Python/aqt API** — documented, long-standing,
-part of the template-rendering language itself rather than something that has shifted across
-`aqt`/`anki` releases the way Python method signatures have (see the traps below). It was not
-independently re-verified against a real running Anki 26.08.1 instance; confirmed only by
-documentation and by the reproduction in `tests/test_llm_audio_safety.py`. **Verify it
-visually** the first time a mixed-field deck (the German test deck, `"Hund [sound:hund.mp3]"`
-in one field) goes through the live preview: the term should render as plain text with no
-leftover play icon for its own original-language audio. If `{{text:Field}}` behaves
-differently than documented on this build, that would show up immediately there, before any
-real note is touched.
+**Consequence:** `llm/audio_safety.py`'s `enforce_audio_safety` (force a sound-bearing field's
+reference into `{{text:Field}}`) never actually prevented that field's audio from autoplaying —
+it only stripped incidental HTML formatting, which was never the real risk. This was the root
+cause of two real bugs (the original deck's audio still playing on a converted card, and hiding
+an audio field via the "Hide fields" panel silencing its play button but not the sound). The
+real fix moved to the data layer instead: `ops/notetype_manager.py`'s
+`_strip_pre_existing_audio` removes `[sound:...]` from every field's value while it's copied
+onto the clone, unconditionally, so there's nothing left for any template filter to fail to
+suppress. See `CLAUDE.md`'s "NOTETYPE CLONING / SAFE APPLY" → "Audio" section and `TODO.md` for
+the full writeup, including why this also required removing the "Flip in place" mode (it never
+duplicated notes, so it had no copy step to strip audio during).
+
+`enforce_audio_safety` itself is still in the code and still harmless (rewriting a reference to
+`{{text:Field}}` doesn't hurt anything), but it is no longer load-bearing for audio safety.
+
+<details>
+<summary>Original text (2026-09, before the correction above) — kept for the record</summary>
+
+> `{{text:Field}}` strips special references (sound, images) and HTML from a field's rendered
+> value. This addon force-rewrites any bare or differently-filtered reference to a field with
+> known pre-existing audio into this form — see `llm/audio_safety.py`'s `enforce_audio_safety`.
+>
+> **Superseded home, same underlying fact:** this used to be owned by the deleted role-mapping
+> system's `core/role_detect.py` (`_filter_for`, applied selectively per field during role
+> detection). The LLM overhaul moved the same mechanism to `llm/audio_safety.py`, where it's
+> applied uniformly and deterministically to whatever the model wrote, regardless of what the
+> model itself referenced or how — see `CLAUDE.md`'s "LOCAL LLM DECK ANALYSIS" section.
+>
+> **This is core Anki template syntax, not a Python/aqt API** — documented, long-standing,
+> part of the template-rendering language itself rather than something that has shifted across
+> `aqt`/`anki` releases the way Python method signatures have (see the traps below). It was not
+> independently re-verified against a real running Anki 26.08.1 instance; confirmed only by
+> documentation and by the reproduction in `tests/test_llm_audio_safety.py`. **Verify it
+> visually** the first time a mixed-field deck (the German test deck, `"Hund [sound:hund.mp3]"`
+> in one field) goes through the live preview: the term should render as plain text with no
+> leftover play icon for its own original-language audio. If `{{text:Field}}` behaves
+> differently than documented on this build, that would show up immediately there, before any
+> real note is touched.
+
+That last line turned out to be exactly right, in the end — it just took a real bug report to
+actually check it.
+
+</details>
 
 ## Adding fields to the clone (generated audio fields)
 
@@ -261,26 +308,19 @@ names get onto the saved notetype is unchanged by that history.
   the `id` would make the new field indistinguishable from the one it was copied from.
   `col.models.add_field` is deliberately **not** used: it's documented as operating on a
   notetype, and appending to `flds` ourselves needs no assumption about its signature.
-- Fields are **appended after** the source's own fields, never inserted among them. This
-  is what keeps the Flip-in-place field map correct under either reading: matched by
-  *name*, the appended names exist only on the clone and match nothing; matched by
-  *position*, their ords are past the end of the source's field list, so there's nothing
-  there either. Inserting them next to their sibling audio field would shift every later
-  field by one and make the positional reading silently wrong.
+- Fields are **appended after** the source's own fields, never inserted among them, so every
+  original field keeps its own ord and the new one(s) are easy to spot at a glance in Anki's
+  field-list editor. (This ordering used to also matter for a since-removed "Flip in place"
+  mode's positional field map -- that mode is gone, so this is now purely a legibility choice,
+  not a correctness requirement, but there's no reason to insert among the source fields
+  either.)
 - `build_clone` verifies the fields are actually present on the saved notetype and raises
   `ApiMismatch` naming them if not — the generated templates reference them, so a silent
   drop would leave every card rendering a dangling `{{Field}}`.
 
-**To confirm on the first real run** (both fail loudly rather than corrupt anything):
+**To confirm on the first real run** (fails loudly rather than corrupts anything):
 
-1. **Flip-in-place with an added field.** New-deck mode is unaffected (notes are built
-   fresh from the clone and the new field is simply left empty, which is covered by
-   `tests/test_notetype_manager.py::TestGeneratedAudioFieldsAreCreatedOnTheClone`). Flip in
-   place goes through `change_notetype_of_notes` with Anki's own prefilled map, and the
-   appended-at-the-end reasoning above is a *deduction* from how such a map can be built,
-   not something verified against this build. Check that converting in Flip-in-place mode
-   leaves every original field's content intact on the notes.
-2. **A generated field name can contain a space** whenever the source field's own name does
+1. **A generated field name can contain a space** whenever the source field's own name does
    (e.g. `ddc-audio-Example Sentence`), which is ordinary for Anki field names and renders as
    `{{ddc-audio-Example Sentence}}` / `{{#ddc-audio-Example Sentence}}` — no character
    `generated_audio_field_name` produces is special to the template parser, and no forbidden

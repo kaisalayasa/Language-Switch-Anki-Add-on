@@ -8,14 +8,16 @@ newly-fronted language using [Piper](https://github.com/rhasspy/piper), locally 
 Both models run entirely on-device — nothing about a deck's content, or how it gets converted,
 is ever sent anywhere.
 
-**Status:** the core pipeline — Analyze, Convert (both modes), Generate TTS audio, live preview
-(including right after Analyze and before Convert), reopening an already-converted deck to
-generate more audio without a fresh AI call, and hiding/showing individual fields without
-touching HTML — is built, covered by 316 unit tests (`python -m unittest discover -s tests -t .`,
-no Anki or network required), and confirmed working end-to-end against a real Anki profile. One
-known item is still open, tracked in [`TODO.md`](TODO.md): a placement-compliance check
-`llm/validate.py` doesn't yet make (one specific test deck is occasionally flaky on direction).
-License (MIT vs. GPL) is still an open, deliberately deferred decision — see Milestones below.
+**Status:** the core pipeline — Analyze, Convert, Generate TTS audio, live preview (including
+right after Analyze and before Convert), reopening an already-converted deck to generate more
+audio without a fresh AI call, and hiding/showing individual fields without touching HTML — is
+built, covered by 308 unit tests (`python -m unittest discover -s tests -t .`, no Anki or
+network required), and confirmed working end-to-end against a real Anki profile, including a
+real fix for the original deck's own audio playing on the converted card (see "How a conversion
+writes" below). One known item is still open, tracked in [`TODO.md`](TODO.md): a
+placement-compliance check `llm/validate.py` doesn't yet make (one specific test deck is
+occasionally flaky on direction). License (MIT vs. GPL) is still an open, deliberately deferred
+decision — see Milestones below.
 
 ## Why a local LLM instead of a hand-written mapping system
 
@@ -35,16 +37,26 @@ failed all four identically (see `docs/llm-notes.md` and `CLAUDE.md`'s "LOCAL LL
 section for the full account) — it's an abstraction the model reliably gets right, wrapped
 around a reasoning task it reliably does not.
 
-## The two modes
+## How a conversion writes: always a new deck
 
-| | What happens | Original deck |
-|---|---|---|
-| **New deck** (default) | Clones the notetype, rewrites the template, **duplicates** the notes into a brand-new deck | untouched |
-| **Flip in place** | Clones the notetype, rewrites the template, **repoints** the existing notes onto the clone | its cards are replaced |
+A conversion clones the notetype, writes the AI's generated templates onto the clone, and
+**duplicates** the notes onto it into a brand-new deck. The original deck, notetype, and notes
+are always 100% untouched.
 
-Scheduling is **always** reset, in both modes. The old interval and ease describe a skill —
-recognition in the original direction — that was never practised in the new direction, so
-carrying it over would be actively misleading.
+**There used to be a second mode, "Flip in place"** (repoint the existing notes onto the clone
+instead, replacing their current cards) — removed. It was cut once a real audio-safety fix (see
+below) came to depend on every note being duplicated: the only reliable way to guarantee a
+note's own pre-existing audio can never survive onto the converted card is to strip
+`[sound:...]` out of every field's value while copying it — which needs a fresh copy to write
+the stripped value into. Flip in place never created one, and giving it the same guarantee would
+have meant rewriting the literal content of the user's real, existing notes in place — a bigger,
+more sensitive kind of change than anything else this addon does. Rather than ship that, or ship
+one mode safe and the other not, it was cut. See `docs/api-notes.md` for why the mechanism the
+old design leaned on (`{{text:Field}}`) never actually worked for this in the first place.
+
+Scheduling is **always** reset. The old interval and ease describe a skill — recognition in the
+original direction — that was never practised in the new direction, so carrying it over would
+be actively misleading.
 
 A conversion's real writes (the clone, the notes, the scheduling reset) always happen before
 Anki's own undo-grouping step, which is why a `merge_undo_entries` hiccup there (Anki's
@@ -52,7 +64,7 @@ Anki's own undo-grouping step, which is why a `merge_undo_entries` hiccup there 
 same-tick retry instead of being reported as a failed conversion — see `apply_plan` in
 `notetype_manager.py` and `docs/api-notes.md` for the full writeup.
 
-The original **notetype object** is never modified in either mode.
+The original **notetype object** is never modified.
 
 ## Design rules
 
@@ -68,9 +80,12 @@ The original **notetype object** is never modified in either mode.
 - **Direction, language, and audio-field placement are computed, never asked of the model or
   the user.** `llm/direction.py`'s `resolve_direction` is the single source of truth; see
   `CLAUDE.md` for why.
-- **A deck's pre-existing audio can never play on the converted card.** Enforced deterministically
-  (`llm/audio_safety.py`) on the model's output regardless of what it actually wrote — see
-  `CLAUDE.md`'s "LOCAL LLM DECK ANALYSIS" section.
+- **A deck's pre-existing audio can never play on the converted card.** Enforced at the data
+  level: every field's value has `[sound:...]` stripped out while it's copied onto the clone
+  (`ops/notetype_manager.py`'s `_strip_pre_existing_audio`), unconditionally, regardless of what
+  the AI's template ends up referencing or how. `{{text:Field}}` was tried first and doesn't
+  actually work for this — see `CLAUDE.md`'s "NOTETYPE CLONING / SAFE APPLY" → "Audio" section
+  for why, confirmed against real Anki source.
 - **Refuse rather than misalign.** If a plan's field names disagree with the live notetype, or
   a schema-level Anki call returns something this addon doesn't recognise, the run stops
   (`ApiMismatch`) instead of writing the wrong content into every note.
@@ -119,9 +134,10 @@ exactly as originally planned.)
 
 ### The single screen, top to bottom
 
-1. **Pick a (deck, notetype) pair and a mode** (New deck / Flip in place — see above). Pairs are
-   read live from the collection (`ops/deck_data.decks_with_notetypes`), scoped by both deck and
-   notetype since either alone can be ambiguous.
+1. **Pick a (deck, notetype) pair.** Pairs are read live from the collection
+   (`ops/deck_data.decks_with_notetypes`), scoped by both deck and notetype since either alone
+   can be ambiguous. There's no mode to choose any more — every conversion duplicates onto a new
+   deck (see above).
 2. **Analyze** — sends a handful of real sample notes (`ops/deck_data.collect_field_samples`,
    capped to match what the prompt actually uses) plus the current templates to the local model
    and gets back a `DeckAnalysis`: a plain-language description, the finished Front/Back/CSS, the
@@ -150,16 +166,24 @@ exactly as originally planned.)
    converted card's back, something the original card never did.
    **Hide fields** — a third left-pane mode, next to "HTML", for turning an already-placed field's
    display on or off without touching HTML at all: a checkbox list of exactly the fields currently
-   referenced on the Front/Back (`llm/field_visibility.py`'s `visible_fields`), split by side.
-   Unchecking one wraps its `{{Field}}` reference in a small, reversible `<span class="ddc-hidden">`
-   (paired with one `display: none` CSS rule, the same technique the real Core 2000 CSS already
-   uses for its own `.ios-only`/`.mac-only` toggles) — the field's data and its surrounding markup
-   are untouched, only whether it renders changes, and re-checking the box restores the exact
-   original HTML. A field the deck never showed in the first place (per the paragraph above) isn't
-   listed — there's nothing to toggle for a field that was never part of the card.
+   referenced (or currently hidden) on the Front/Back (`llm/field_visibility.py`'s
+   `visible_fields`), split by side. Unchecking one **removes its reference from the HTML
+   entirely**, replacing it with an inert marker comment (`<!--ddc-hidden:Field:filter-->`) that
+   records the field name and its original filter — nothing is left behind to render, no wrapper
+   element, no CSS class — and re-checking the box restores the exact original reference, byte
+   for byte, in the same place. This is purely a *display* toggle, safe for any field including
+   one that might carry audio: the actual guarantee against playing pre-existing audio lives one
+   step earlier, in the copy every note goes through at Convert time (see "How a conversion
+   writes" above), not in how a field happens to be hidden afterward — an earlier version of this
+   feature instead wrapped the reference in a `display: none` span, which only hid the play
+   *button*, not the sound (Anki decides what to autoplay by scanning the rendered text,
+   independent of CSS/DOM); once the real fix moved to the data itself, there was no reason left
+   to keep a wrapper around instead of just removing the reference. A field the deck never showed
+   in the first place (per the paragraph above) isn't listed — there's nothing to toggle for a
+   field that was never part of the card.
 4. **Convert** — writes the reviewed templates via a clone-notetype flow (`ops/notetype_manager`,
-   `ops/convert_op`) in the chosen mode, always resetting scheduling, and records the conversion
-   (`core/deck_state`) so this pair is recognised as converted from now on.
+   `ops/convert_op`), duplicating the notes onto a new deck and always resetting scheduling, and
+   records the conversion (`core/deck_state`) so this pair is recognised as converted from now on.
 5. **Generate TTS audio** — batch-synthesizes audio for every field `llm/direction.py` decided
    needs it (usually two per note: a word/term and a full sentence, each into its own field —
    never one shared field) via Piper, with visible progress and a real Stop button, resumable

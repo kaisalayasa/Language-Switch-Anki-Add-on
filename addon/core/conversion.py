@@ -1,19 +1,26 @@
 """Conversion planning -- what a run *will* do, decided before anything is written.
 
-Pure and Anki-free, so the risky decisions (which notes are in scope, which mode is safe,
-what gets destroyed) are unit-testable without a collection. ``addon/ops/notetype_manager``
-executes a plan; it does not decide one.
+Pure and Anki-free, so the risky decisions (which notes are in scope, what gets written) are
+unit-testable without a collection. ``addon/ops/notetype_manager`` executes a plan; it does not
+decide one.
 
-Two modes, per ``claude.md``:
+A conversion always **duplicates** the notes onto a clone in a brand-new deck. The original
+deck, notetype and notes are untouched. Scheduling is reset on the new cards, unconditionally.
 
-``FLIP_IN_PLACE``
-    Clone the notetype, rewrite its template, then **repoint** the existing notes onto the
-    clone. The original-direction cards are replaced.
-``NEW_DECK``
-    Clone the notetype, rewrite its template, then **duplicate** the notes onto the clone
-    in a brand-new deck. The original deck, notetype and notes are untouched.
-
-Scheduling is reset in both modes, unconditionally.
+**There used to be a second mode, Flip in place** (repoint the existing notes onto the clone
+instead of duplicating them, replacing their current cards). It was removed once a real
+audio-safety fix depended on duplication happening unconditionally: the only way to guarantee a
+note's *own* pre-existing audio can never survive onto the converted card is to strip
+``[sound:...]`` out of every field's value while copying it onto the clone (see
+``ops/notetype_manager.py``'s ``_copy_fields_by_name``) -- which requires a fresh copy to write
+the stripped value into. Flip in place never created one; achieving the same guarantee there
+would have meant rewriting the literal content of the user's real, existing notes in place, a
+categorically bigger and more sensitive operation than anything else this addon does (every
+other write is additive -- new fields, a scheduling reset, a notetype change -- never a rewrite
+of a field's existing text). Rather than ship that, or ship an asymmetric guarantee where one
+mode is safe and the other isn't, Flip in place was cut. See ``docs/api-notes.md`` for the full
+history of why ``{{text:Field}}`` (Flip in place's only real card in this game) never actually
+worked for this: it only strips HTML tags, not ``[sound:...]``.
 
 A plan carries plain ``front``/``back``/``css`` strings rather than a role mapping -- the LLM
 overhaul's model produces finished template HTML directly (see ``addon/llm/analyze.py``'s
@@ -27,11 +34,9 @@ way would make a cycle. The caller (``ui/main_screen.py``) unpacks a ``DeckAnaly
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import List, Optional
 
 __all__ = [
-    "ConversionMode",
     "ConversionPlan",
     "PreflightSummary",
     "ValidationError",
@@ -58,23 +63,6 @@ class ValidationResult:
     def raise_if_failed(self) -> None:
         if self.errors:
             raise ValidationError("; ".join(self.errors))
-
-
-class ConversionMode(Enum):
-    FLIP_IN_PLACE = "flip_in_place"
-    NEW_DECK = "new_deck"
-
-    @property
-    def is_destructive(self) -> bool:
-        """True when the run changes the notes the user already has."""
-        return self is ConversionMode.FLIP_IN_PLACE
-
-    @property
-    def label(self) -> str:
-        return {
-            ConversionMode.FLIP_IN_PLACE: "Flip in place",
-            ConversionMode.NEW_DECK: "New deck (non-destructive)",
-        }[self]
 
 
 def escape_search_term(value: str) -> str:
@@ -110,42 +98,28 @@ def scope_query(notetype_name: str, deck_name: str) -> str:
 class PreflightSummary:
     """Exactly what the user is agreeing to. Nothing is written before this is shown."""
 
-    mode: ConversionMode
     source_notetype: str
     source_deck: str
     clone_notetype: str
     target_deck: str
     note_count: int
     scheduling_will_reset: bool = True
-    media_cleanup: bool = False
     new_fields: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
     def lines(self) -> List[str]:
         out = [
-            "Mode:              %s" % self.mode.label,
             "Source notetype:   %s" % self.source_notetype,
             "Source deck:       %s" % self.source_deck,
             "Notes in scope:    %d" % self.note_count,
             "New notetype:      %s" % self.clone_notetype,
             "Cards land in:     %s" % self.target_deck,
+            "Effect:            %d copies are created; the original deck, notetype "
+            "and notes are untouched" % self.note_count,
         ]
-        if self.mode is ConversionMode.FLIP_IN_PLACE:
-            out.append(
-                "Effect:            the %d existing notes move onto the new notetype; "
-                "their current cards are replaced" % self.note_count
-            )
-        else:
-            out.append(
-                "Effect:            %d copies are created; the original deck, notetype "
-                "and notes are untouched" % self.note_count
-            )
         out.append(
             "Scheduling:        %s"
             % ("WILL BE RESET (all cards become new)" if self.scheduling_will_reset else "kept")
-        )
-        out.append(
-            "Media cleanup:     %s" % ("yes" if self.media_cleanup else "no (nothing deleted)")
         )
         if self.new_fields:
             out.append(
@@ -164,7 +138,6 @@ class PreflightSummary:
 
 @dataclass
 class ConversionPlan:
-    mode: ConversionMode
     front: str
     back: str
     css: str
@@ -181,7 +154,6 @@ class ConversionPlan:
     note_ids: List[int] = field(default_factory=list)
     strip_tags: List[str] = field(default_factory=lambda: ["leech"])
     reset_scheduling: bool = True
-    media_cleanup: bool = False
     dry_run: bool = False
     #: Field names to add to the clone that the source notetype does not have -- in practice
     #: the audio field generated TTS is written into, per ``core.audio_fields``. Appended
@@ -209,17 +181,10 @@ class ConversionPlan:
                 "the new notetype must not reuse the source's name (%r) -- the original "
                 "notetype is never modified" % self.source_notetype
             )
-        if self.mode is ConversionMode.NEW_DECK:
-            if self.target_deck == self.source_deck:
-                result.errors.append(
-                    "new-deck mode must write to a different deck than %r"
-                    % self.source_deck
-                )
-            if self.media_cleanup:
-                result.errors.append(
-                    "media cleanup must never run in new-deck mode: the original notes "
-                    "still reference those files"
-                )
+        if self.target_deck == self.source_deck:
+            result.errors.append(
+                "the conversion must write to a different deck than %r" % self.source_deck
+            )
         if not self.reset_scheduling:
             result.errors.append(
                 "scheduling reset is not optional -- the old review history describes a "
@@ -231,14 +196,12 @@ class ConversionPlan:
 
     def preflight(self, warnings: Optional[List[str]] = None) -> PreflightSummary:
         summary = PreflightSummary(
-            mode=self.mode,
             source_notetype=self.source_notetype,
             source_deck=self.source_deck,
             clone_notetype=self.clone_notetype,
             target_deck=self.target_deck,
             note_count=len(self.note_ids),
             scheduling_will_reset=self.reset_scheduling,
-            media_cleanup=self.media_cleanup,
             new_fields=list(self.new_fields),
         )
         summary.warnings.extend(self.validate().warnings)
@@ -248,7 +211,6 @@ class ConversionPlan:
 
 def build_plan(
     *,
-    mode: ConversionMode,
     front: str,
     back: str,
     css: str,
@@ -268,12 +230,8 @@ def build_plan(
     ``suffix`` is caller-supplied so no language name is baked in here.
     """
     clone = clone_notetype or "%s (%s)" % (source_notetype, suffix)
-    if mode is ConversionMode.NEW_DECK:
-        deck = target_deck or "%s (%s)" % (source_deck, suffix)
-    else:
-        deck = target_deck or source_deck
+    deck = target_deck or "%s (%s)" % (source_deck, suffix)
     return ConversionPlan(
-        mode=mode,
         front=front,
         back=back,
         css=css,

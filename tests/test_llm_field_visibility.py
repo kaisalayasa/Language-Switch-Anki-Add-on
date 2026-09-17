@@ -7,8 +7,7 @@ from __future__ import annotations
 import unittest
 
 from addon.llm.field_visibility import (
-    HIDDEN_FIELD_CSS_CLASS,
-    ensure_hidden_field_css,
+    HIDDEN_MARKER_PREFIX,
     is_field_hidden,
     set_field_hidden,
     visible_fields,
@@ -39,10 +38,11 @@ class TestVisibleFields(unittest.TestCase):
         front_fields, back_fields = visible_fields("{{Word}}", "{{FrontSide}}")
         self.assertNotIn("Core-Index", front_fields + back_fields)
 
-    def test_an_already_hidden_field_still_appears_not_removed(self):
-        """Hiding wraps the reference, it doesn't delete it -- the checkbox must stay in the
-        list (just unchecked), not vanish once toggled off."""
-        front = '<div><span class="%s">{{Word}}</span></div>' % HIDDEN_FIELD_CSS_CLASS
+    def test_an_already_hidden_field_still_appears_not_removed_from_the_list(self):
+        """Hiding replaces the reference with a marker comment naming the field -- the
+        checkbox must stay in the list (just unchecked), not vanish once toggled off, or
+        there would be no way to show it again."""
+        front = set_field_hidden("<div>{{Word}}</div>", "Word", hidden=True)
         front_fields, _back = visible_fields(front, "{{FrontSide}}")
         self.assertEqual(front_fields, ("Word",))
 
@@ -51,31 +51,49 @@ class TestVisibleFields(unittest.TestCase):
 
 
 class TestSetFieldHidden(unittest.TestCase):
-    def test_hides_a_plain_reference(self):
+    def test_hiding_removes_the_reference_entirely(self):
+        """Not wrapped, not CSS-hidden -- actually gone, leaving only an inert marker comment
+        (see module docstring for why this is safe now that pre-existing audio is stripped
+        from note data at Convert time rather than suppressed per-reference here)."""
         html = '<div class="word">{{Word}}</div>'
         result = set_field_hidden(html, "Word", hidden=True)
         self.assertTrue(is_field_hidden(result, "Word"))
-        self.assertIn('<span class="%s">{{Word}}</span>' % HIDDEN_FIELD_CSS_CLASS, result)
+        self.assertNotIn("{{Word}}", result)
+        self.assertEqual(result, '<div class="word"><!--ddc-hidden:Word:--></div>')
 
-    def test_hides_a_filtered_reference(self):
-        html = '<div class="t">{{text:Vocabulary-Audio}}</div>'
-        result = set_field_hidden(html, "Vocabulary-Audio", hidden=True)
-        self.assertIn(
-            '<span class="%s">{{text:Vocabulary-Audio}}</span>' % HIDDEN_FIELD_CSS_CLASS, result
-        )
+    def test_hiding_leaves_no_span_or_css_class_reference_behind(self):
+        html = "{{Audio}}"
+        result = set_field_hidden(html, "Audio", hidden=True)
+        self.assertNotIn("<span", result)
+        self.assertNotIn("display", result)
 
-    def test_unhide_restores_the_exact_original_text(self):
+    def test_unhide_restores_a_bare_reference_exactly(self):
         html = '<div class="word">{{Word}}</div>'
         hidden = set_field_hidden(html, "Word", hidden=True)
         shown = set_field_hidden(hidden, "Word", hidden=False)
         self.assertEqual(shown, html)
 
-    def test_hiding_twice_does_not_nest_the_wrapper(self):
+    def test_unhide_restores_a_filtered_reference_exactly(self):
+        """The exact example that prompted this design: {{text:Audio}} in a div, hidden then
+        shown again, byte for byte."""
+        html = '<div class="audio">{{text:Audio}}</div>'
+        hidden = set_field_hidden(html, "Audio", hidden=True)
+        self.assertEqual(hidden, '<div class="audio"><!--ddc-hidden:Audio:text--></div>')
+        shown = set_field_hidden(hidden, "Audio", hidden=False)
+        self.assertEqual(shown, html)
+
+    def test_unhide_restores_a_non_text_filter_exactly(self):
+        html = "<div>{{furigana:Reading}}</div>"
+        hidden = set_field_hidden(html, "Reading", hidden=True)
+        shown = set_field_hidden(hidden, "Reading", hidden=False)
+        self.assertEqual(shown, html)
+
+    def test_hiding_twice_does_not_duplicate_or_lose_the_marker(self):
         html = "{{Word}}"
         once = set_field_hidden(html, "Word", hidden=True)
         twice = set_field_hidden(once, "Word", hidden=True)
         self.assertEqual(once, twice)
-        self.assertEqual(twice.count("ddc-hidden"), 1)
+        self.assertEqual(twice.count(HIDDEN_MARKER_PREFIX), 1)
 
     def test_unhiding_an_already_visible_field_is_a_no_op(self):
         html = "{{Word}}"
@@ -86,13 +104,13 @@ class TestSetFieldHidden(unittest.TestCase):
         result = set_field_hidden(html, "Word", hidden=True)
         self.assertIn("{{#Word}}", result)
         self.assertIn("{{/Word}}", result)
-        self.assertIn('<span class="%s">{{Word}}</span>' % HIDDEN_FIELD_CSS_CLASS, result)
+        self.assertIn("<!--%s:Word:-->" % HIDDEN_MARKER_PREFIX, result)
 
     def test_every_occurrence_is_toggled_together(self):
         """A field referenced more than once must not end up half-hidden."""
         html = "{{Kanji}} ... {{Kanji}} ... {{Kanji}}"
         result = set_field_hidden(html, "Kanji", hidden=True)
-        self.assertEqual(result.count(HIDDEN_FIELD_CSS_CLASS), 3)
+        self.assertEqual(result.count(HIDDEN_MARKER_PREFIX), 3)
         shown = set_field_hidden(result, "Kanji", hidden=False)
         self.assertEqual(shown, html)
 
@@ -101,25 +119,7 @@ class TestSetFieldHidden(unittest.TestCase):
         html = "{{Front}}{{FrontSide}}"
         result = set_field_hidden(html, "Front", hidden=True)
         self.assertIn("{{FrontSide}}", result)
-        self.assertNotIn(
-            '<span class="%s">{{FrontSide}}</span>' % HIDDEN_FIELD_CSS_CLASS, result
-        )
-
-
-class TestEnsureHiddenFieldCss(unittest.TestCase):
-    def test_appends_the_rule_when_missing(self):
-        result = ensure_hidden_field_css(".card { color: red; }")
-        self.assertIn(".%s { display: none; }" % HIDDEN_FIELD_CSS_CLASS, result)
-        self.assertIn(".card { color: red; }", result)
-
-    def test_idempotent_does_not_duplicate(self):
-        once = ensure_hidden_field_css(".card {}")
-        twice = ensure_hidden_field_css(once)
-        self.assertEqual(once, twice)
-
-    def test_empty_css_gets_just_the_rule(self):
-        result = ensure_hidden_field_css("")
-        self.assertEqual(result.strip(), ".%s { display: none; }" % HIDDEN_FIELD_CSS_CLASS)
+        self.assertFalse(is_field_hidden(result, "FrontSide"))
 
 
 if __name__ == "__main__":

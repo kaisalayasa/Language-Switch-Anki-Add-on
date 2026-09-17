@@ -77,9 +77,10 @@ proving ground, not the ceiling.
   model files, all from their respective public release hosts (GitHub
   releases, HuggingFace). Nothing else phones home. No telemetry.
 - Must never modify a user's original **notetype object** in place. Always
-  clone the notetype before touching templates. What happens to the *notes* is
-  a user-selected mode — see "NOTETYPE CLONING / SAFE APPLY" below.
-- **Scheduling is always reset** on the converted cards, in every mode. The
+  clone the notetype before touching templates. The notes are always
+  **duplicated** onto the clone, never repointed — see "NOTETYPE CLONING /
+  SAFE APPLY" below for why there is only ever one mode.
+- **Scheduling is always reset** on the converted cards. The
   old interval/ease data describes a skill (recognition in the original
   direction) the learner never practised in the new direction, so carrying it
   over would be actively wrong.
@@ -107,17 +108,14 @@ proving ground, not the ceiling.
 - A notetype dict has `["flds"]` (ordered list of field dicts w/ `name`,
   `ord`, etc.) and `["tmpls"]` (list of template dicts w/ `name`, `qfmt`,
   `afmt`, optional `did` deck override) and `["css"]`.
-- To move existing notes onto the clone: `col.models.change_notetype_info(
-  old_notetype_id=…, new_notetype_id=…)` returns a `ChangeNotetypeInfo` whose
-  `.input` is a prefilled `ChangeNotetypeRequest`; set its `note_ids` and pass
-  it to `col.models.change_notetype_of_notes(...)`.
-  **Because we clone, the field and template maps are identity maps** for
-  every field the source notetype already had — the clone preserves field
-  names, order and count, so 1:1 is the correct explicit map for those. The
-  one exception, now real rather than hypothetical: the clone also gets one
-  **new, appended** field per generated-audio target (see "NOTETYPE CLONING /
-  SAFE APPLY" → "Audio" below) — those have no counterpart on the source, so
-  they're simply left empty by the identity map, never part of it.
+- **Notes always reach the clone by duplication** (`col.new_note`/`add_note`,
+  copying field values by name — see "NOTETYPE CLONING / SAFE APPLY" below),
+  never by repointing the originals onto it. `col.models.change_notetype_info`/
+  `change_notetype_of_notes` (moving *existing* notes onto a different
+  notetype in place) is a real, confirmed-present Anki API — this addon used
+  it for an earlier "Flip in place" mode that has since been removed (see
+  "NOTETYPE CLONING / SAFE APPLY" for why) — but nothing in the current
+  codebase calls it any more.
 - **Resetting scheduling: `col.sched.schedule_cards_as_new(card_ids, restore_position,
   reset_counts, context)`.** Note `col.sched.forget_cards` does **not** exist on
   the collection in 26.08.1 — the name `forget_cards` only exists as the GUI
@@ -362,15 +360,31 @@ A user-facing, non-technical way to turn an already-*placed* field's display on 
 hand-editing the HTML at all — for a user who doesn't know Anki template syntax. Distinct from
 placement (`direction.py`, above): a field can legitimately belong on the back and still be
 something the user wants hidden (e.g. a bookkeeping field the AI judged worth "little visual
-weight" rather than omitting outright). Mechanism: wrap the field's rendering reference in
-`<span class="ddc-hidden">...</span>`, paired with one `display: none` CSS rule — the same
-technique real decks already use for their own conditional-display classes (Core 2000's
-`.ios-only`/`.mac-only`), so this is ordinary Anki template behavior, not a new mechanism. Fully
-reversible: un-hiding removes exactly that wrapper, so the HTML is never regenerated or lossy
-either direction. No separate hidden-state is tracked anywhere — the HTML itself is the source
-of truth, read back by `is_field_hidden`, the same "a fact recorded in the artifact itself, not
-a shadow flag" principle `core/deck_state.py` already uses for conversion state. `ui/main_screen.py`'s
-"Hide fields" panel is the only caller; it never touches a generated-audio field (that field's
+weight" rather than omitting outright). Mechanism: hiding a field **removes its rendering
+reference from the HTML entirely**, replacing it with an inert marker comment —
+`<!--ddc-hidden:Field:filter-->` — that records the field name and whatever filter (or none) the
+reference used, so showing it again restores the exact original reference, byte for byte, in the
+exact same place. Nothing is left behind to render — no wrapper element, no CSS rule — because a
+comment is inert HTML the browser never renders and Anki's own `{{...}}` substitution never
+touches (the marker contains no `{{`/`}}` characters).
+
+**This used to wrap the reference in `<span class="ddc-hidden">` instead, paired with a CSS
+`display: none` rule, and (briefly) also forced it through `{{text:Field}}`** under the mistaken
+belief that this was needed to stop a hidden audio-bearing field from autoplaying — see
+`docs/api-notes.md` for why `{{text:Field}}` never actually did that (confirmed against real
+Anki source: it only strips HTML tags, never `[sound:...]`, and Anki's `extract_av_tags` scans
+the fully-rendered text for `[sound:...]` regardless of what wraps it). That concern is now moot
+regardless of hide mechanism: pre-existing audio is stripped out of every field's *data* at
+Convert time (`ops/notetype_manager.py`'s `_strip_pre_existing_audio`), so by the time a
+converted card exists to hide fields on, no field's value has `[sound:...]` left in it to
+protect against — which is exactly why hiding could move to actually removing the markup,
+found in real use to be the cleaner, more obviously-correct behavior anyway (no empty wrapper
+elements or unused CSS classes left sitting in the generated template).
+
+No separate hidden-state is tracked anywhere — the HTML itself is the source of truth, read back
+by `is_field_hidden`, the same "a fact recorded in the artifact itself, not a shadow flag"
+principle `core/deck_state.py` already uses for conversion state. `ui/main_screen.py`'s "Hide
+fields" panel is the only caller; it never touches a generated-audio field (that field's
 visibility is already governed by whether TTS filled it in, a different concern) or a field the
 original card never showed at all (never listed as toggleable in the first place, per the
 placement exclusion above).
@@ -413,19 +427,29 @@ rather than by a role-mapper UI banner.
 
 Anki-facing, not one of the pure `core/` modules.
 
-### Two user-facing modes
+### One mode: New deck (non-destructive)
 
-The user always chooses one. There is **no** bidirectional / "keep both
-directions" mode — we are not building dual-direction study in this version.
+Clone the notetype, rewrite its template, then **duplicate** the notes onto
+the clone and place the copies in a brand-new deck. The original deck,
+notetype and notes stay 100% untouched.
 
-- **Mode A — Flip in place.** Clone the notetype, rewrite its template to the
-  new direction, then **repoint** the target deck's existing notes onto the
-  clone. The original-direction cards are *replaced*, not kept alongside.
-- **Mode B — New deck (non-destructive).** Clone the notetype, rewrite its
-  template, then **duplicate** the notes onto the clone and place the copies in
-  a brand-new deck. The original deck, notetype and notes stay 100% untouched.
-
-Mode B is the default.
+**There used to be a second mode, Flip in place** (repoint the *existing*
+notes onto the clone instead of duplicating them, replacing their current
+cards) — removed. It was cut once a real audio-safety fix (see "Audio" below)
+came to depend on duplication happening unconditionally: the only way to
+guarantee a note's own pre-existing audio can never survive onto the
+converted card is to strip `[sound:...]` out of every field's value while
+copying it onto the clone — which needs a fresh copy to write the stripped
+value into. Flip in place never created one; achieving the same guarantee
+there would have meant rewriting the literal content of the user's real,
+existing notes in place, a categorically bigger and more sensitive operation
+than anything else this addon does (every other write is additive — new
+fields, a scheduling reset, a notetype change — never a rewrite of a field's
+existing text). Rather than ship that, or ship an asymmetric guarantee where
+one mode is safe and the other isn't, Flip in place was cut entirely. See
+`docs/api-notes.md` for why `{{text:Field}}` — the mechanism the old
+Flip-in-place-compatible design leaned on — never actually worked for this in
+the first place: it only strips HTML tags, never `[sound:...]`.
 
 ### Common steps
 
@@ -442,24 +466,22 @@ Mode B is the default.
 3. Scope the note set by **both** notetype and deck:
    `col.find_notes(f'"note:{nt}" "deck:{deck}"')`. Assert the resulting count
    matches what the preflight dialog showed before writing anything.
-4. Apply the mode (see above). In Mode A the change-notetype field/template map
-   is an identity map for every field the source already had — see "ANKI DATA
-   MODEL" above for the one addition (generated-audio fields) this no longer
-   holds for unmodified.
-5. **Reset scheduling unconditionally**, both modes, via
+4. Duplicate the notes onto the clone (`ops/notetype_manager.py`'s
+   `_new_deck`/`_copy_fields_by_name`), stripping pre-existing audio out of
+   every copied field value along the way — see "Audio" below.
+5. **Reset scheduling unconditionally** via
    `col.sched.schedule_cards_as_new(...)` with `reset_counts=True`.
 6. Wrap everything in one `CollectionOp`. **A single custom undo entry cannot
-   span the whole conversion**: creating the clone notetype (and, in Mode A,
-   `change_notetype_of_notes`) is a notetype *schema* change, and Anki
-   invalidates any `add_custom_undo_entry` marker set before a schema change —
-   confirmed against a real collection as `"target undo op not found"` when
-   this was gotten wrong. `add_custom_undo_entry`/`merge_undo_entries` may
-   only ever span what comes *after* the last schema-changing call (the
-   scheduling reset, and in Mode B the note duplication) — never wrap it
-   around a notetype-level call. In practice a conversion is therefore two or
-   three separate undo steps, not one; see `notetype_manager.py`'s
-   `apply_plan` for exactly where the boundaries fall. Still prompt for a
-   manual backup/export before starting, regardless.
+   span the whole conversion**: creating the clone notetype is a notetype
+   *schema* change, and Anki invalidates any `add_custom_undo_entry` marker
+   set before a schema change — confirmed against a real collection as
+   `"target undo op not found"` when this was gotten wrong.
+   `add_custom_undo_entry`/`merge_undo_entries` may only ever span what comes
+   *after* the last schema-changing call (the note duplication, the
+   scheduling reset) — never wrap it around the clone-creation call. In
+   practice a conversion is therefore two separate undo steps, not one; see
+   `notetype_manager.py`'s `apply_plan` for exactly where the boundary falls.
+   Still prompt for a manual backup/export before starting, regardless.
    **Update, confirmed in real use:** even with the marker placed correctly per the
    above, `"target undo op not found"` was still observed occasionally in practice
    (exact second trigger not pinned down — see `docs/api-notes.md`). Worse than the
@@ -471,11 +493,43 @@ Mode B is the default.
    retry marker and merging it immediately after) — see `docs/api-notes.md` for the full
    writeup and `tests/test_notetype_manager.py::TestUndoMergeRecovery`.
 
-### Audio: the demoted language's is hidden, the new language's goes in a new field per source field
+### Audio: the demoted language's is stripped from the data itself, the new language's goes in a new field per source field
 
-On a flip, the demoted language's audio is no longer wanted — a learner going
-EN→JP does not need Japanese pronunciation audio on cards that now test English.
+On a conversion, the demoted language's audio is no longer wanted — a learner
+going EN→JP does not need Japanese pronunciation audio on cards that now test
+English.
 
+**The real guarantee lives in the copy, not in the template.** Every field's
+value is stripped of `[sound:...]` references while it's copied onto the
+clone (`ops/notetype_manager.py`'s `_strip_pre_existing_audio`, applied
+unconditionally to every field, not just ones some detection step flagged as
+audio-bearing), so the demoted language's audio simply isn't present in the
+converted notes' data at all, regardless of how the AI's template ends up
+referencing any given field. This was a real, verified fix for two bugs
+found in testing: the original deck's audio still playing on the converted
+card, and — the same underlying cause — hiding a field via the "Hide fields"
+panel silencing its play button without silencing the sound itself.
+
+**Why the previous approach (forcing a reference to `{{text:Field}}`) didn't
+work, confirmed against real Anki source (`ankitects/anki` on GitHub):**
+`{{text:Field}}` compiles to `strip_html(text)`, whose regex only matches
+HTML tags (`<...>`) — it has never touched `[sound:...]`, which is Anki's own
+bracket notation, not HTML. Separately, `extract_av_tags` (which decides what
+autoplays) scans the *fully rendered* card text for `[sound:...]`/`[anki:tts...]`
+patterns unconditionally, with no awareness of what filter referenced the
+field or what HTML/CSS wraps it. No Anki template filter strips `[sound:...]`
+at all (checked the complete filter list: `text`, `furigana`/`kanji`/`kana`,
+`cloze`/`cloze-only`, `type*`, `hint`, `tts` — none of them do) — so the only
+thing that can ever work is removing the marker from the *data* before a
+template can reference it, which is exactly what copy-time stripping does.
+Stripping the whole deck's data this way (rather than only fields some
+detection step flagged) also means it doesn't matter if that detection missed
+a field, and a field that mixes real text with its own audio (the German-deck
+case, `"Hund [sound:hund.mp3]"`) keeps its text — only the marker goes.
+`llm/audio_safety.py`'s older `{{text:Field}}`-forcing mechanism is still in
+the code and still harmless, but the actual guarantee no longer depends on
+it — it's now made structurally true by the copy, before any template gets a
+chance to reference anything.
 - Drop the demoted language's audio from the generated template **entirely** —
   not renamed, not kept as a secondary field. (Mechanically this now falls out
   of `llm/audio_safety.py` plus the model simply never being told the demoted
@@ -525,20 +579,17 @@ EN→JP does not need Japanese pronunciation audio on cards that now test Englis
   fresh regardless of whether the deck already had one for something else.
 
 Covered by `tests/test_llm_direction.py` (placement + audio-target
-computation), `tests/test_llm_audio_safety.py` (the old-audio-can-never-play
-guarantee), and `tests/test_audio_fields.py` (naming and recognition).
+computation), `tests/test_llm_audio_safety.py` (the pre-copy-stripping-era
+guarantee, still exercised even though it's no longer the primary defense),
+and `tests/test_notetype_manager.py::TestPreExistingAudioIsStrippedFromCopies`
+(the real, current guarantee) and `::TestGeneratedAudioFieldsAreCreatedOnTheClone`
+(naming and recognition via `tests/test_audio_fields.py`).
 
-### Orphaned media cleanup
-
-After Mode A + TTS replacement, the old audio files are unreferenced. Removing
-them is an **explicit opt-in step** ("also remove now-unused <language> audio
-files"), never automatic. Use `col.media.check()` to find unused files and
-`col.media.trash_files(...)` (which trashes rather than hard-deletes, so it
-stays recoverable).
-
-**This cleanup must never run in Mode B** — in Mode B the original deck's notes
-still legitimately reference those same files, and deleting them would break the
-untouched original.
+Orphaned media cleanup (removing now-unreferenced original-language audio
+files after a conversion) was planned for the old Flip-in-place mode but
+never actually implemented, and no longer applies now that there is only one
+mode: New deck never orphans anything, since the source deck's notes still
+legitimately reference their own original media files forever.
 
 ## PIPER TTS IMPLEMENTATION (module group: /tts)
 
@@ -670,15 +721,18 @@ machinery (role schema, role detection, template generation, the profiles
 system, the role-mapper UI) wholesale with the local-LLM pipeline described
 under "LOCAL LLM DECK ANALYSIS" above, and replaced the submenu of separate
 dialogs (Convert / Preview / Generate TTS audio) with the single screen
-`ui/main_screen.py` (Analyze → review/hand-edit → Convert → Generate TTS
-audio, one flow). **Status:** the core pipeline (Analyze, Convert, both
-conversion modes, Generate TTS audio, and re-opening an already-converted
-deck to generate more audio without a fresh AI call) is built, unit-tested,
-and confirmed working end to end against a real Anki profile. Three items are
-open, tracked in `TODO.md`: the live-preview-before-Convert template error
-described under "ANKI DATA MODEL" above; extending `validate.py` for full
-placement compliance (the field-name-collision deck's remaining flakiness);
-and this documentation pass itself. Packaging
+`ui/main_screen.py` (Analyze → review/hand-edit, optionally via "Hide fields"
+→ Convert → Generate TTS audio, one flow). Also dropped the second
+conversion mode ("Flip in place") entirely — see "NOTETYPE CLONING / SAFE
+APPLY" for why; there is now exactly one mode (duplicate onto a new deck).
+**Status:** the core pipeline (Analyze, Convert, Generate TTS audio, live
+preview including right after Analyze/before Convert, the Hide-fields panel,
+and re-opening an already-converted deck to generate more audio without a
+fresh AI call) is built, unit-tested, and confirmed working end to end
+against a real Anki profile, including the audio-safety fix described under
+"NOTETYPE CLONING / SAFE APPLY" → "Audio" above. One item is open, tracked in
+`TODO.md`: extending `validate.py` for full placement compliance (the
+field-name-collision deck's remaining flakiness). Packaging
 (`tools/build_ankiaddon.py`, not `anki-addon-builder` — see below) and the
 Tools-menu consolidation carry forward unchanged from M7.
 **Deliberately still not done:** a LICENSE file, `manifest.json` license

@@ -39,62 +39,46 @@ the project's existing "preview writes nothing" invariant. Covered by
 `tests/test_llm_analyze.py::TestStripPendingAudioHtml`; the full 293-test pure suite passes.
 **Confirmed fixed in real Anki testing.**
 
-## Original deck's own audio is still audible on the converted card
+## Original deck's own audio playing on the converted card, and a hidden audio field's play button not actually silencing it — fixed at the root, pending real-Anki confirmation
 
-Found in real Anki testing (2026-09-17), not yet diagnosed -- needs a real repro (which mode,
-which field, before or after Generate TTS audio has run) before attempting a fix, per
-`claude.md`'s own "don't guess twice" rule.
+Two bugs found in real Anki testing (2026-09-17), traced to one shared root cause.
 
-Not yet confirmed which of these it is, in rough order of likelihood:
+**Root cause, confirmed against real Anki source (`ankitects/anki` on GitHub, not guessed):**
+`{{text:Field}}` compiles to `strip_html(text)`, whose regex only matches HTML tags (`<...>`) --
+it has never touched `[sound:...]`, which is Anki's own bracket notation, not HTML. Separately,
+`extract_av_tags` (which decides what autoplays) scans the *fully rendered* card text for
+`[sound:...]`/`[anki:tts...]` patterns unconditionally, with no awareness of what filter
+referenced the field or what HTML/CSS wraps it. Checked the complete Anki filter list --
+`text`, `furigana`/`kanji`/`kana`, `cloze`/`cloze-only`, `type*`, `hint`, `tts` -- none of them
+strip `[sound:...]`. This meant `llm/audio_safety.py`'s `{{text:Field}}`-forcing mechanism, and
+`llm/field_visibility.py`'s hide-via-CSS-wrap (which also forced `{{text:Field}}`, on the same
+mistaken assumption), never actually prevented playback -- both bugs were the same gap surfacing
+two different ways.
 
-- **Sample-based false negative in `sound_field_names`.** `llm/analyze.py` decides which fields
-  need `{{text:Field}}` forcing (`llm/audio_safety.py`'s `enforce_audio_safety`) from
-  `sound_field_names(fields)`, which only looks at the handful of real notes sampled for the
-  prompt (`ops/deck_data.collect_field_samples`, `_ANALYZE_SAMPLE_NOTES = 6` in
-  `ui/main_screen.py`). A field that carries audio on most notes but happens to be empty on
-  all of the sampled ones would never get flagged, and the model would then be free to bare-
-  reference it -- correct on the sampled notes, silently wrong on every other one. Low
-  likelihood specifically for Core 2000 (its audio fields are populated on nearly every note,
-  so a sampling miss is unlikely there), but the mechanism itself is a real gap regardless of
-  how likely it is to trigger.
-- **Flip-in-place field-mapping risk, already flagged as unconfirmed in `docs/api-notes.md`**
-  ("Adding fields to the clone" section): the appended generated-audio field is assumed to
-  land at the correct (empty) position in Anki's prefilled change-notetype field map "by
-  construction," but this has never actually been exercised against a real Flip-in-place
-  conversion with an added field -- if the map is wrong, a new audio field could start out
-  holding a *different* field's old content instead of being empty, which would explain
-  "original audio still plays" without `enforce_audio_safety` being wrong at all. Only
-  possible if this was tested in Flip-in-place mode, not New-deck mode -- worth checking first,
-  since it narrows this down immediately.
-- Something not yet considered -- get an exact repro (mode, deck, which audio is heard: the
-  original field's own audio, or a generated field playing the wrong note's audio) before
-  picking one of the above over the other.
+**Fix:** since no template filter can suppress `[sound:...]`, the only thing that reliably works
+is removing it from the *data* before a template can ever reference it. Every field's value now
+has `[sound:...]` stripped out while it's copied onto the clone, unconditionally, for every
+field -- `ops/notetype_manager.py`'s `_strip_pre_existing_audio` (called from
+`_copy_fields_by_name`). This doesn't depend on detecting which fields carry audio (removing that
+whole class of "sampling missed it" risk), and it preserves real text in a field that mixes
+content with its own audio (the German-deck `"Hund [sound:hund.mp3]"` case) -- only the marker
+goes. `llm/field_visibility.py`'s hide mechanism is unchanged in code but is now correct as a
+side effect: by the time a converted card exists to hide fields on, none of its fields have
+`[sound:...]` left in their values regardless of hide state.
 
-## Hiding an audio-bearing field silences its play button, not the actual audio
+**This required removing "Flip in place" as a mode.** The stripping fix needs a fresh copy to
+write the stripped value into; Flip in place never created one (it repoints the user's *existing*
+notes onto the clone without touching field values at all). Giving it the same guarantee would
+have meant rewriting the literal content of the user's real notes in place -- a bigger, more
+sensitive kind of change than anything else this addon does. Rather than ship an asymmetric
+guarantee (one mode safe, one not), Flip in place was cut entirely; there is now only one mode
+(duplicate onto a new deck). See `core/conversion.py`'s and `CLAUDE.md`'s "NOTETYPE CLONING /
+SAFE APPLY" section for the full writeup.
 
-Found in real Anki testing (2026-09-17), alongside the bug above. Root cause is understood, not
-just theorized: `llm/field_visibility.py`'s hide mechanism wraps a field's reference in
-`<span class="ddc-hidden">{{Field}}</span>` and hides it with CSS `display: none` -- but Anki
-extracts which `[sound:...]` tags to autoplay by scanning the *rendered text* of the card
-(`anki/template.py`: `self.col()._backend.extract_av_tags(text=qtext, ...)`, confirmed against
-real `anki==26.8.1` source during the preview-bug investigation above), entirely independent of
-CSS or DOM visibility. `{{Field}}` still substitutes in the field's real value -- `[sound:...]`
-tag included -- before that scan ever happens; CSS only hides the *play-button icon* the
-webview renders for it afterward, in the browser. This is exactly why the button disappears but
-the sound keeps playing -- CSS hiding is real, sufficient, and correct for a text field
-(nothing about a plain string is affected by whether it's autoplay-scanned), but it is the
-wrong mechanism for a field carrying `[sound:...]`, where visual hiding and audio silencing are
-two different things.
-
-**Likely fix direction, not yet implemented or verified:** hiding a field already known to
-carry audio (`llm/audio_safety.sound_field_names`, the same detection `enforce_audio_safety`
-already uses) should route through `{{text:Field}}` instead of, or in addition to, the
-`ddc-hidden` span -- `{{text:...}}` genuinely strips a `[sound:...]` reference out of the
-*rendered text itself*, before `extract_av_tags` ever runs, which is what actually stops
-autoplay rather than just hiding a button for it. Needs deciding whether "hide" on an audio
-field should mean text-strip (silent, but an empty box may still render depending on
-surrounding HTML) or something else -- worth discussing before implementing, not just picking
-one.
+Covered by `tests/test_notetype_manager.py::TestPreExistingAudioIsStrippedFromCopies` (pure
+audio field → empty; mixed field → text survives, audio gone; original notes' own audio
+untouched; no media file deleted). Full suite: 308 tests, all green.
+**Not yet re-tested in real Anki** — do that before considering this fully closed.
 
 ## Extend `validate.py` to check placement compliance
 
