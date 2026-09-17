@@ -16,8 +16,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ..core.audio_fields import AUDIO_DONE_TAG
-from ..core.conversion import ConversionMode, ConversionPlan
+from ..core.conversion import ConversionPlan
 from ..core.deck_state import conversion_tag
+from ..llm.audio_safety import SOUND_TAG_RE
 
 __all__ = ["ConversionResult", "ApiMismatch", "apply_plan", "probe_api", "shape_notetype"]
 
@@ -204,9 +205,8 @@ def shape_notetype(source: Dict[str, Any], *, name: str, front: str, back: str,
 
     ``extra_fields`` names fields to add that the source doesn't have -- the generated audio
     fields, per ``core.audio_fields``. They are **appended after** the source's own fields
-    and never inserted among them, which keeps every original field at its original ord.
-    That is what lets a Flip-in-place change-notetype keep mapping old field *n* to new field
-    *n*, with the appended ones having no counterpart to come from (see ``_flip_in_place``).
+    and never inserted among them, so every original field keeps its original ord and the
+    new one(s) are easy to find at a glance in Anki's own field-list editor.
 
     Adding a field that is already there is a no-op, so converting an already-converted
     notetype a second time doesn't accumulate duplicates.
@@ -295,61 +295,35 @@ def build_clone(col: Any, plan: ConversionPlan, front: str, back: str, css: str,
 # ---------------------------------------------------------------------------
 
 
-def _flip_in_place(col: Any, plan: ConversionPlan, clone: Dict[str, Any]) -> int:
-    """Repoint the existing notes onto the clone.
+def _strip_pre_existing_audio(value: str) -> str:
+    """Remove every ``[sound:...]`` reference from a field value being copied onto the clone.
 
-    The clone keeps every source field at its original name and ord, and only *appends* the
-    generated audio field(s) after them (see ``shape_notetype``). So Anki's prefilled
-    field map is an identity map for all the source's own fields, with the appended ones
-    having no source field to come from -- which is exactly right: they are meant to start
-    empty, and get filled by the TTS run. Role mapping drives template HTML only, never
-    field migration.
+    Applied to **every** field, unconditionally, not just ones some detection step flagged as
+    audio-bearing -- deliberately, because that detection (``llm.audio_safety.sound_field_names``)
+    only samples a handful of real notes, so it can miss a field whose audio happens to be
+    absent on all of them. Stripping every field's value removes that dependency entirely: it
+    doesn't matter which field the AI's template ends up referencing, or how (bare or filtered),
+    because none of the copied data has ``[sound:...]`` left in it to leak. This is also why
+    ``{{text:Field}}`` was never actually a fix for this (see ``docs/api-notes.md``): it only
+    strips HTML tags, never ``[sound:...]``, so the one thing that reliably works is removing
+    the marker from the data itself, once, here -- not trying to suppress it per-reference in
+    the template afterward.
 
-    The appended-at-the-end ordering is deliberate rather than incidental. It makes the
-    prefilled map correct whether Anki builds it by matching field *names* (the appended
-    names exist only on the clone, so they match nothing) or by position (their ords are
-    past the end of the source's field list, so there is nothing at that position either).
-    Inserting them next to their sibling fields instead would shift every later field by one
-    and make the positional reading silently wrong. See docs/api-notes.md.
+    A no-op for the overwhelming majority of fields, which have no sound tag at all. Only
+    ``.strip()``s the result when something was actually removed, so a field that never had
+    audio keeps its exact original value, including any leading/trailing whitespace -- this
+    must never be a blanket whitespace-trim of every field on every note.
     """
-    source = col.models.by_name(plan.source_notetype)
-    info = _call_checked(
-        col.models.change_notetype_info,
-        "col.models.change_notetype_info",
-        old_notetype_id=source["id"],
-        new_notetype_id=clone["id"],
-    )
-    request = getattr(info, "input", None)
-    if request is None:
-        raise ApiMismatch(
-            "change_notetype_info() returned %r with no .input request. Verify against "
-            "your Anki build (see docs/api-notes.md)." % type(info).__name__
-        )
-
-    del request.note_ids[:]
-    request.note_ids.extend(plan.note_ids)
-    col.models.change_notetype_of_notes(request)
-    return len(plan.note_ids)
-
-
-def _tag_converted_notes(col: Any, note_ids: Sequence[int], tag: str) -> None:
-    """Add ``tag`` to every note in ``note_ids``, for the record ``core.deck_state`` reads
-    back on reopen.
-
-    Only needed by Flip-in-place: the notes already existed before this conversion, and
-    ``change_notetype_of_notes`` (a bulk schema-level repoint) does not touch tags. New-deck
-    mode instead adds the tag inline while building each duplicated note in
-    :func:`_new_deck`, since that note is already being written anyway.
-    """
-    for nid in note_ids:
-        note = col.get_note(nid)
-        if tag not in note.tags:
-            note.tags.append(tag)
-            col.update_note(note)
+    stripped = SOUND_TAG_RE.sub("", value)
+    return stripped.strip() if stripped != value else value
 
 
 def _copy_fields_by_name(source_note: Any, target_note: Any, field_names: Sequence[str]) -> None:
-    """Fill ``target_note``'s fields from ``source_note``, matching by name.
+    """Fill ``target_note``'s fields from ``source_note``, matching by name, with any
+    pre-existing ``[sound:...]`` reference stripped out of every value (see
+    :func:`_strip_pre_existing_audio`) -- the direction being converted away from does not need
+    to keep pronouncing itself on the new card, and this is the one point where every field's
+    value passes through this addon's own hands before landing on the clone.
 
     Fields the clone has that the source note doesn't are skipped rather than raised. That
     is the normal case now, not an edge one: the clone carries the generated audio field(s)
@@ -361,15 +335,23 @@ def _copy_fields_by_name(source_note: Any, target_note: Any, field_names: Sequen
             value = source_note[name]
         except (KeyError, IndexError, ValueError):
             continue
-        target_note[name] = value
+        target_note[name] = _strip_pre_existing_audio(value)
 
 
 def _new_deck(col: Any, plan: ConversionPlan, clone: Dict[str, Any]) -> int:
     """Duplicate the notes onto the clone, into a fresh deck.
 
-    ``[sound:...]`` references point at files already in the media folder, so media is
-    shared rather than duplicated. Anki's duplicate check is per-notetype, so these copies
-    raise no duplicate warnings against the originals.
+    This is the only way notes ever reach the clone -- see ``core/conversion.py``'s module
+    docstring for why the once-alternative "repoint the existing notes in place" mode was
+    removed rather than kept alongside this: duplicating is what makes the audio-stripping in
+    :func:`_copy_fields_by_name` possible without ever touching the user's original notes.
+
+    Original media files are **not** deleted -- only the ``[sound:...]`` *references* to
+    pre-existing (now-superseded) audio are removed from the copy's field values; the files
+    themselves stay in the media folder, still referenced by the fully untouched originals.
+    Nothing is orphaned by this conversion, since the source deck and its notes never change.
+    Anki's duplicate check is per-notetype, so these copies raise no duplicate warnings against
+    the originals.
     """
     deck_id = _resolve_deck(col, plan.target_deck)
     clone_fields = [f["name"] for f in clone["flds"]]
@@ -470,50 +452,31 @@ def apply_plan(
         # Nothing is cloned or written in a dry run, so there is no notetype id or deck id
         # to report -- only what *would* have happened, from the plan itself.
         result.messages.append(
-            "Dry run: nothing was written. %d notes from %r would move onto a new "
-            "notetype %r%s."
-            % (
-                len(plan.note_ids),
-                plan.source_notetype,
-                plan.clone_notetype,
-                (" in a new deck %r" % plan.target_deck)
-                if plan.mode is ConversionMode.NEW_DECK
-                else " (replacing their current cards)",
-            )
+            "Dry run: nothing was written. %d notes from %r would be duplicated onto a new "
+            "notetype %r in a new deck %r."
+            % (len(plan.note_ids), plan.source_notetype, plan.clone_notetype, plan.target_deck)
         )
         result.notes_converted = len(plan.note_ids)
         return result
 
-    # ``build_clone`` and (for Flip-in-place) ``change_notetype_of_notes`` are both
-    # notetype-*schema* changes -- they bump Anki's schema modification time, which
-    # invalidates any custom undo marker set before them. A custom-undo-entry span may
-    # therefore only ever cover what comes *after* the last such call, never wrap around
-    # one; doing so produces Anki's own "target undo op not found" (confirmed against a
-    # real collection -- see docs/api-notes.md). Deck creation is not schema-level in this
-    # sense (it has never required a full resync), so it's fine inside the wrapped span.
+    # ``build_clone`` is a notetype-*schema* change -- it bumps Anki's schema modification
+    # time, which invalidates any custom undo marker set before it. A custom-undo-entry span
+    # may therefore only ever cover what comes *after* it, never wrap around it; doing so
+    # produces Anki's own "target undo op not found" (confirmed against a real collection --
+    # see docs/api-notes.md). Deck creation is not schema-level in this sense (it has never
+    # required a full resync), so it's fine inside the wrapped span.
     clone = build_clone(col, plan, front=front, back=back, css=css, template_name=template_name)
     result.clone_notetype_id = int(clone["id"])
     result.clone_notetype_name = clone["name"]
 
-    if plan.mode is ConversionMode.FLIP_IN_PLACE:
-        result.notes_converted = _flip_in_place(col, plan, clone)
-        undo_entry = col.add_custom_undo_entry("Convert deck direction")
-        # After the marker, never before: change_notetype_of_notes just above is a schema
-        # change, and Anki invalidates any custom undo marker set before one (see this
-        # function's own docstring). Tagging is plain per-note writes, so it groups cleanly
-        # into the same undo step as long as it happens after the marker.
-        _tag_converted_notes(
-            col, plan.note_ids, conversion_tag(plan.target_language, plan.native_language)
-        )
-    else:
-        undo_entry = col.add_custom_undo_entry("Convert deck direction")
-        result.notes_converted = _new_deck(col, plan, clone)
+    undo_entry = col.add_custom_undo_entry("Convert deck direction")
+    result.notes_converted = _new_deck(col, plan, clone)
 
     card_ids = list(col.find_cards('mid:%d' % clone["id"]))
     if plan.reset_scheduling:
         result.cards_reset = _reset_scheduling(col, card_ids)
 
-    result.target_deck_id = _resolve_deck(col, plan.target_deck) if plan.mode is ConversionMode.NEW_DECK else 0
+    result.target_deck_id = _resolve_deck(col, plan.target_deck)
 
     # Every real write above has already committed by this point -- what follows only
     # groups them into one convenient undo step. If merging still raises "target undo op
@@ -535,12 +498,8 @@ def apply_plan(
         retry_entry = col.add_custom_undo_entry("Convert deck direction")
         result.op_changes = col.merge_undo_entries(retry_entry)
 
-    if plan.mode is ConversionMode.NEW_DECK:
-        destination = "into new deck %r" % plan.target_deck
-    else:
-        destination = "in place, in %r" % plan.source_deck
     result.messages.append(
-        "Done: %d notes converted to %r %s; %d cards reset to new."
-        % (result.notes_converted, result.clone_notetype_name, destination, result.cards_reset)
+        "Done: %d notes converted to %r into new deck %r; %d cards reset to new."
+        % (result.notes_converted, result.clone_notetype_name, plan.target_deck, result.cards_reset)
     )
     return result

@@ -1,7 +1,8 @@
-"""Conversion planning: scoping, mode safety rules, and the preflight summary.
+"""Conversion planning: scoping, safety rules, and the preflight summary.
 
 A plan carries plain front/back/css strings (what the LLM produced) rather than a role mapping
--- see ``addon/core/conversion.py``'s module docstring.
+-- see ``addon/core/conversion.py``'s module docstring. There is only one mode -- duplicate
+onto a new deck -- since Flip in place was removed (see that module's docstring for why).
 """
 
 from __future__ import annotations
@@ -9,7 +10,6 @@ from __future__ import annotations
 import unittest
 
 from addon.core.conversion import (
-    ConversionMode,
     build_plan,
     escape_search_term,
     scope_query,
@@ -19,7 +19,7 @@ from addon.core.conversion import (
 _SAMPLE_NOTE_COUNT = 500
 
 
-def plan(mode=ConversionMode.NEW_DECK, **kw):
+def plan(**kw):
     kw.setdefault("front", "<div>{{Word}}</div>")
     kw.setdefault("back", "{{FrontSide}}<hr id=answer><div>{{Translation}}</div>")
     kw.setdefault("css", ".card { font-size: 20px; }")
@@ -28,7 +28,7 @@ def plan(mode=ConversionMode.NEW_DECK, **kw):
     kw.setdefault("source_notetype", "Generic")
     kw.setdefault("source_deck", "Generic")
     kw.setdefault("note_ids", list(range(_SAMPLE_NOTE_COUNT)))
-    return build_plan(mode=mode, **kw)
+    return build_plan(**kw)
 
 
 class TestScoping(unittest.TestCase):
@@ -56,18 +56,10 @@ class TestScoping(unittest.TestCase):
         self.assertNotIn('deck:"Core*"', scope_query("N", "Core*"))
 
 
-class TestModeSafetyRules(unittest.TestCase):
-    def test_new_deck_mode_refuses_to_write_into_the_source_deck(self):
-        p = plan(ConversionMode.NEW_DECK, target_deck="Generic")
+class TestSafetyRules(unittest.TestCase):
+    def test_refuses_to_write_into_the_source_deck(self):
+        p = plan(target_deck="Generic")
         self.assertFalse(p.validate().ok)
-
-    def test_new_deck_mode_refuses_media_cleanup(self):
-        """The original notes still reference those files."""
-        p = plan(ConversionMode.NEW_DECK)
-        p.media_cleanup = True
-        result = p.validate()
-        self.assertFalse(result.ok)
-        self.assertTrue(any("never run in new-deck mode" in e for e in result.errors))
 
     def test_clone_may_not_reuse_the_source_notetype_name(self):
         p = plan(clone_notetype="Generic")
@@ -94,26 +86,15 @@ class TestModeSafetyRules(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertTrue(any("back template is empty" in e for e in result.errors))
 
-    def test_a_valid_new_deck_plan_passes(self):
-        self.assertTrue(plan(ConversionMode.NEW_DECK).validate().ok)
-
-    def test_a_valid_flip_plan_passes(self):
-        self.assertTrue(plan(ConversionMode.FLIP_IN_PLACE).validate().ok)
-
-    def test_only_flip_is_marked_destructive(self):
-        self.assertTrue(ConversionMode.FLIP_IN_PLACE.is_destructive)
-        self.assertFalse(ConversionMode.NEW_DECK.is_destructive)
+    def test_a_valid_plan_passes(self):
+        self.assertTrue(plan().validate().ok)
 
 
 class TestDefaultNaming(unittest.TestCase):
-    def test_new_deck_gets_its_own_deck_by_default(self):
-        p = plan(ConversionMode.NEW_DECK)
+    def test_gets_its_own_deck_by_default(self):
+        p = plan()
         self.assertNotEqual(p.target_deck, p.source_deck)
         self.assertTrue(p.validate().ok)
-
-    def test_flip_stays_in_the_source_deck(self):
-        p = plan(ConversionMode.FLIP_IN_PLACE)
-        self.assertEqual(p.target_deck, p.source_deck)
 
     def test_suffix_is_caller_supplied_not_baked_in(self):
         p = plan(suffix="Produccion")
@@ -132,21 +113,14 @@ class TestPlanRecordsTheConversionDirection(unittest.TestCase):
 
 class TestPreflight(unittest.TestCase):
     def test_summary_states_the_note_count_and_reset(self):
-        text = plan(ConversionMode.NEW_DECK).preflight().as_text()
+        text = plan().preflight().as_text()
         self.assertIn(str(_SAMPLE_NOTE_COUNT), text)
         self.assertIn("WILL BE RESET", text)
         self.assertIn("untouched", text)
 
-    def test_flip_summary_says_cards_are_replaced(self):
-        text = plan(ConversionMode.FLIP_IN_PLACE).preflight().as_text()
-        self.assertIn("replaced", text)
-
     def test_summary_warns_when_nothing_matched(self):
         p = plan(note_ids=[])
         self.assertTrue(any("no notes matched" in w for w in p.preflight().warnings))
-
-    def test_media_cleanup_is_reported_as_off_by_default(self):
-        self.assertIn("nothing deleted", plan().preflight().as_text())
 
 
 if __name__ == "__main__":

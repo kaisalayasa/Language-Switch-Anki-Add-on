@@ -64,17 +64,12 @@ from aqt.qt import (
 from aqt.sound import av_player
 from aqt.utils import askUser, showInfo, showWarning
 
-from ..core.conversion import ConversionMode, build_plan, scope_query
+from ..core.conversion import build_plan, scope_query
 from ..core.deck_state import ConversionState, state_from_notetype
 from ..llm.analyze import DeckAnalysis, analyze_deck, strip_pending_audio_html
 from ..llm.client import call_model
 from ..llm.direction import Direction, resolve_direction
-from ..llm.field_visibility import (
-    ensure_hidden_field_css,
-    is_field_hidden,
-    set_field_hidden,
-    visible_fields,
-)
+from ..llm.field_visibility import is_field_hidden, set_field_hidden, visible_fields
 from ..llm.model_manager import ensure_model, model_is_cached
 from ..llm.runtime import ensure_llama_runtime, runtime_is_cached
 from ..ops.convert_op import convert_op
@@ -201,13 +196,13 @@ class _FieldVisibilityPanel(QWidget):
     non-technical alternative to the "HTML" tab, for a user who just wants a field off the
     card without editing template syntax at all.
 
-    Lists exactly what ``llm.field_visibility.visible_fields`` finds referenced on the current
-    Front/Back HTML. A field never placed at all -- a deck's own hidden bookkeeping field
-    ``llm.direction`` already excludes, or a not-yet-existing generated-audio field -- never
-    appears, since toggling something that was never part of the card wouldn't do anything.
-    The list itself does not shrink as fields are hidden: a hidden field's reference is only
-    wrapped, never removed (see the module docstring), so it stays listed with its checkbox
-    simply unchecked -- exactly what "toggled on and off" means.
+    Lists exactly what ``llm.field_visibility.visible_fields`` finds referenced (or hidden as a
+    marker comment) on the current Front/Back HTML. A field never placed at all -- a deck's own
+    hidden bookkeeping field ``llm.direction`` already excludes, or a not-yet-existing
+    generated-audio field -- never appears, since toggling something that was never part of the
+    card wouldn't do anything. The list itself does not shrink as fields are hidden: a hidden
+    field's marker comment still names it (see the module docstring), so it stays listed with
+    its checkbox simply unchecked -- exactly what "toggled on and off" means.
     """
 
     changed = pyqtSignal(str, bool)  #: (field_name, now_visible)
@@ -406,18 +401,12 @@ class MainScreen(QDialog):
 
         layout = QVBoxLayout(self)
 
-        # -- 1. deck/mode picker --------------------------------------------------
+        # -- 1. deck picker ---------------------------------------------------------
         picker_row = QHBoxLayout()
         picker_row.addWidget(QLabel("Deck:"))
         self.pair_box = QComboBox()
         picker_row.addWidget(self.pair_box, stretch=1)
-        picker_row.addWidget(QLabel("Mode:"))
-        self.mode_box = QComboBox()
-        self.mode_box.addItem("New deck (recommended)", ConversionMode.NEW_DECK)
-        self.mode_box.addItem("Flip in place", ConversionMode.FLIP_IN_PLACE)
-        picker_row.addWidget(self.mode_box)
         layout.addLayout(picker_row)
-        self.mode_box.currentIndexChanged.connect(lambda *_args: self._update_target_deck_default())
 
         rename_row = QHBoxLayout()
         rename_row.addWidget(QLabel("New deck name:"))
@@ -670,22 +659,9 @@ class MainScreen(QDialog):
 
     def _update_target_deck_default(self) -> None:
         """Refills "New deck name" with a sensible default -- unless the user has typed
-        their own, which stays put until the deck/notetype pair itself changes. Flip in
-        place never creates a separate deck (notes stay put; only the notetype changes),
-        so the field is locked to the source deck's own name and disabled while that mode
-        is selected."""
+        their own, which stays put until the deck/notetype pair itself changes."""
         if not self._deck_name:
             return
-        if self.mode_box.currentData() is ConversionMode.FLIP_IN_PLACE:
-            self.target_deck_edit.setText(self._deck_name)
-            self.target_deck_edit.setEnabled(False)
-            self.target_deck_edit.setToolTip(
-                "Flip in place keeps notes in their original deck -- there's no new deck "
-                "to name."
-            )
-            return
-        self.target_deck_edit.setEnabled(True)
-        self.target_deck_edit.setToolTip("")
         if not self._target_deck_dirty:
             suffix = addon_config().get("name_suffix", "Converted")
             self.target_deck_edit.setText("%s (%s)" % (self._deck_name, suffix))
@@ -898,8 +874,8 @@ class MainScreen(QDialog):
 
     def _on_field_visibility_changed(self, field_name: str, now_visible: bool) -> None:
         """A checkbox in the "Hide fields" panel was toggled -- rewrite whichever side
-        ``field_name`` is on to wrap/unwrap its reference (see ``llm.field_visibility``), same
-        as if the user had hand-edited the HTML themselves, without them ever seeing HTML.
+        ``field_name`` is on to remove/restore its reference (see ``llm.field_visibility``),
+        same as if the user had hand-edited the HTML themselves, without them ever seeing HTML.
         """
         front, back, css = self.html_editor.get_content()
         front_fields, _back_fields = visible_fields(front, back)
@@ -908,7 +884,6 @@ class MainScreen(QDialog):
             front = set_field_hidden(front, field_name, hidden=hidden)
         else:
             back = set_field_hidden(back, field_name, hidden=hidden)
-        css = ensure_hidden_field_css(css)
         self.html_editor.set_content(front, back, css)
         self._html_dirty = True
         self._refresh_preview()
@@ -1022,10 +997,7 @@ class MainScreen(QDialog):
         native_language = self._analysis.native_language
 
         config = addon_config()
-        mode = self.mode_box.currentData()
-        source_deck_at_start = self._deck_name
         plan = build_plan(
-            mode=mode,
             front=front,
             back=back,
             css=css,
@@ -1057,16 +1029,7 @@ class MainScreen(QDialog):
                 self._update_action_state()
                 return
             showInfo("\n".join(result.messages), parent=self)
-            # Flip in place never creates or moves to a new deck -- apply_plan leaves
-            # result.target_deck_id at 0 for that mode, and mw.col.decks.name(0) is not a
-            # real deck, so it must never be consulted here. Read from a variable captured
-            # *before* the (async) conversion ran, not self._deck_name, in case the pair
-            # dropdown got changed while the conversion was still in flight.
-            deck_name = (
-                mw.col.decks.name(result.target_deck_id)
-                if mode is ConversionMode.NEW_DECK
-                else source_deck_at_start
-            )
+            deck_name = mw.col.decks.name(result.target_deck_id)
             if carried_analysis is not None:
                 self._post_convert_carry = (result.clone_notetype_name, carried_analysis)
             self._refresh_pairs()
