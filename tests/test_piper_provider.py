@@ -26,6 +26,15 @@ def _prepopulate_binary(cache_dir) -> Path:
     return exe_path
 
 
+def _prepopulate_ffmpeg_binary(cache_dir) -> Path:
+    root = Path(cache_dir) / "ffmpeg"
+    root.mkdir(parents=True, exist_ok=True)
+    exe_name = "ffmpeg.exe" if platform.system().lower() == "windows" else "ffmpeg"
+    exe_path = root / exe_name
+    exe_path.write_bytes(b"stub")
+    return exe_path
+
+
 def _stub_voice_download(url, dest):
     Path(dest).parent.mkdir(parents=True, exist_ok=True)
     Path(dest).write_bytes(b"stub")
@@ -148,6 +157,79 @@ class TestPiperProviderSynthesize(unittest.TestCase):
             )
             with self.assertRaises(SynthesisError):
                 provider.synthesize("hello there", voice_id="en_US-ljspeech-high")
+
+
+class TestPiperProviderCompression(unittest.TestCase):
+    """Compression is a best-effort optimization layered on top of an already-working
+    pipeline -- see piper_provider.py's module docstring. These tests lock in both halves of
+    that contract: it actually shrinks the file when ffmpeg is available, and it must never
+    be able to break synthesis (fall back to the original WAV) when ffmpeg isn't."""
+
+    def _fake_run_with_ffmpeg(self, *, ffmpeg_exit=0):
+        def fake_run(argv, input_text=None):
+            if "--version" in argv:
+                return SubprocessResult(0, "piper 1.2.0", "")
+            if "-version" in argv:
+                return SubprocessResult(0, "ffmpeg version 9.0", "")
+            if "--output_file" in argv:
+                out_path = Path(argv[argv.index("--output_file") + 1])
+                out_path.write_bytes(b"RIFF....WAVEfake")
+                return SubprocessResult(0, "", "")
+            # the ffmpeg conversion call itself
+            out_path = Path(argv[-1])
+            if ffmpeg_exit == 0:
+                out_path.write_bytes(b"fake-mp3-bytes")
+            return SubprocessResult(ffmpeg_exit, "", "")
+
+        return fake_run
+
+    def test_compresses_to_mp3_and_removes_the_original_wav_when_ffmpeg_is_available(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            _prepopulate_binary(cache_dir)
+            _prepopulate_ffmpeg_binary(cache_dir)
+            provider = PiperProvider(
+                cache_dir,
+                download_to=_stub_voice_download,
+                run=self._fake_run_with_ffmpeg(),
+            )
+
+            out = provider.synthesize("hello there", voice_id="en_US-ljspeech-high")
+
+            self.assertEqual(out.suffix, ".mp3")
+            self.assertTrue(out.exists())
+            self.assertFalse(out.with_suffix(".wav").exists())
+
+    def test_falls_back_to_the_original_wav_when_ffmpeg_cannot_be_obtained(self):
+        """No ffmpeg pre-populated, and download_to writes an unextractable stub -- exactly
+        today's behavior for a platform/network that can't get ffmpeg at all."""
+        with tempfile.TemporaryDirectory() as cache_dir:
+            _prepopulate_binary(cache_dir)
+            provider = PiperProvider(
+                cache_dir,
+                download_to=_stub_voice_download,
+                run=self._fake_run_with_ffmpeg(),
+            )
+
+            out = provider.synthesize("hello there", voice_id="en_US-ljspeech-high")
+
+            self.assertEqual(out.suffix, ".wav")
+            self.assertTrue(out.exists())
+            self.assertGreater(out.stat().st_size, 0)
+
+    def test_falls_back_to_the_original_wav_when_ffmpeg_conversion_itself_fails(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            _prepopulate_binary(cache_dir)
+            _prepopulate_ffmpeg_binary(cache_dir)
+            provider = PiperProvider(
+                cache_dir,
+                download_to=_stub_voice_download,
+                run=self._fake_run_with_ffmpeg(ffmpeg_exit=1),
+            )
+
+            out = provider.synthesize("hello there", voice_id="en_US-ljspeech-high")
+
+            self.assertEqual(out.suffix, ".wav")
+            self.assertTrue(out.exists())
 
 
 if __name__ == "__main__":

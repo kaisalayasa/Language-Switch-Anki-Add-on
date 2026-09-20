@@ -108,6 +108,56 @@ _(not yet run — see `docs/api-notes.md`'s probe instructions above for the Ank
 equivalent; this one just needs the extracted `piper`/`piper.exe` run directly, no Anki
 required)_
 
+## ffmpeg facts (compression feature, added 2026-09-20) — verified against real APIs and a real download this session
+
+Same "never guess" discipline as the Piper facts above. `addon/tts/ffmpeg_binary_manager.py`
+downloads ffmpeg only to shrink Piper's WAV output to MP3 (see `piper_provider.py`'s
+`_compress_to_mp3`) — never for anything else.
+
+**Windows/Linux — BtbN/FFmpeg-Builds** (`GET api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest`):
+
+- This repo publishes to a single continuously-updated release literally tagged `latest`, not
+  discrete per-version tags — there is no immutable release to pin the way Piper's
+  `2023.11.14-2` tag is. Same situation already accepted for llama.cpp's nightly builds: the
+  asset filenames below need periodic re-verification, not a one-time check.
+- Confirmed real asset filenames (`n9.0` family, i.e. tracking ffmpeg's `9.0` stable branch):
+  `ffmpeg-n9.0-latest-win64-lgpl-9.0.zip` and `ffmpeg-n9.0-latest-linux64-lgpl-9.0.tar.xz`
+  (also `-linuxarm64-` for `aarch64`). No 32-bit ARM Linux build exists — `resolve_asset`
+  raises `UnsupportedPlatform` for `armv7l`, unlike Piper which does support that platform;
+  compression is just unavailable there.
+- **LGPL vs GPL confirmed by reading the actual build scripts**, not the repo's marketing
+  description: `scripts.d/50-libmp3lame.sh` and `scripts.d/45-libvorbis.sh` in
+  `BtbN/FFmpeg-Builds` have no `$LICENSE`/`$GPL` gate at all — both encoders build
+  unconditionally in every flavor. Only `libx264`/`libx265` (GPL-only) are excluded from the
+  `lgpl` flavor. This addon only ever downloads the `lgpl` asset, so the binary it runs is
+  genuinely LGPL-2.1+, not GPL.
+- **Real download confirmed this session** (Windows amd64, `2026-09-20`): downloaded, extracted,
+  and ran successfully. Real executable path inside the archive:
+  `ffmpeg-n9.0-latest-win64-lgpl-9.0/bin/ffmpeg.exe` (nested — `_find_executable`'s recursive
+  search handles this regardless of the archive's internal layout, so this path isn't
+  hardcoded anywhere). Real `-version` output:
+  `ffmpeg version n9.0.2-3-ga5923073bf-20260920 Copyright (c) 2000-2026 the FFmpeg developers`.
+
+**macOS — evermeet.cx** (`GET https://evermeet.cx/ffmpeg/info/ffmpeg/release`):
+
+- No Apple Silicon native build exists from this source ("I do not plan to provide native
+  ffmpeg binaries for Apple Silicon ARM" — the site's own words). Apple Silicon Macs run the
+  x86_64 build under Rosetta 2, which macOS installs automatically on first launch of an Intel
+  binary.
+- Confirmed via the JSON info API this session: current version `9.0.2`, built with
+  `--enable-gpl --enable-version3` (GPL, not LGPL) and both `--enable-libmp3lame` and
+  `--enable-libvorbis` present. Pinned URL: `https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip`.
+  This is a versioned filename, not a "latest" alias — it will need updating once 9.0.2 is
+  superseded, same caveat as the BtbN builds above.
+- Used despite being GPL because it's invoked as a subprocess only, never linked — see the
+  module docstring in `ffmpeg_binary_manager.py` and `README.md`'s Licensing section for the
+  full reasoning.
+
+**Real end-to-end synthesis + compression confirmed this session** (Windows amd64): a real
+Piper synthesis followed by real ffmpeg compression produced a working `.mp3` file; the
+original `.wav` was removed as designed. Exact before/after byte sizes not yet recorded here —
+see the commit that introduced this feature for the numbers observed at the time.
+
 ## ⚠️ The traps (found by actually running M1)
 
 **`col.sched.forget_cards` does not exist.** The obvious guess fails.

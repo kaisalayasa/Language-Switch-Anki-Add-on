@@ -9,14 +9,29 @@ The exact CLI invocation shape (stdin text + ``--model``/``--output_file`` flags
 Piper's documented usage but has not been run against the real downloaded binary yet --
 see the "still to confirm" entry in ``docs/api-notes.md``. If it mismatches, ``run`` (the
 injected subprocess wrapper) will surface a non-zero exit / stderr rather than fail silently.
+
+**Compression.** Piper only ever writes uncompressed WAV -- no flag of its own produces
+anything smaller. After a successful synthesis, ``synthesize`` makes one best-effort attempt
+to shrink that WAV down to a mono MP3 via ``ffmpeg_binary_manager``'s ffmpeg binary (~44KB/sec
+of WAV audio becomes ~6KB/sec of MP3 -- roughly a 7x reduction, with no audible quality loss
+for spoken word at this bitrate). This is a pure optimization layered on top of an already-
+working pipeline: **any** failure to get a working ffmpeg (unsupported platform, offline, a
+dead pinned download URL, a bad conversion) is caught in ``_compress_to_mp3`` and silently
+falls back to returning the original WAV untouched -- compression must never be the reason
+generating audio stops working. ``col.media.add_file``/the ``[sound:...]`` tag written by
+``ops/tts_batch.py`` are both format-agnostic, so nothing downstream needed to change for
+this. See ``ffmpeg_binary_manager.py`` for where the binary comes from and why its license
+doesn't apply to this addon's own code.
 """
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Optional, Sequence, Tuple
 
+from .ffmpeg_binary_manager import ensure_ffmpeg_binary
 from .piper_binary_manager import RunFn, _run_subprocess, ensure_piper_binary
 from .piper_voice_manager import DownloadFn, ensure_voice
 from .provider_base import TTSProvider
@@ -24,6 +39,10 @@ from .sanitize import sanitize_text
 from .script_ranges import ranges_for_voice
 
 __all__ = ["PiperProvider", "EmptyTextError", "SynthesisError"]
+
+#: Mono MP3 bitrate used for compressed TTS output -- generous for intelligible spoken word,
+#: nowhere near what's needed for music, chosen to bias toward the smallest safe file size.
+_MP3_BITRATE = "48k"
 
 
 class EmptyTextError(ValueError):
@@ -56,6 +75,12 @@ class PiperProvider(TTSProvider):
         self.allowed_ranges = allowed_ranges
         self._download_to = download_to
         self._run: RunFn = run or _run_subprocess
+        # Guards ensure_ffmpeg_binary specifically -- it's new code with a first-download race
+        # the same as ensure_piper_binary/ensure_voice already have, but unlike those two
+        # (accepted as-is elsewhere), nothing already calls this one from ensure_ready(), so a
+        # concurrent TTS batch (ops/tts_runner.py's run_concurrent) really could have several
+        # worker threads reach it at once on a cold cache.
+        self._ffmpeg_lock = threading.Lock()
 
     def ensure_ready(self, voice_id: str) -> None:
         """Downloads the Piper binary and this voice if not already cached, without
@@ -121,4 +146,39 @@ class PiperProvider(TTSProvider):
             raise SynthesisError(
                 "piper reported success but wrote no audio to %s" % out_path
             )
-        return out_path
+        return self._compress_to_mp3(out_path) or out_path
+
+    def _compress_to_mp3(self, wav_path: Path) -> Optional[Path]:
+        """Best-effort WAV -> mono MP3 shrink via ffmpeg. Returns ``None`` (never raises) on
+        any failure at all, so a caller can just fall back to the original WAV -- see the
+        module docstring for why compression must never be able to break synthesis."""
+        try:
+            with self._ffmpeg_lock:
+                binary = ensure_ffmpeg_binary(
+                    self.cache_dir, download_to=self._download_to, run=self._run
+                )
+            mp3_path = wav_path.with_suffix(".mp3")
+            result = self._run(
+                [
+                    str(binary.path),
+                    "-y",
+                    "-i",
+                    str(wav_path),
+                    "-ac",
+                    "1",
+                    "-codec:a",
+                    "libmp3lame",
+                    "-b:a",
+                    _MP3_BITRATE,
+                    str(mp3_path),
+                ]
+            )
+            if result.returncode != 0 or not mp3_path.exists() or mp3_path.stat().st_size == 0:
+                return None
+        except Exception:  # noqa: BLE001 -- compression is optional; any failure just skips it
+            return None
+        try:
+            wav_path.unlink()
+        except OSError:
+            pass
+        return mp3_path

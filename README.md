@@ -74,10 +74,12 @@ Everything it downloads at runtime was individually checked for license compatib
 | [Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF) (language model) | Apache-2.0 |
 | Piper voice `en_US-ljspeech-high` | Public domain |
 | Piper voice `en_GB-alba-medium` | CC BY 4.0 (attribution: "Alba" voice via [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices)) |
+| ffmpeg (Windows/Linux build, used only to compress generated audio) | [LGPL-2.1+](https://github.com/BtbN/FFmpeg-Builds) |
+| ffmpeg (macOS build, same purpose) | [GPL-3.0+](https://evermeet.cx/ffmpeg/) — invoked as a separate subprocess only, never linked into this addon's code, so its license doesn't apply to this addon's own code (the same way any app can shell out to `git` or ImageMagick without becoming GPL itself) |
 
 None of these are bundled in this repository — the addon downloads each one from its own
-official source (GitHub releases, HuggingFace) the first time it's needed, and caches it
-locally.
+official source (GitHub releases, HuggingFace, evermeet.cx for the macOS ffmpeg build) the
+first time it's needed, and caches it locally.
 
 ## For developers
 

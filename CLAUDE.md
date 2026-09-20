@@ -74,8 +74,11 @@ given. Core 2000 is the proving ground, not the ceiling.
   No OpenAI/Anthropic/Google API calls, no sending deck content anywhere.
 - No network calls except: (a) downloading the Piper binary and voice model
   files, (b) downloading the llama.cpp runtime binary and the Qwen2.5-7B GGUF
-  model files, all from their respective public release hosts (GitHub
-  releases, HuggingFace). Nothing else phones home. No telemetry.
+  model files, (c) downloading a static ffmpeg binary used only to compress
+  Piper's WAV output down to MP3 after synthesis — all from their respective
+  public release hosts (GitHub releases, HuggingFace, evermeet.cx for the
+  macOS ffmpeg build — see `addon/tts/ffmpeg_binary_manager.py`). Nothing
+  else phones home. No telemetry.
 - Must never modify a user's original **notetype object** in place. Always
   clone the notetype before touching templates. The notes are always
   **duplicated** onto the clone, never repointed — see "NOTETYPE CLONING /
@@ -607,8 +610,10 @@ piper_voice_manager.py responsibilities:
 piper_provider.py responsibilities:
 
 - Implements provider_base.py's interface: given text, return a path to a
-  generated audio file (WAV is fine — Anki plays WAV natively, no need to
-  transcode to mp3).
+  generated audio file. Piper itself only ever writes uncompressed WAV, which
+  Anki plays natively — but WAV is large (~44KB/sec), so `synthesize()` makes
+  one best-effort attempt to shrink it to a mono MP3 afterward; see
+  "Compression" below.
 - Runs via subprocess call: pass text via stdin, `--model <path to .onnx>`,
   `--output_file <path>`. Must run inside a CollectionOp/QueryOp background
   task, not on the Qt main thread — Piper synthesis is CPU-bound and can take
@@ -657,6 +662,37 @@ piper_provider.py responsibilities:
   target-language text rather than a canned phrase), and full-batch
   generation with progress reporting and skip-if-already-has-audio caching
   (`ops/tts_batch.py`'s `AUDIO_DONE_TAG` / `notes_needing_audio`).
+- **Compression (`ffmpeg_binary_manager.py`, added 2026-09-20).** Piper's WAV
+  output is uncompressed PCM — the actual root cause of an oversized
+  converted deck, confirmed by inspecting a real `.apkg`'s media files. After
+  a successful synthesis, `PiperProvider._compress_to_mp3` makes one
+  best-effort attempt to shrink the WAV to a mono 48kbps MP3 via a
+  lazily-downloaded, cached ffmpeg binary (roughly a 7x size reduction, no
+  audible quality loss for spoken word). **This must never be able to break
+  synthesis**: any failure at all — unsupported platform, offline, a dead
+  pinned download URL, a bad conversion — is caught and silently falls back
+  to returning the original WAV untouched, exactly like before this feature
+  existed. `col.media.add_file`/the `[sound:...]` tag are both
+  format-agnostic, so nothing downstream (`ops/tts_batch.py`,
+  `ops/tts_runner.py`, the Sample button) needed to change.
+  Two different, independently-verified binary sources are used per platform
+  (see the module docstring and `docs/api-notes.md` for exactly how each was
+  verified): Windows/Linux use BtbN/FFmpeg-Builds' **LGPL** flavor (confirmed
+  by reading its build scripts directly — libmp3lame/libvorbis aren't gated
+  behind a GPL check, only libx264/libx265 are excluded from that flavor);
+  macOS has no equivalent LGPL static build available anywhere actively
+  maintained, so it uses evermeet.cx's **GPL** build instead — safe because
+  ffmpeg is only ever invoked as a subprocess, never linked into this
+  addon's own code, the same "shell out to a GPL CLI tool" pattern used by
+  countless MIT/Apache-licensed applications. Every URL is a pinned,
+  verified-working snapshot (the same "needs periodic re-verification"
+  caveat already accepted for llama.cpp's nightly builds — BtbN has no
+  immutable per-version tag to pin to instead). A first-time ffmpeg download
+  during a concurrent TTS batch (`ops/tts_runner.py`'s opt-in concurrent
+  mode) is guarded by `PiperProvider`'s own `threading.Lock` — unlike
+  `ensure_piper_binary`/`ensure_voice`, this one really could race two
+  worker threads on a cold cache, since nothing pre-fetches it from
+  `ensure_ready()` the way the Piper binary/voice are pre-fetched.
 
 `ui/piper_test_dialog.py` — a standalone dialog for sampling a voice in
 isolation, sharing no code with the main screen — is **not wired to the
