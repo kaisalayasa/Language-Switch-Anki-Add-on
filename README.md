@@ -7,7 +7,8 @@ and offline: a local LLM reads the deck's real fields and writes the new card la
 local TTS engine generates the audio. No cloud services, no accounts, no data ever leaves your
 machine.
 
-![Deck Direction Converter main screen](docs/screenshot.png)
+<img width="1917" height="984" alt="main picture" src="https://github.com/user-attachments/assets/c6507db0-9993-4306-a169-ca9e4fab53a0" />
+
 
 ## Why I built this
 
