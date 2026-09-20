@@ -26,82 +26,64 @@
   "template_name": "Card 1",
   "samples": [
     {
-      "note_id": 1536343410533,
+      "note_id": 3000000000001,
       "fields": {
-        "Korean": "<b>나</b>, <b>저</b>(polite)",
-        "English": "I, me&nbsp;",
-        "Audio": "[sound:Day 1-01.mp3]",
+        "Korean": "<b>학교</b>",
+        "English": "school&nbsp;",
+        "Audio": "[sound:sample-ko-01.mp3]",
         "Picture": ""
       },
-      "tags": [
-        "1",
-        "day"
-      ]
+      "tags": ["1", "day"]
     },
     {
-      "note_id": 1536343713829,
+      "note_id": 3000000000002,
       "fields": {
-        "Korean": "<b>회사원 </b>(會社員)",
-        "English": "Company employee",
-        "Audio": "[sound:Day 1-02.mp3]",
-        "Picture": "<img src=\"mHIopEOJEpFx27PHDASlL4hn-kAyjYlzXoXdU10DCy99-MmBFBBgmaE12fShh7cDHI0qJeeCibYPcmPFOyaDT9_BLZ3ZxrQ_aRdxAhePVd14OkO5tSb.jpg\">"
+        "Korean": "<b>선생님 </b>(先生)",
+        "English": "teacher",
+        "Audio": "[sound:sample-ko-02.mp3]",
+        "Picture": "<img src=\"sample-picture-02.jpg\">"
       },
-      "tags": [
-        "1",
-        "day"
-      ]
+      "tags": ["1", "day"]
     },
     {
-      "note_id": 1536343865070,
+      "note_id": 3000000000003,
       "fields": {
-        "Korean": "<b>너무</b>",
-        "English": "too, very",
-        "Audio": "[sound:Day 1-03.mp3]",
+        "Korean": "<b>많이</b>",
+        "English": "a lot, much",
+        "Audio": "[sound:sample-ko-03.mp3]",
         "Picture": ""
       },
-      "tags": [
-        "1",
-        "day"
-      ]
+      "tags": ["1", "day"]
     },
     {
-      "note_id": 1536343939068,
+      "note_id": 3000000000004,
       "fields": {
-        "Korean": "<b>바쁘다</b>",
-        "English": "to be busy",
-        "Audio": "[sound:Day 1-04.mp3]",
-        "Picture": "<img src=\"paste-68f91435b7f28f1a676cbdb83bfb2d831d862e90.jpg\">"
+        "Korean": "<b>배고프다</b>",
+        "English": "to be hungry",
+        "Audio": "[sound:sample-ko-04.mp3]",
+        "Picture": "<img src=\"sample-picture-04.jpg\">"
       },
-      "tags": [
-        "1",
-        "day"
-      ]
+      "tags": ["1", "day"]
     },
     {
-      "note_id": 1536343948105,
+      "note_id": 3000000000005,
       "fields": {
-        "Korean": "<b>우리, 저희</b>(polite)",
-        "English": "we, our",
-        "Audio": "[sound:Day 1-05.mp3]",
+        "Korean": "<b>고양이</b>",
+        "English": "cat",
+        "Audio": "[sound:sample-ko-05.mp3]",
         "Picture": ""
       },
-      "tags": [
-        "1",
-        "day"
-      ]
+      "tags": ["1", "day"]
     },
     {
-      "note_id": 1536344000116,
+      "note_id": 3000000000006,
       "fields": {
-        "Korean": "<b>주말 </b>(週末)",
-        "English": "weekend",
-        "Audio": "[sound:Day 1-06.mp3]",
-        "Picture": "<img src=\"paste-04657a1f056ab25aad63a51f36d3bfef231a75a8.jpg\">"
+        "Korean": "<b>도서관 </b>(圖書館)",
+        "English": "library",
+        "Audio": "[sound:sample-ko-06.mp3]",
+        "Picture": "<img src=\"sample-picture-06.jpg\">"
       },
-      "tags": [
-        "1",
-        "day"
-      ]
+      "tags": ["1", "day"]
     }
   ]
 }

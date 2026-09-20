@@ -18,50 +18,50 @@
   "template_name": "Card 1",
   "samples": [
     {
-      "note_id": 1443624414631,
+      "note_id": 2000000000001,
       "fields": {
-        "Front": "stellen [sound:oddcast-072e7647-ef91ad3b-30f433f3-9c340db8-129f2f55.mp3]",
-        "Back": "to place, set<br>"
+        "Front": "machen [sound:sample-de-01.mp3]",
+        "Back": "to make, do<br>"
       },
       "tags": []
     },
     {
-      "note_id": 1443624141420,
+      "note_id": 2000000000002,
       "fields": {
-        "Front": "stehen [sound:oddcast-131f7a4d-8027a755-1839d67f-01162464-1b28ccdc.mp3]",
-        "Back": "to stand<br>"
+        "Front": "gehen [sound:sample-de-02.mp3]",
+        "Back": "to go<br>"
       },
       "tags": []
     },
     {
-      "note_id": 1443624335130,
+      "note_id": 2000000000003,
       "fields": {
-        "Front": "sprechen [sound:oddcast-657ce755-64261b5b-da958988-a73c4a19-4276b0c9.mp3]",
-        "Back": "to speak<br>"
+        "Front": "kommen [sound:sample-de-03.mp3]",
+        "Back": "to come<br>"
       },
       "tags": []
     },
     {
-      "note_id": 1443624495012,
+      "note_id": 2000000000004,
       "fields": {
-        "Front": "spielen [sound:oddcast-e82d0e98-82b5c473-38d3a830-89819e5c-902b2d24.mp3]",
-        "Back": "to play<br>"
+        "Front": "sehen [sound:sample-de-04.mp3]",
+        "Back": "to see<br>"
       },
       "tags": []
     },
     {
-      "note_id": 1443624074968,
+      "note_id": 2000000000005,
       "fields": {
-        "Front": "sollen [sound:oddcast-71f3f6c4-7be79cbd-78f6396c-e4ac3578-01201cc9.mp3]",
-        "Back": "should, ought to<br>"
+        "Front": "wissen [sound:sample-de-05.mp3]",
+        "Back": "to know<br>"
       },
       "tags": []
     },
     {
-      "note_id": 1443625270588,
+      "note_id": 2000000000006,
       "fields": {
-        "Front": "sitzen [sound:oddcast-674a265e-8ac0a696-6e7b5aac-93104617-6c20b1d1.mp3]",
-        "Back": "to sit<br>"
+        "Front": "essen [sound:sample-de-06.mp3]",
+        "Back": "to eat<br>"
       },
       "tags": []
     }
