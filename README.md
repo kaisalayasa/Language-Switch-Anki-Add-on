@@ -1,253 +1,87 @@
 # Deck Direction Converter
 
-An Anki addon that flips a bilingual deck's direction — *Language A front / Language B back*
-becomes *Language B front / Language A back* — using a local LLM (Qwen2.5-7B-Instruct, run
-through [llama.cpp](https://github.com/ggml-org/llama.cpp)) to read the deck's real content and
-write the converted card's templates directly, then generates natural TTS audio for the
-newly-fronted language using [Piper](https://github.com/rhasspy/piper), locally and offline.
-Both models run entirely on-device — nothing about a deck's content, or how it gets converted,
-is ever sent anywhere.
+An Anki addon that takes an existing bilingual deck and flips its direction — for example,
+turning a Japanese-front/English-back deck into an English-front/Japanese-back deck — and
+generates natural pronunciation audio for the newly-fronted language. Everything runs locally
+and offline: a local LLM reads the deck's real fields and writes the new card layout, and a
+local TTS engine generates the audio. No cloud services, no accounts, no data ever leaves your
+machine.
 
-**Status:** the core pipeline — Analyze, Convert, Generate TTS audio, live preview (including
-right after Analyze and before Convert), reopening an already-converted deck to generate more
-audio without a fresh AI call, and hiding/showing individual fields without touching HTML — is
-built, covered by 308 unit tests (`python -m unittest discover -s tests -t .`, no Anki or
-network required), and confirmed working end-to-end against a real Anki profile, including a
-real fix for the original deck's own audio playing on the converted card (see "How a conversion
-writes" below). One known item is still open, tracked in [`TODO.md`](TODO.md): a
-placement-compliance check `llm/validate.py` doesn't yet make (one specific test deck is
-occasionally flaky on direction). License (MIT vs. GPL) is still an open, deliberately deferred
-decision — see Milestones below.
+![Deck Direction Converter main screen](docs/screenshot.png)
 
-## Why a local LLM instead of a hand-written mapping system
+## Why I built this
 
-This addon used to work the other way around: a role-mapping system (`Word`/`Sentence`/`Audio`/…
-role tags, content-based auto-detection heuristics, and a template generator that turned a
-role→field dict into HTML) drove the whole conversion. It worked, but every new deck shape
-tended to expose a heuristic that didn't generalize — a field mixing real text with its own
-embedded audio, a deck whose fields were literally named `Front`/`Back`, and so on each needed
-its own special case.
+There are a lot of excellent, carefully-built decks out there for people learning Japanese —
+Core 2000 being a well-known example. But the reverse doesn't really exist: there isn't nearly
+as much equally well-structured material for people trying to learn English. Rather than build
+a new English-learning deck from scratch, it seemed simpler to just take a deck that already
+works — good example sentences, good structure, years of community refinement — and reverse it:
+flip which language is on the front, and generate real pronunciation audio for it. That way the
+quality of the original deck carries over, but now a much wider audience can actually use it.
 
-The LLM approach replaces all of that: given a notetype's real fields, real sample values, and
-its current CSS, the model writes the finished Front/Back/CSS HTML directly. What it does
-**not** do is decide direction, language, or field placement — those are computed in Python
-(`addon/llm/direction.py`) and simply handed to the model as a given fact. That split exists
-because the model was tested on deciding direction itself, four separately-phrased ways, and
-failed all four identically (see `docs/llm-notes.md` and `CLAUDE.md`'s "LOCAL LLM DECK ANALYSIS"
-section for the full account) — it's an abstraction the model reliably gets right, wrapped
-around a reasoning task it reliably does not.
+## Current status and limitations
 
-## How a conversion writes: always a new deck
+- **Direction-flipping works between any two languages** the deck already contains — the addon
+  reads the deck's own content to figure out field placement, it isn't hardcoded to Japanese or
+  English.
+- **Pronunciation audio currently only works when English ends up as the new front-facing
+  language.** The addon's voice list right now only includes English voices, so converting into
+  a non-English front will flip the deck correctly but won't have audio generated for it yet.
+  Adding more languages is a matter of adding more voices, not rebuilding the pipeline — it's
+  planned, just not done yet.
+- The core flow (analyze → review → convert → generate audio) is built and tested end-to-end.
+  See [`TODO.md`](TODO.md) for the small list of known open issues.
 
-A conversion clones the notetype, writes the AI's generated templates onto the clone, and
-**duplicates** the notes onto it into a brand-new deck. The original deck, notetype, and notes
-are always 100% untouched.
+## Requirements
 
-**There used to be a second mode, "Flip in place"** (repoint the existing notes onto the clone
-instead, replacing their current cards) — removed. It was cut once a real audio-safety fix (see
-below) came to depend on every note being duplicated: the only reliable way to guarantee a
-note's own pre-existing audio can never survive onto the converted card is to strip
-`[sound:...]` out of every field's value while copying it — which needs a fresh copy to write
-the stripped value into. Flip in place never created one, and giving it the same guarantee would
-have meant rewriting the literal content of the user's real, existing notes in place — a bigger,
-more sensitive kind of change than anything else this addon does. Rather than ship that, or ship
-one mode safe and the other not, it was cut. See `docs/api-notes.md` for why the mechanism the
-old design leaned on (`{{text:Field}}`) never actually worked for this in the first place.
+- Anki 2.1.50 or newer (built and verified against 26.08.1)
+- Windows, macOS, or Linux — CPU only, no GPU required
+- About 5 GB of free disk space the first time you use it (a local language model and a local
+  text-to-speech voice are downloaded once and cached — every run after that is fast and fully
+  offline)
 
-Scheduling is **always** reset. The old interval and ease describe a skill — recognition in the
-original direction — that was never practised in the new direction, so carrying it over would
-be actively misleading.
+## How to use it
 
-A conversion's real writes (the clone, the notes, the scheduling reset) always happen before
-Anki's own undo-grouping step, which is why a `merge_undo_entries` hiccup there (Anki's
-`"target undo op not found"`, seen occasionally in real use) is recovered from with a
-same-tick retry instead of being reported as a failed conversion — see `apply_plan` in
-`notetype_manager.py` and `docs/api-notes.md` for the full writeup.
+1. **Install the addon** in Anki (Tools → Add-ons → Install from file…, using the
+   `.ankiaddon` file — see [Installing](#installing) below if you're building it yourself).
+2. Open **Tools → Deck Direction Converter…**
+3. **Pick the deck and note type** you want to convert from the dropdowns.
+4. Click **Analyze**. The first time you do this, it downloads the local language model — this
+   can take a while depending on your connection, but only happens once. It reads your deck's
+   real fields and content and works out how the converted card should look.
+5. **Review the result** in the live preview on the right. You can:
+   - Use **Hide fields** to show or hide individual fields on the card without touching any code.
+   - Switch to the **HTML** view if you want to hand-edit the generated template directly.
+6. Click **Convert**. This creates a brand-new deck with the flipped direction — your original
+   deck, notes, and notetype are never modified or touched in any way.
+7. Click **Generate TTS audio**. The first time, this downloads the voice model — again, only
+   once. It then generates pronunciation audio for every card, with a progress bar and a Stop
+   button; you can stop partway through and pick up again later without redoing finished cards.
+8. Study your new deck like any other.
 
-The original **notetype object** is never modified.
+## Licensing
 
-## Design rules
+This addon's own code is **MIT-licensed** (see [`LICENSE`](LICENSE)) — free to use, modify, and
+share.
 
-- **`addon/core/` and `addon/tts/` are pure**, and `addon/llm/` is pure except for the one
-  real subprocess call each in `llm/client.py`/`llm/runtime.py`, always dependency-injected out
-  in tests. No `anki`, no `aqt`, no language name, no script name, no deck-specific field name in
-  `core/` (the LLM prompt itself is the one deliberate exception — `llm/prompt.py` — since
-  describing languages is its entire job; see its module docstring). Enforced by
-  `tests/test_purity.py`, not by convention.
-- **Never guess an Anki or llama.cpp API.** See `docs/api-notes.md` and `docs/llm-notes.md`.
-  (`col.sched.forget_cards` does not exist — it's `schedule_cards_as_new`. `-no-cnv` does not
-  exist on the pinned llama.cpp build — it's `--single-turn`.)
-- **Direction, language, and audio-field placement are computed, never asked of the model or
-  the user.** `llm/direction.py`'s `resolve_direction` is the single source of truth; see
-  `CLAUDE.md` for why.
-- **A deck's pre-existing audio can never play on the converted card.** Enforced at the data
-  level: every field's value has `[sound:...]` stripped out while it's copied onto the clone
-  (`ops/notetype_manager.py`'s `_strip_pre_existing_audio`), unconditionally, regardless of what
-  the AI's template ends up referencing or how. `{{text:Field}}` was tried first and doesn't
-  actually work for this — see `CLAUDE.md`'s "NOTETYPE CLONING / SAFE APPLY" → "Audio" section
-  for why, confirmed against real Anki source.
-- **Refuse rather than misalign.** If a plan's field names disagree with the live notetype, or
-  a schema-level Anki call returns something this addon doesn't recognise, the run stops
-  (`ApiMismatch`) instead of writing the wrong content into every note.
+Everything it downloads at runtime was individually checked for license compatibility rather
+than assumed:
 
-## Layout
+| Component | License |
+|---|---|
+| [Piper](https://github.com/rhasspy/piper) (TTS engine) | MIT |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) (LLM runtime) | MIT |
+| [Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF) (language model) | Apache-2.0 |
+| Piper voice `en_US-ljspeech-high` | Public domain |
+| Piper voice `en_GB-alba-medium` | CC BY 4.0 (attribution: "Alba" voice via [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices)) |
 
-```
-addon/
-  core/        pure logic — conversion (plan/validate/preflight), deck_state (records which
-               notetypes this addon already converted, and to what), audio_fields (naming and
-               recognition for generated-audio fields), language_detect
-  llm/         local LLM pipeline — runtime/model_manager (download+cache llama.cpp and
-               Qwen2.5-7B), client (runs one completion), prompt/response (build the prompt,
-               parse the reply), direction/template_fields/audio_safety (deterministic
-               direction, placement, and audio-safety logic the model never decides), validate
-               (checks the model's output against real failure modes), analyze (orchestrates a
-               full Analyze call, retries, trust rating)
-  tts/         pure logic — Piper binary/voice managers, subprocess provider, sanitizer,
-               script_ranges (voice locale -> pronounceable characters)
-  ops/         everything that imports anki/aqt — notetype cloning/safe-apply, conversion as a
-               CollectionOp, TTS batch execution and its Qt-facing runner, deck_data (reads
-               real note samples for the LLM prompt)
-  ui/          main_screen (the single entry point), preview_panel (embedded live preview),
-               piper_test_dialog (standalone dev/debug voice check)
-  user_files/  gitignored, per-machine: Piper binary/voice cache, llama.cpp runtime + model cache
-  vendor/      committed third-party source (langdetect + six) — see vendor/README.md
-tests/         stock-Python unit tests, no Anki required, no network required
-tools/         install_dev.py, build_ankiaddon.py
-docs/          deck-facts.md (verified ground truth for the Core 2000 test deck), api-notes.md
-               (verified Anki API facts), llm-notes.md (verified llama.cpp/Qwen facts)
-```
+None of these are bundled in this repository — the addon downloads each one from its own
+official source (GitHub releases, HuggingFace) the first time it's needed, and caches it
+locally.
 
-## Development
+## For developers
 
-```bash
-python -m unittest discover -s tests -t .   # 289 tests, no Anki needed, no network needed
-python tools/install_dev.py --link          # install into Anki (close Anki first)
-```
-
-Then in Anki: **Tools → Deck Direction Converter…** — the single entry point
-(`addon/ui/main_screen.py`). There's also a separate **Test Piper voice… (dev)** action for
-standalone voice sampling; it shares no code with the main screen and exists purely as a dev/
-debug tool. (An earlier Tools submenu holding separate Convert/Preview/Generate-TTS dialogs,
-built around the deleted role-mapping system, has been removed — the single screen replaced it,
-exactly as originally planned.)
-
-### The single screen, top to bottom
-
-1. **Pick a (deck, notetype) pair.** Pairs are read live from the collection
-   (`ops/deck_data.decks_with_notetypes`), scoped by both deck and notetype since either alone
-   can be ambiguous. There's no mode to choose any more — every conversion duplicates onto a new
-   deck (see above).
-2. **Analyze** — sends a handful of real sample notes (`ops/deck_data.collect_field_samples`,
-   capped to match what the prompt actually uses) plus the current templates to the local model
-   and gets back a `DeckAnalysis`: a plain-language description, the finished Front/Back/CSS, the
-   detected target/native language, which fields ended up on which new side, and a 1-5 star trust
-   rating (never something the model reports about itself — computed from how many retries
-   validation actually needed; see `CLAUDE.md`). Below 5 stars, a plain-language review message
-   nudges the user to check the preview carefully, or at 1 star to consider hand-editing before
-   converting.
-   If this (deck, notetype) pair was **already converted** in an earlier session, Analyze reads
-   that back (`core/deck_state.state_from_notetype` — a tag plus a CSS comment marker, either one
-   surviving `.apkg` export/import) and feeds it in as `known_state`, so re-Analyzing an
-   already-converted deck can't flip it back to its original direction — see `llm/direction.py`.
-3. **Review** — the right-hand pane is a live, embeddable preview (`ui/preview_panel.PreviewPanel`,
-   an `AnkiWebView` fed via `note.ephemeral_card()`, never writing to the collection) showing the
-   card Analyze just produced. The left-hand pane defaults to a read-only summary of the analysis;
-   toggling "HTML" swaps it for a raw Front/Back/Styling text editor pre-filled with the same
-   content — whatever that editor holds is exactly what Convert uses, whether it came straight
-   from Analyze, hand-edited, or changed via "Hide fields" below.
-   **Only fields the original card actually showed are placed at all:** a field never referenced
-   anywhere in the *original* `qfmt`/`afmt` (a deck's own bookkeeping/index columns — Core 2000's
-   `Core-Index`, `Optimized-Voc-Index`, etc., confirmed against the real deck export never being
-   referenced in its own template) is excluded from placement entirely by `llm/direction.py`, the
-   same way a not-yet-existing generated-audio field already was — and never shown to the model at
-   all (`llm/analyze.py` filters the prompt down to exactly what got placed). Fixing this stopped a
-   real, observed bug where every one of a deck's hidden bookkeeping fields was rendering on the
-   converted card's back, something the original card never did.
-   **Hide fields** — a third left-pane mode, next to "HTML", for turning an already-placed field's
-   display on or off without touching HTML at all: a checkbox list of exactly the fields currently
-   referenced (or currently hidden) on the Front/Back (`llm/field_visibility.py`'s
-   `visible_fields`), split by side. Unchecking one **removes its reference from the HTML
-   entirely**, replacing it with an inert marker comment (`<!--ddc-hidden:Field:filter-->`) that
-   records the field name and its original filter — nothing is left behind to render, no wrapper
-   element, no CSS class — and re-checking the box restores the exact original reference, byte
-   for byte, in the same place. This is purely a *display* toggle, safe for any field including
-   one that might carry audio: the actual guarantee against playing pre-existing audio lives one
-   step earlier, in the copy every note goes through at Convert time (see "How a conversion
-   writes" above), not in how a field happens to be hidden afterward — an earlier version of this
-   feature instead wrapped the reference in a `display: none` span, which only hid the play
-   *button*, not the sound (Anki decides what to autoplay by scanning the rendered text,
-   independent of CSS/DOM); once the real fix moved to the data itself, there was no reason left
-   to keep a wrapper around instead of just removing the reference. A field the deck never showed
-   in the first place (per the paragraph above) isn't listed — there's nothing to toggle for a
-   field that was never part of the card.
-4. **Convert** — writes the reviewed templates via a clone-notetype flow (`ops/notetype_manager`,
-   `ops/convert_op`), duplicating the notes onto a new deck and always resetting scheduling, and
-   records the conversion (`core/deck_state`) so this pair is recognised as converted from now on.
-5. **Generate TTS audio** — batch-synthesizes audio for every field `llm/direction.py` decided
-   needs it (usually two per note: a word/term and a full sentence, each into its own field —
-   never one shared field) via Piper, with visible progress and a real Stop button, resumable
-   (a re-run only touches notes without the `ddc-tts-generated` tag), and safe to run partially or
-   repeatedly — every audio field starts empty and is referenced with a conditional, so a note
-   the batch hasn't reached yet simply renders nothing rather than stale or wrong-language audio.
-   For a pair **already known converted**, this step needs no fresh Analyze call at all: which
-   fields to speak and which fields their audio goes into is fully recomputed locally
-   (`llm.direction.resolve_direction`, no AI call) every time the pair changes, so adding more TTS
-   to an already-converted deck later is instant. Voice selection defaults to `en_GB-alba-medium`
-   (`addon/config.json`'s `tts_voice`); "Sample" speaks the *currently selected note's* own
-   target-language text rather than a canned phrase.
-
-Both the local LLM and Piper download their binary/model files on first use into
-`addon/user_files/` (gitignored, never wiped by an addon update) — a few hundred MB for Piper's
-binary + voice, roughly 4.7GB for the split Qwen2.5-7B-Instruct GGUF plus the llama.cpp runtime.
-Every later run reuses the cache. The Analyze progress message distinguishes "downloading the
-model" from "already downloaded, just analyzing" so a long first run doesn't look identical to a
-stuck one.
-
-To install a real, packaged copy (rather than the dev symlink above):
-
-```bash
-python tools/build_ankiaddon.py   # writes dist/deck_direction_converter-<version>.ankiaddon
-```
-
-Then Anki → Tools → Add-ons → Install from file… This is a small local script, not the
-community `anki-addon-builder` (`aab`) tool — `aab` expects the addon to live under
-`src/<module_name>/` with a repo-root `addon.json`, and is built around git-tag-based versioning
-for publishing to AnkiWeb. Adopting it would mean restructuring this repo for a public-release
-workflow this project hasn't committed to yet (license — MIT vs. GPL — is still an open
-question, deliberately deferred). This script does the one thing needed for now: produce a file
-Anki can actually install, for testing outside the dev symlink. It excludes `addon/user_files/`
-(a fresh install shouldn't inherit the packager's locally-downloaded model/voice cache).
-
-Develop against a scratch profile, not your real collection. Every operation is scoped to a
-single (deck, notetype) pair, but in-development code writes to the same `collection.anki2`
-that holds everything else.
-
-## Milestones
-
-M1 proof of concept · M2 Piper integration · M3 role-mapping UI · M4 language detection ·
-M5 batch apply · M6 profiles · M7 release prep
-
-**M1-M6 and the packaging half of M7 were completed against the original role-mapping
-architecture, then that entire architecture was deleted.** The LLM overhaul (see "Why a local
-LLM" above) replaced the role schema, content-based role detection, the template generator, the
-profiles system, and the role-mapper/field-list UI wholesale with the pipeline described in
-`CLAUDE.md`'s "LOCAL LLM DECK ANALYSIS" section, and replaced the old Tools submenu of separate
-dialogs with the single screen described above. What M1-M7 actually discovered along the way —
-the notetype-cloning safety rules, the undo-boundary rules, the "audio in a new field, not a
-reused one" policy, the wrong-script-filter trap — all still hold for the system that replaced
-it; only the specific role-mapping code is gone.
-
-**Deliberately not done:** a LICENSE file, `manifest.json` license metadata, and a contribution
-guide — all need the MIT-vs-GPL decision, which is intentionally on hold ("I don't know
-anything about open source, leave it for later"). Nothing in the addon depends on that
-decision; it only blocks the parts of a public release about being ready for outside
-contributors.
-
-**Known limitation, not a bug:** the curated Piper voice list (`addon/tts/piper_voice_manager.py`)
-ships English voices only — `en_US-lessac-medium` and `en_GB-alba-medium`. A deck whose
-*newly-fronted* language is not English has no voice to generate with yet, even though Analyze
-and Convert already work for any language pair the local LLM can read. Piper publishes voices
-for many languages; widening the curated list is a data change, not a code one.
-
-See [`TODO.md`](TODO.md) for the current, actively-tracked list of open bugs and follow-ups.
+The full technical write-up — architecture, design decisions, verified Anki/llama.cpp API
+facts, and the reasoning behind every non-obvious choice in this codebase — lives in
+[`CLAUDE.md`](CLAUDE.md) and the [`docs/`](docs/) folder. [`TODO.md`](TODO.md) tracks known
+open issues.

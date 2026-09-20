@@ -24,7 +24,7 @@ from tests.test_piper_provider import _prepopulate_binary, _stub_voice_download
 
 class TestVoiceIdParsing(unittest.TestCase):
     def test_the_language_comes_off_the_front_of_a_real_voice_id(self):
-        self.assertEqual(language_of_voice("en_US-lessac-medium"), "en")
+        self.assertEqual(language_of_voice("en_US-ljspeech-high"), "en")
         self.assertEqual(language_of_voice("en_GB-alba-medium"), "en")
         self.assertEqual(language_of_voice("ko_KR-kss-medium"), "ko")
         self.assertEqual(language_of_voice("ja_JP-test-medium"), "ja")
@@ -79,7 +79,7 @@ class TestTextSurvivesTheRightVoice(unittest.TestCase):
         and that makes a voice stumble over the whole sentence."""
         cleaned = sanitize_text(
             "processing (unlike 加工, a new thing is not created)",
-            allowed_ranges=ranges_for_voice("en_US-lessac-medium"),
+            allowed_ranges=ranges_for_voice("en_US-ljspeech-high"),
         )
         self.assertIn("processing", cleaned)
         self.assertNotIn("加工", cleaned)

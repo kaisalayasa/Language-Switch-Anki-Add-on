@@ -71,14 +71,25 @@ archive layout wrong wastes a build cycle the same way a wrong Anki signature do
 **HuggingFace voice repo** (`rhasspy/piper-voices`):
 
 - Path/filename convention confirmed by listing a real folder and file:
-  `en/en_US/lessac/medium/en_US-lessac-medium.onnx` genuinely exists (63,201,294 bytes),
-  alongside `en_US-lessac-medium.onnx.json` (4,885 bytes). General pattern:
+  `en/en_US/ljspeech/high/en_US-ljspeech-high.onnx` genuinely exists (114,199,011 bytes),
+  alongside `en_US-ljspeech-high.onnx.json` (4,970 bytes). General pattern:
   `en/{locale}/{voice}/{quality}/{locale}-{voice}-{quality}.onnx{,.json}`.
 - Download via `https://huggingface.co/rhasspy/piper-voices/resolve/main/<path>`.
 - `en_GB/alba` folder confirmed to exist as a locale/voice pairing; its `medium` quality
-  subfolder was not independently re-checked byte-for-byte the way `lessac/medium` was — if
+  subfolder was not independently re-checked byte-for-byte the way `ljspeech/high` was — if
   `piper_test_dialog.py`'s "Speak" button fails to download it, that's the first thing to
   check, and this note should be updated with the real result either way.
+- **Per-voice license check (2026-09-20), don't skip this when adding a voice:** each voice's
+  `MODEL_CARD` on this repo states its own license, and they are not uniform.
+  `en_US-lessac-medium` (the addon's original default) was checked and found to be trained on
+  the Blizzard 2013/Lessac corpus, licensed "Research Purposes only" and explicitly excluding
+  "the development, marketing, commercialisation, sale or licencing of voice synthesis ...
+  products" — see https://www.cstr.ed.ac.uk/projects/blizzard/2013/lessac_blizzard2013/license.html.
+  Removed from `CURATED_VOICES` for that reason. `en_US-ljspeech-high`'s model card states
+  "License: public domain" — confirmed clean, now the default. `en_GB-alba-medium`'s model card
+  states "License: https://creativecommons.org/licenses/by/4.0/" (CC BY 4.0) — usable, requires
+  attribution (given in `README.md`'s Licensing section), not yet independently re-verified
+  beyond the model-card text itself.
 
 **Still unverified (signature/behavioural level, not presence)**:
 

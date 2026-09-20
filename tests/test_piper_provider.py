@@ -52,14 +52,14 @@ class TestPiperProviderSynthesize(unittest.TestCase):
             out = provider.synthesize(
                 "processing,&nbsp;management<div>(unlike 加工, a new thing "
                 "is not created)</div>",
-                voice_id="en_US-lessac-medium",
+                voice_id="en_US-ljspeech-high",
             )
 
             self.assertTrue(out.exists())
             self.assertGreater(out.stat().st_size, 0)
             self.assertIn("--model", captured["argv"])
             model_arg = captured["argv"][captured["argv"].index("--model") + 1]
-            self.assertIn("en_US-lessac-medium.onnx", model_arg)
+            self.assertIn("en_US-ljspeech-high.onnx", model_arg)
             self.assertNotIn("加工", captured["input_text"])
             self.assertNotIn("<div>", captured["input_text"])
             self.assertIn("processing", captured["input_text"])
@@ -74,7 +74,7 @@ class TestPiperProviderSynthesize(unittest.TestCase):
             )
             with self.assertRaises(EmptyTextError):
                 provider.synthesize(
-                    "<!-- only a comment -->", voice_id="en_US-lessac-medium"
+                    "<!-- only a comment -->", voice_id="en_US-ljspeech-high"
                 )
 
     def test_nonzero_exit_from_piper_raises_synthesis_error(self):
@@ -89,7 +89,7 @@ class TestPiperProviderSynthesize(unittest.TestCase):
                 cache_dir, download_to=_stub_voice_download, run=fake_run
             )
             with self.assertRaises(SynthesisError):
-                provider.synthesize("hello there", voice_id="en_US-lessac-medium")
+                provider.synthesize("hello there", voice_id="en_US-ljspeech-high")
 
     def test_ensure_ready_downloads_binary_and_voice_without_synthesizing(self):
         calls = []
@@ -105,10 +105,10 @@ class TestPiperProviderSynthesize(unittest.TestCase):
                 cache_dir, download_to=_stub_voice_download, run=fake_run
             )
 
-            provider.ensure_ready("en_US-lessac-medium")
+            provider.ensure_ready("en_US-ljspeech-high")
 
-            onnx = Path(cache_dir) / "voices" / "en_US-lessac-medium.onnx"
-            config = Path(cache_dir) / "voices" / "en_US-lessac-medium.onnx.json"
+            onnx = Path(cache_dir) / "voices" / "en_US-ljspeech-high.onnx"
+            config = Path(cache_dir) / "voices" / "en_US-ljspeech-high.onnx.json"
             self.assertTrue(onnx.exists())
             self.assertTrue(config.exists())
             self.assertTrue(all("--version" in argv for argv in calls))
@@ -129,8 +129,8 @@ class TestPiperProviderSynthesize(unittest.TestCase):
                 run=lambda argv, input_text=None: SubprocessResult(0, "piper 1.2.0", ""),
             )
 
-            provider.ensure_ready("en_US-lessac-medium")
-            provider.ensure_ready("en_US-lessac-medium")
+            provider.ensure_ready("en_US-ljspeech-high")
+            provider.ensure_ready("en_US-ljspeech-high")
 
             self.assertEqual(len(downloads), 2, "onnx + json, only on the first call")
 
@@ -147,7 +147,7 @@ class TestPiperProviderSynthesize(unittest.TestCase):
                 cache_dir, download_to=_stub_voice_download, run=fake_run
             )
             with self.assertRaises(SynthesisError):
-                provider.synthesize("hello there", voice_id="en_US-lessac-medium")
+                provider.synthesize("hello there", voice_id="en_US-ljspeech-high")
 
 
 if __name__ == "__main__":

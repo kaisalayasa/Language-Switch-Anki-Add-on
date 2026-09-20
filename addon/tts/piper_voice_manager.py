@@ -1,11 +1,20 @@
 """Curated Piper voice list, plus download/cache of a voice's ``.onnx``/``.onnx.json`` pair.
 
 The URL pattern and the two starting voices were verified against the real HuggingFace repo
-this session (see ``docs/api-notes.md``) -- ``en/en_US/lessac/medium/en_US-lessac-medium.onnx``
-genuinely exists there. ``CURATED_VOICES`` is deliberately short for M2 (the user asked for a
-real multi-voice picker later, "once we get to the final stages", not now); the point of
+(see ``docs/api-notes.md``) -- ``en/en_US/ljspeech/high/en_US-ljspeech-high.onnx`` genuinely
+exists there. ``CURATED_VOICES`` is deliberately short for M2 (the user asked for a real
+multi-voice picker later, "once we get to the final stages", not now); the point of
 :class:`VoiceSpec` and this module's shape is that growing the list later is just appending
 entries, not a redesign.
+
+``en_US-lessac-medium`` was the original default here and has been deliberately removed, not
+just swapped for a better voice: the Lessac/Blizzard-2013 corpus this voice was trained on is
+licensed "Research Purposes only" and explicitly excludes "the development, marketing,
+commercialisation, sale or licencing of voice synthesis ... products" -- see
+https://www.cstr.ed.ac.uk/projects/blizzard/2013/lessac_blizzard2013/license.html. That's
+broad enough to cover a free open-source addon whose purpose is voice synthesis, so it was
+never safe to ship as a default regardless of price. ``en_US-ljspeech-high`` replaces it:
+the LJSpeech corpus is public domain per its own model card, no restriction of any kind.
 """
 
 from __future__ import annotations
@@ -29,10 +38,10 @@ HF_RESOLVE_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
 
 @dataclass(frozen=True)
 class VoiceSpec:
-    voice_id: str  # e.g. "en_US-lessac-medium" -- also the .onnx file's basename
+    voice_id: str  # e.g. "en_US-ljspeech-high" -- also the .onnx file's basename
     locale: str  # e.g. "en_US"
-    name: str  # e.g. "lessac"
-    quality: str  # e.g. "medium"
+    name: str  # e.g. "ljspeech"
+    quality: str  # e.g. "high"
     display_name: str  # shown in the voice picker
 
 
@@ -43,7 +52,7 @@ class VoiceFiles:
 
 
 CURATED_VOICES: Tuple[VoiceSpec, ...] = (
-    VoiceSpec("en_US-lessac-medium", "en_US", "lessac", "medium", "English (US) – Lessac"),
+    VoiceSpec("en_US-ljspeech-high", "en_US", "ljspeech", "high", "English (US) – LJSpeech"),
     VoiceSpec("en_GB-alba-medium", "en_GB", "alba", "medium", "English (UK) – Alba"),
 )
 

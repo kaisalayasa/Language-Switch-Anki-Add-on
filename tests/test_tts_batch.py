@@ -28,7 +28,7 @@ from addon.tts.piper_provider import EmptyTextError
 from tests.fake_collection import FakeCollection
 
 FIELDS = ["Word", "Sentence", "Meaning", "AudioWord", "AudioSentence"]
-VOICE_ID = "en_US-lessac-medium"
+VOICE_ID = "en_US-ljspeech-high"
 
 AUDIO_FIELD = "AudioWord"
 SOURCE_FIELD = "Word"

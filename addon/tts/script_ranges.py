@@ -78,7 +78,7 @@ _LANG_RE = re.compile(r"^[A-Za-z]{2,3}")
 
 
 def language_of_voice(voice_id: str) -> str:
-    """The bare language code in a Piper voice id, e.g. ``en_US-lessac-medium`` -> ``en``.
+    """The bare language code in a Piper voice id, e.g. ``en_US-ljspeech-high`` -> ``en``.
 
     Returns ``""`` for anything that doesn't start with a language code, which callers
     treat the same as an unknown language.

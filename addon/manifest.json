@@ -2,7 +2,8 @@
   "package": "deck_direction_converter",
   "name": "Deck Direction Converter",
   "human_version": "0.1.0",
-  "homepage": "",
+  "homepage": "https://github.com/kaisalayasa/Language-Switch-Anki-Add-on",
   "conflicts": [],
-  "min_point_version": 50
+  "min_point_version": 50,
+  "license": "MIT"
 }

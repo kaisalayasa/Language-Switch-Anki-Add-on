@@ -18,23 +18,24 @@ not what a flag's name suggests it should do.
 
 ## PROJECT MISSION
 
-Build an open-source Anki addon (target repo: public GitHub, MIT or GPL
-license TBD) that converts an existing bilingual language-learning deck from
-"Language A front, Language B back" into "Language B front, Language A back,"
-generating natural TTS audio for the newly-fronted language using Piper
-(local, offline, free — no cloud AI providers).
+Build an open-source Anki addon (MIT-licensed, see `LICENSE`) that converts an
+existing bilingual language-learning deck from "Language A front, Language B
+back" into "Language B front, Language A back," generating natural TTS audio
+for the newly-fronted language using Piper (local, offline, free — no cloud AI
+providers).
 
 **The deck's field placement, and the Front/Back/CSS template HTML itself, are
 produced by a local LLM** (Qwen2.5-7B-Instruct, run through llama.cpp — see
 "LOCAL LLM DECK ANALYSIS" below), not by a hand-written role-mapping/template-
-generation system. That system existed first (M1-M6, see BUILD ORDER below)
-and was deliberately deleted once the LLM approach proved it could do the same
-job — reading a deck's real field content and producing a correct, styled
-card — without a maintained catalogue of role definitions, content heuristics,
-and generator rules that broke on every new deck shape. **The LLM runs
-entirely locally, via a downloaded-and-cached llama.cpp binary and GGUF model
-file — this is still a "no cloud AI providers" project**, just one where the
-"no cloud" constraint now also covers deck analysis, not only TTS.
+generation system. An earlier, hand-written version of this addon existed
+first and was deliberately deleted, not deprecated, once the LLM approach
+proved it could do the same job — reading a deck's real field content and
+producing a correct, styled card — without a maintained catalogue of role
+definitions, content heuristics, and generator rules that broke on every new
+deck shape. **The LLM runs entirely locally, via a downloaded-and-cached
+llama.cpp binary and GGUF model file — this is still a "no cloud AI
+providers" project**, just one where the "no cloud" constraint now also
+covers deck analysis, not only TTS.
 
 **Starting test case:** the "Core 2000" Japanese deck (Japanese-front,
 English-back) → converted into an English-front, Japanese-back deck with
@@ -42,7 +43,7 @@ generated English audio. The deck export lives at `Core 2000 claude.txt`
 (tab-separated, 1983 notes, quoted CSV-style — parse it with `csv` and
 `delimiter='\t'`, never `str.split('\t')`). A Korean deck and a German deck
 (the latter specifically for its field-name collisions and mixed text+audio
-field, see below) were added later as second and third proving grounds.
+field, see below) are the second and third proving grounds.
 
 **Note the export does NOT contain field names** — Anki omits them. The
 authoritative field list was read directly from the collection DB and is
@@ -52,10 +53,9 @@ truth for field names.
 **Long-term goal, already substantially true:** the tool must generalize to
 arbitrary two-language decks, not be hardcoded to Core 2000's specific field
 names. Nothing in `addon/llm/` or `addon/core/` names a language, a script, or
-a deck-specific field name (enforced by `tests/test_purity.py`, same rule the
-old role-mapping system followed) — the model is handed a deck's real fields
-and content and writes templates for whatever it's given. Core 2000 is the
-proving ground, not the ceiling.
+a deck-specific field name (enforced by `tests/test_purity.py`) — the model is
+handed a deck's real fields and content and writes templates for whatever it's
+given. Core 2000 is the proving ground, not the ceiling.
 
 ## HARD CONSTRAINTS
 
@@ -98,44 +98,42 @@ proving ground, not the ceiling.
 - Cloning a notetype: `deepcopy(src)` → set `["id"] = 0` → rename → `col.models.add_dict(...)`.
   This avoids depending on `col.models.copy()`'s add/rename behaviour. Save later
   edits with `col.models.update_dict(...)`.
-  **Confirmed bug, already fixed:** `col.models.ensure_name_unique(...)` does **not**
-  take a plain string and return a new one — it takes a **notetype dict** and mutates
-  its `"name"` key in place. Calling it with a bare string crashes with
-  `TypeError: string indices must be integers, not 'str'`. This addon's own naming
-  (`notetype_manager._unique_notetype_name`) instead checks uniqueness itself via
-  `col.models.by_name(...)`, and `tests/test_notetype_manager.py::TestNotetypeNaming`
-  asserts `ensure_name_unique` is never called with a bare string again.
+  **Confirmed bug:** `col.models.ensure_name_unique(...)` does **not** take a
+  plain string and return a new one — it takes a **notetype dict** and
+  mutates its `"name"` key in place. Calling it with a bare string crashes
+  with `TypeError: string indices must be integers, not 'str'`. This addon's
+  own naming (`notetype_manager._unique_notetype_name`) instead checks
+  uniqueness itself via `col.models.by_name(...)`, and
+  `tests/test_notetype_manager.py::TestNotetypeNaming` asserts
+  `ensure_name_unique` is never called with a bare string.
 - A notetype dict has `["flds"]` (ordered list of field dicts w/ `name`,
-  `ord`, etc.) and `["tmpls"]` (list of template dicts w/ `name`, `qfmt`,
-  `afmt`, optional `did` deck override) and `["css"]`.
+  `ord`, etc.), `["tmpls"]` (list of template dicts w/ `name`, `qfmt`, `afmt`,
+  optional `did` deck override), and `["css"]`.
 - **Notes always reach the clone by duplication** (`col.new_note`/`add_note`,
-  copying field values by name — see "NOTETYPE CLONING / SAFE APPLY" below),
-  never by repointing the originals onto it. `col.models.change_notetype_info`/
-  `change_notetype_of_notes` (moving *existing* notes onto a different
-  notetype in place) is a real, confirmed-present Anki API — this addon used
-  it for an earlier "Flip in place" mode that has since been removed (see
-  "NOTETYPE CLONING / SAFE APPLY" for why) — but nothing in the current
-  codebase calls it any more.
+  copying field values by name), never by repointing the originals onto it —
+  see "NOTETYPE CLONING / SAFE APPLY" below. (`col.models.change_notetype_of_notes`,
+  which repoints *existing* notes onto a different notetype in place, is a
+  real, confirmed-present Anki API — just not one this addon uses.)
 - **Resetting scheduling: `col.sched.schedule_cards_as_new(card_ids, restore_position,
-  reset_counts, context)`.** Note `col.sched.forget_cards` does **not** exist on
+  reset_counts, context)`.** `col.sched.forget_cards` does **not** exist on
   the collection in 26.08.1 — the name `forget_cards` only exists as the GUI
-  wrapper `aqt.operations.scheduling.forget_cards`. This is exactly the kind of
-  plausible-looking guess that fails; verify before use.
+  wrapper `aqt.operations.scheduling.forget_cards`. This is exactly the kind
+  of plausible-looking guess that fails; verify before use.
 - Reusable CollectionOp wrappers ship in `aqt.operations.notetype`
   (`add_notetype_legacy`, `update_notetype_legacy`, `change_notetype_of_notes`,
-  `remove_notetype`) and `aqt.operations.scheduling`. In practice this addon does **not**
-  use them: a conversion needs several schema-level calls plus a scheduling reset plus a
-  custom undo-entry grouping step, all inside one user-facing operation, and composing
-  several pre-built CollectionOps couldn't give the exact undo-boundary control the
-  "NOTETYPE CLONING / SAFE APPLY" section below depends on. `ops/convert_op.py` wraps the
-  whole thing in one hand-rolled `CollectionOp` instead — a deliberate, considered
-  deviation from this bullet, not an oversight.
-- Duplicating notes (non-destructive mode): `col.new_note(notetype)` →
-  copy values **by field name** → `col.add_note(note, deck_id)`. Create the
-  destination deck with `col.decks.add_normal_deck_with_name(name)`.
-  `[sound:…]` references point at files already in the media folder, so media
-  is shared, not duplicated. Anki's duplicate check is per-notetype, so copies
-  on the clone raise no duplicate warnings against the original.
+  `remove_notetype`) and `aqt.operations.scheduling`. This addon does **not**
+  use them: a conversion needs several schema-level calls plus a scheduling
+  reset plus a custom undo-entry grouping step, all inside one user-facing
+  operation, and composing several pre-built CollectionOps couldn't give the
+  exact undo-boundary control "NOTETYPE CLONING / SAFE APPLY" below depends
+  on. `ops/convert_op.py` wraps the whole thing in one hand-rolled
+  `CollectionOp` instead — a deliberate deviation, not an oversight.
+- Duplicating notes: `col.new_note(notetype)` → copy values **by field name**
+  → `col.add_note(note, deck_id)`. Create the destination deck with
+  `col.decks.add_normal_deck_with_name(name)`. `[sound:…]` references point at
+  files already in the media folder, so media is shared, not duplicated.
+  Anki's duplicate check is per-notetype, so copies on the clone raise no
+  duplicate warnings against the original.
 - Grouping many writes into one undo step: `col.add_custom_undo_entry(...)` +
   `col.merge_undo_entries(...)`.
 - Media: `col.media.add_file(path)` copies a file into the media folder
@@ -147,58 +145,42 @@ proving ground, not the ceiling.
   blocked, with progress reported through `mw.progress`.
 - **Live card preview: an embedded `AnkiWebView` fed by `note.ephemeral_card()`,
   not a launched `aqt.clayout.CardLayout` window.** `ui/preview_panel.py`'s
-  `PreviewPanel` is ported from `CardLayout`'s own internal
-  `setup_preview`/`_renderPreview` pattern (checked against real `aqt` 26.8.1
-  source) rather than opening Anki's separate `CardLayout` dialog — the
-  preview there is just a plain `AnkiWebView` driven by `note.ephemeral_card()`,
-  and nothing about it requires `CardLayout`'s dialog chrome, so it's embedded
-  directly as this addon's own widget instead. `ephemeral_card()` never writes
-  to the collection, same safety property the original `CardLayout`-launching
-  approach had — see `docs/api-notes.md`'s `CardLayout` section for the real
-  hang bug that approach caused and why it was replaced.
-  **Known open bug, not yet fixed (see `TODO.md`):** right after Analyze, before
-  Convert, the preview pane shows Anki's own template error
-  (`Found '{{#ddc-audio-<Field>}}', but there is no field called ...`) instead
-  of the card, because the generated-audio field the AI's Front HTML now
-  references doesn't exist on the live (pre-conversion) notetype yet. A first
-  fix attempt (building a throwaway notetype copy with the field appended, via
-  `notetype_manager.shape_notetype`, and handing that to `PreviewPanel` instead
-  of the real notetype) did not resolve it in real Anki. Leading theory:
-  `ephemeral_card(custom_note_type=...)` may not fully override which notetype
-  Anki's template *validator* checks field references against. Needs
-  confirming against real `aqt`/`anki` source before trying again — the
-  conversion and TTS generation themselves are unaffected either way.
+  `PreviewPanel` mirrors `CardLayout`'s own internal
+  `setup_preview`/`_renderPreview` pattern rather than opening Anki's
+  separate `CardLayout` dialog. `ephemeral_card()` never writes to the
+  collection. Field references in the preview are validated against the
+  note's real, live notetype — the backend render call takes no notetype
+  override — so a generated Front referencing a not-yet-existing
+  generated-audio field would otherwise error out the preview between
+  Analyze and Convert. **Fixed** by `llm/analyze.py`'s
+  `strip_pending_audio_html`: since a not-yet-existing audio field's
+  reference is always wrapped in a `{{#field}}...{{/field}}` conditional and
+  therefore always renders as nothing regardless, it's simply removed from
+  the HTML handed to `PreviewPanel` rather than made to "exist" some other
+  way. Confirmed fixed in real Anki testing.
 
 ## LOCAL LLM DECK ANALYSIS (module group: addon/llm/)
 
-**This replaces the entire role-mapping/template-generation system** (the old
-`core/role_schema.py`, `core/role_detect.py`, `core/template_generator.py`,
-`ui/role_mapper.py`, `ui/field_list.py`, and the `RoleMapping` type they were
-all built around — deleted, not deprecated). The idea that shipped instead:
-hand the model a notetype's real fields, real sample content, and its current
-CSS, and have it write the finished Front/Back/CSS HTML directly — no
+Given a notetype's real fields, real sample content, and its current CSS, the
+model writes the finished Front/Back/CSS HTML directly — there's no
 intermediate role vocabulary for other code to interpret.
 
 **What the model does and does not decide.** This is the one thing to get
 right before touching any file in this group: **direction, target/native
 language, per-field placement, and which fields get their own generated-audio
-field are all computed in Python — never asked of the model.** This was not
-the original design; it's the result of the model failing the same task four
-separately-phrased ways during real testing (see `docs/llm-notes.md`): asked
-plainly, asked with an explicit swap rule spelled out, given the language of
-each side directly, and asked as a separate call whose only job was that one
-decision — it never once correctly executed "whichever fields are on the
-current back move to the new front," instead either describing the current,
-unconverted state as if nothing had changed, or reproducing the system
-prompt's own worked example almost verbatim when further confused (a deck
-whose only text fields are literally named `Front`/`Back`, colliding with the
-template-side vocabulary, broke it hardest). That's evidence of an
-abstract-reasoning limit on this specific task, not missing information, so
-the fix was to stop asking. **The model's only remaining job is writing
-Front/Back/CSS HTML for a placement it is simply told.** If the model gets the
-template HTML itself wrong, the fix is more detail in the system prompt
-(`addon/llm/prompt.py`), never a bigger model and never a hand-written
-fallback that re-derives the deleted heuristic pipeline.
+field are all computed in Python — never asked of the model.** Real testing
+showed the model reliably failing to reason about "whichever fields are on
+the current back move to the new front" across several different phrasings
+of the question (see `docs/llm-notes.md`) — it would describe the current,
+unconverted state as if nothing had changed, or, when confused by a deck
+whose fields are literally named `Front`/`Back`, reproduce the system
+prompt's own worked example almost verbatim. That's an abstract-reasoning
+limit on this specific task, not missing information, so the fix was to stop
+asking. **The model's only remaining job is writing Front/Back/CSS HTML for a
+placement it is simply told.** If the model gets the template HTML itself
+wrong, the fix is more detail in the system prompt (`addon/llm/prompt.py`),
+never a bigger model and never a hand-written fallback that re-derives a
+heuristic pipeline.
 
 ### The pipeline, module by module
 
@@ -256,13 +238,13 @@ fallback that re-derives the deleted heuristic pipeline.
   and Back HTML. This exists because the first real prompt test showed the
   model referencing a mixed text+audio field (`"stellen [sound:...mp3]"`) as a
   bare `{{Front}}` — which would have played the deck's own original-direction
-  audio on the newly-converted card. Not something worth re-litigating with a
-  smarter prompt: whether a field's audio should ever play is determinable
-  deterministically from its own sample content, so there's no judgment call
-  to hand to a small model. Applied twice: samples shown to the model already
-  have `[sound:...]` stripped for display (so there's nothing to parse or
-  reason about in the first place), and the model's actual response is
-  rewritten again afterward as the real guarantee.
+  audio on the newly-converted card. Whether a field's audio should ever play
+  is determinable deterministically from its own sample content, so there's
+  no judgment call to hand to a small model. Applied twice: samples shown to
+  the model already have `[sound:...]` stripped for display, and the model's
+  actual response is rewritten again afterward as the real guarantee (though
+  the real, current guarantee lives one layer deeper — see "NOTETYPE CLONING
+  / SAFE APPLY" → "Audio" below).
 - **`llm/direction.py`** — the deterministic core described above.
   `resolve_direction(fields, qfmt, afmt, *, known_state=None)` computes, per
   field, which new side it belongs on (by that field's own detected language
@@ -278,28 +260,22 @@ fallback that re-derives the deleted heuristic pipeline.
   front vs. back — correct the first time, but read exactly backwards on an
   already-converted notetype (whose current front *is* the target language),
   flipping the deck right back to its original direction. When the caller
-  supplies the recorded state from `core/deck_state.py` instead (this
-  notetype was already converted once), that recorded fact is used directly
-  and fields already on the target-language side simply match again and stay
-  put.
+  supplies the recorded state from `core/deck_state.py` instead, that
+  recorded fact is used directly and fields already on the target-language
+  side simply match again and stay put.
   **A field never referenced anywhere in the original `qfmt`/`afmt` is
-  excluded from placement entirely**, the same way a not-yet-existing
-  generated-audio field already was — confirmed necessary against a real
+  excluded from placement entirely** — confirmed necessary against a real
   Core 2000 conversion, which was otherwise rendering every one of that
   deck's bookkeeping/index fields (`Core-Index`, `Optimized-Voc-Index`,
   `Optimized-Sent-Index`, …) on the converted card's back, even though the
-  original card never showed them at all. Reproducing a field's existing
-  invisibility isn't the "never silently drop a field" policy's concern —
-  the field's data is untouched on the clone either way; only whether it
-  *renders* stays exactly as it already was. A field referenced only inside
-  a conditional (`{{#Field}}...{{/Field}}`) still counts as shown, since it
-  genuinely does render when non-empty — this only catches a field with no
-  reference anywhere. `llm/analyze.py` also filters what the model's prompt
-  shows to exactly the fields that got placed, so an excluded field's
-  content is never shown to the model at all, not merely left out of the
-  given placement lists (closing a real gap: `validate.py` only checks a
-  reference against those two lists, so a field in neither would otherwise
-  go unchecked if referenced).
+  original card never showed them at all. The field's data is untouched on
+  the clone either way; only whether it *renders* stays exactly as it
+  already was. A field referenced only inside a conditional
+  (`{{#Field}}...{{/Field}}`) still counts as shown, since it genuinely does
+  render when non-empty — this only catches a field with no reference
+  anywhere. `llm/analyze.py` also filters what the model's prompt shows to
+  exactly the fields that got placed, so an excluded field's content is
+  never shown to the model at all.
 - **`llm/prompt.py`** — builds the one system+user prompt sent to the model,
   given a `PromptInput` carrying the deck's fields/samples, the *already-
   decided* new-front/new-back field lists from `direction.py`, and the
@@ -343,85 +319,78 @@ fallback that re-derives the deleted heuristic pipeline.
   discarded — the UI's job is to show `review_message` prominently, not to
   hide a bad result).
 
-### Known limitation (tracked in `TODO.md`, not yet fixed)
+### Known limitation — tracked in `TODO.md`
 
-The field-name-collision deck (fields literally named `Front`/`Back`) is
-still occasionally flaky on direction, run to run, even at `--temp 0` —
-confirmed as real llama.cpp CPU-inference non-determinism, not a prompt
-defect. `validate.py` checks field existence, conditional balance, and
-misplaced-field leaks, but not yet full placement compliance against the
-given `new_front_fields`/`new_back_fields` — extending it to catch and retry
-on a placement violation (the same pattern that already worked for audio
-safety) is the intended fix.
+The field-name-collision German test deck is still occasionally flaky on
+direction, run to run, even at `--temp 0` — confirmed as real llama.cpp
+CPU-inference non-determinism, not a prompt defect. `validate.py` checks
+field existence, conditional balance, and misplaced-field leaks, but not yet
+full placement compliance against `new_front_fields`/`new_back_fields`;
+extending it to catch and retry on a placement violation (the pattern
+already used for audio safety) is the intended fix. Check `TODO.md` for
+current status rather than assuming this description is still accurate.
 
 ### Field visibility (module: llm/field_visibility.py) — post-Analyze, not part of the model call
 
-A user-facing, non-technical way to turn an already-*placed* field's display on or off, without
-hand-editing the HTML at all — for a user who doesn't know Anki template syntax. Distinct from
-placement (`direction.py`, above): a field can legitimately belong on the back and still be
-something the user wants hidden (e.g. a bookkeeping field the AI judged worth "little visual
-weight" rather than omitting outright). Mechanism: hiding a field **removes its rendering
-reference from the HTML entirely**, replacing it with an inert marker comment —
-`<!--ddc-hidden:Field:filter-->` — that records the field name and whatever filter (or none) the
-reference used, so showing it again restores the exact original reference, byte for byte, in the
-exact same place. Nothing is left behind to render — no wrapper element, no CSS rule — because a
-comment is inert HTML the browser never renders and Anki's own `{{...}}` substitution never
-touches (the marker contains no `{{`/`}}` characters).
+A user-facing, non-technical way to turn an already-*placed* field's display
+on or off, without hand-editing HTML at all — for a user who doesn't know
+Anki template syntax. Distinct from placement (`direction.py`, above): a
+field can legitimately belong on the back and still be something the user
+wants hidden. Mechanism: hiding a field **removes its rendering reference
+from the HTML entirely**, replacing it with an inert marker comment —
+`<!--ddc-hidden:Field:filter-->` — that records the field name and whatever
+filter (or none) the reference used, so showing it again restores the exact
+original reference, byte for byte, in the exact same place. A comment is
+inert HTML the browser never renders and Anki's `{{...}}` substitution never
+touches.
 
-**This used to wrap the reference in `<span class="ddc-hidden">` instead, paired with a CSS
-`display: none` rule, and (briefly) also forced it through `{{text:Field}}`** under the mistaken
-belief that this was needed to stop a hidden audio-bearing field from autoplaying — see
-`docs/api-notes.md` for why `{{text:Field}}` never actually did that (confirmed against real
-Anki source: it only strips HTML tags, never `[sound:...]`, and Anki's `extract_av_tags` scans
-the fully-rendered text for `[sound:...]` regardless of what wraps it). That concern is now moot
-regardless of hide mechanism: pre-existing audio is stripped out of every field's *data* at
-Convert time (`ops/notetype_manager.py`'s `_strip_pre_existing_audio`), so by the time a
-converted card exists to hide fields on, no field's value has `[sound:...]` left in it to
-protect against — which is exactly why hiding could move to actually removing the markup,
-found in real use to be the cleaner, more obviously-correct behavior anyway (no empty wrapper
-elements or unused CSS classes left sitting in the generated template).
+An earlier version instead wrapped the reference in a
+`<span class="ddc-hidden">` with a CSS `display: none` rule, under the
+mistaken belief that this was needed to stop a hidden audio-bearing field
+from autoplaying. It wasn't — see "NOTETYPE CLONING / SAFE APPLY" → "Audio"
+below for why no CSS/HTML mechanism can ever stop `[sound:...]` playback, and
+why that concern is handled at the data layer instead, making it irrelevant
+to how hiding works.
 
-No separate hidden-state is tracked anywhere — the HTML itself is the source of truth, read back
-by `is_field_hidden`, the same "a fact recorded in the artifact itself, not a shadow flag"
-principle `core/deck_state.py` already uses for conversion state. `ui/main_screen.py`'s "Hide
-fields" panel is the only caller; it never touches a generated-audio field (that field's
-visibility is already governed by whether TTS filled it in, a different concern) or a field the
-original card never showed at all (never listed as toggleable in the first place, per the
-placement exclusion above).
+No separate hidden-state is tracked anywhere — the HTML itself is the source
+of truth, read back by `is_field_hidden`, the same principle
+`core/deck_state.py` uses for conversion state. `ui/main_screen.py`'s "Hide
+fields" panel is the only caller; it never touches a generated-audio field
+(governed by whether TTS has filled it in) or a field the original card
+never showed at all (excluded from placement, see `direction.py` above).
 
 ## LANGUAGE DETECTION (module: core/language_detect.py)
 
-Survives from the original design, now consumed by `llm/direction.py`
-(per-field and per-side language detection feeding direction resolution)
-rather than by a role-mapper UI banner.
+Consumed by `llm/direction.py` for per-field and per-side language detection
+feeding direction resolution.
 
 1. Fast pass: Unicode code-point range classification per field sample
    (Hiragana/Katakana/CJK Unified Ideographs → Japanese-ish; Hangul → Korean;
    Cyrillic → Russian-ish; Latin-only → ambiguous, needs pass 2).
 2. Disambiguation pass for same-script languages (e.g., French vs English,
-   both Latin): implemented with vendored **`langdetect`** (`addon/vendor/`), not
-   `py3langid` as originally planned — `py3langid` pulls in `numpy`, a compiled
-   per-platform dependency, which is exactly the packaging problem the Piper
-   *subprocess* design (below) exists to avoid for TTS; `langdetect` is pure Python.
-   `DetectorFactory.seed` is pinned (`= 0`) since otherwise it reseeds from OS entropy on
-   every call, making the same field text detect differently between runs — confirmed
-   empirically, not theoretical. See `addon/vendor/README.md`.
-3. **Confirmed limitation, worth knowing before trusting a guess:** the `langdetect`
-   fallback is unreliable on short text — a single common English word can get a
-   *confident but wrong* code (e.g. `"apple"` → `"fr"`, `"water"` → `"af"`). Multi-word
-   phrases are reliable; single short words are not. This is exactly why
-   `direction.py`'s `_side_language` weights a group's dominant language by
-   how much real text each field actually carries (raw character length),
-   so a short throwaway field can't outvote the field that actually carries
-   the side's meaning, and why a field whose own guess isn't confident falls
-   back to the back rather than being trusted onto the front.
+   both Latin): implemented with vendored **`langdetect`** (`addon/vendor/`),
+   not `py3langid` — `py3langid` pulls in `numpy`, a compiled per-platform
+   dependency, which is exactly the packaging problem the Piper *subprocess*
+   design (below) exists to avoid for TTS; `langdetect` is pure Python.
+   `DetectorFactory.seed` is pinned (`= 0`) since otherwise it reseeds from OS
+   entropy on every call, making the same field text detect differently
+   between runs — confirmed empirically. See `addon/vendor/README.md`.
+3. **Confirmed limitation, worth knowing before trusting a guess:** the
+   `langdetect` fallback is unreliable on short text — a single common
+   English word can get a *confident but wrong* code (e.g. `"apple"` →
+   `"fr"`, `"water"` → `"af"`). Multi-word phrases are reliable; single short
+   words are not. This is why `direction.py`'s `_side_language` weights a
+   group's dominant language by how much real text each field actually
+   carries (raw character length), so a short throwaway field can't outvote
+   the field that actually carries the side's meaning, and why a field whose
+   own guess isn't confident falls back to the back rather than being
+   trusted onto the front.
 4. There is no upfront "what language are you converting FROM/TO" prompt —
-   `llm/direction.py`'s structural read of which fields are currently front vs.
-   back (`current_sides`) plus content-based per-field language detection
+   `llm/direction.py`'s structural read of which fields are currently front
+   vs. back (`current_sides`) plus content-based per-field language detection
    together sidestep needing to ask, for the common case. The single-screen
-   UI (`ui/main_screen.py`) does show the detected target/native language
-   alongside the preview so the user can see and sanity-check it before
-   converting.
+   UI (`ui/main_screen.py`) shows the detected target/native language
+   alongside the preview so the user can sanity-check it before converting.
 
 ## NOTETYPE CLONING / SAFE APPLY (module: ops/notetype_manager.py)
 
@@ -431,25 +400,18 @@ Anki-facing, not one of the pure `core/` modules.
 
 Clone the notetype, rewrite its template, then **duplicate** the notes onto
 the clone and place the copies in a brand-new deck. The original deck,
-notetype and notes stay 100% untouched.
+notetype, and notes stay 100% untouched.
 
-**There used to be a second mode, Flip in place** (repoint the *existing*
-notes onto the clone instead of duplicating them, replacing their current
-cards) — removed. It was cut once a real audio-safety fix (see "Audio" below)
-came to depend on duplication happening unconditionally: the only way to
-guarantee a note's own pre-existing audio can never survive onto the
-converted card is to strip `[sound:...]` out of every field's value while
-copying it onto the clone — which needs a fresh copy to write the stripped
-value into. Flip in place never created one; achieving the same guarantee
-there would have meant rewriting the literal content of the user's real,
-existing notes in place, a categorically bigger and more sensitive operation
-than anything else this addon does (every other write is additive — new
-fields, a scheduling reset, a notetype change — never a rewrite of a field's
-existing text). Rather than ship that, or ship an asymmetric guarantee where
-one mode is safe and the other isn't, Flip in place was cut entirely. See
-`docs/api-notes.md` for why `{{text:Field}}` — the mechanism the old
-Flip-in-place-compatible design leaned on — never actually worked for this in
-the first place: it only strips HTML tags, never `[sound:...]`.
+A second mode ("Flip in place": repoint existing notes onto the clone
+instead of duplicating them) existed earlier and was removed. The
+audio-safety guarantee below requires stripping `[sound:...]` while copying
+each field's value onto the clone — which needs a fresh copy to write the
+stripped value into. Flip in place never created one, and giving it the same
+guarantee would have meant rewriting the literal content of the user's real,
+existing notes in place — a categorically bigger and more sensitive
+operation than anything else this addon does. Rather than ship that, or ship
+one mode safe and the other not, Flip in place was cut entirely; there is
+now exactly one mode.
 
 ### Common steps
 
@@ -478,118 +440,93 @@ the first place: it only strips HTML tags, never `[sound:...]`.
    `"target undo op not found"` when this was gotten wrong.
    `add_custom_undo_entry`/`merge_undo_entries` may only ever span what comes
    *after* the last schema-changing call (the note duplication, the
-   scheduling reset) — never wrap it around the clone-creation call. In
-   practice a conversion is therefore two separate undo steps, not one; see
-   `notetype_manager.py`'s `apply_plan` for exactly where the boundary falls.
-   Still prompt for a manual backup/export before starting, regardless.
-   **Update, confirmed in real use:** even with the marker placed correctly per the
-   above, `"target undo op not found"` was still observed occasionally in practice
-   (exact second trigger not pinned down — see `docs/api-notes.md`). Worse than the
-   error message itself: because the marker/merge lives inside `apply_plan`, letting
-   that exception propagate made `CollectionOp` treat the *entire, already-successful*
-   conversion as failed — skipping the UI's success message and its refresh of the
-   deck/notetype list. `apply_plan` now retries with a fresh marker on failure, which is
-   structurally guaranteed to succeed (nothing schema-changing can happen between the
-   retry marker and merging it immediately after) — see `docs/api-notes.md` for the full
-   writeup and `tests/test_notetype_manager.py::TestUndoMergeRecovery`.
+   scheduling reset) — never wrap it around the clone-creation call. A
+   conversion is therefore two separate undo steps, not one; see
+   `notetype_manager.py`'s `apply_plan` for exactly where the boundary
+   falls. Still prompt for a manual backup/export before starting,
+   regardless.
+   **In practice, even with the marker placed correctly, `"target undo op
+   not found"` was still observed occasionally** (exact second trigger not
+   pinned down — see `docs/api-notes.md`). Because the marker/merge lives
+   inside `apply_plan`, letting that exception propagate made `CollectionOp`
+   treat the entire, already-successful conversion as failed. `apply_plan`
+   now retries with a fresh marker on failure, which is structurally
+   guaranteed to succeed (nothing schema-changing can happen between the
+   retry marker and merging it immediately after) — see `docs/api-notes.md`
+   and `tests/test_notetype_manager.py::TestUndoMergeRecovery`.
 
-### Audio: the demoted language's is stripped from the data itself, the new language's goes in a new field per source field
+### Audio: the demoted language's is stripped from the data itself, the new language's goes into a new field per source field
 
 On a conversion, the demoted language's audio is no longer wanted — a learner
 going EN→JP does not need Japanese pronunciation audio on cards that now test
 English.
 
-**The real guarantee lives in the copy, not in the template.** Every field's
+**The real guarantee lives in the copy, not the template.** Every field's
 value is stripped of `[sound:...]` references while it's copied onto the
 clone (`ops/notetype_manager.py`'s `_strip_pre_existing_audio`, applied
-unconditionally to every field, not just ones some detection step flagged as
-audio-bearing), so the demoted language's audio simply isn't present in the
-converted notes' data at all, regardless of how the AI's template ends up
-referencing any given field. This was a real, verified fix for two bugs
-found in testing: the original deck's audio still playing on the converted
-card, and — the same underlying cause — hiding a field via the "Hide fields"
-panel silencing its play button without silencing the sound itself.
+unconditionally to every field), so the demoted language's audio simply
+isn't present in the converted notes' data at all, regardless of how the
+AI's template ends up referencing any given field.
 
-**Why the previous approach (forcing a reference to `{{text:Field}}`) didn't
-work, confirmed against real Anki source (`ankitects/anki` on GitHub):**
-`{{text:Field}}` compiles to `strip_html(text)`, whose regex only matches
-HTML tags (`<...>`) — it has never touched `[sound:...]`, which is Anki's own
-bracket notation, not HTML. Separately, `extract_av_tags` (which decides what
-autoplays) scans the *fully rendered* card text for `[sound:...]`/`[anki:tts...]`
-patterns unconditionally, with no awareness of what filter referenced the
-field or what HTML/CSS wraps it. No Anki template filter strips `[sound:...]`
-at all (checked the complete filter list: `text`, `furigana`/`kanji`/`kana`,
-`cloze`/`cloze-only`, `type*`, `hint`, `tts` — none of them do) — so the only
-thing that can ever work is removing the marker from the *data* before a
-template can reference it, which is exactly what copy-time stripping does.
-Stripping the whole deck's data this way (rather than only fields some
-detection step flagged) also means it doesn't matter if that detection missed
-a field, and a field that mixes real text with its own audio (the German-deck
-case, `"Hund [sound:hund.mp3]"`) keeps its text — only the marker goes.
+**Why a template-level fix (forcing `{{text:Field}}`) doesn't work, confirmed
+against real Anki source (`ankitects/anki` on GitHub):** `{{text:Field}}`
+compiles to `strip_html(text)`, whose regex only matches HTML tags (`<...>`)
+— it has never touched `[sound:...]`, which is Anki's own bracket notation,
+not HTML. Separately, `extract_av_tags` (which decides what autoplays) scans
+the *fully rendered* card text for `[sound:...]`/`[anki:tts...]` patterns
+unconditionally, with no awareness of what filter referenced the field or
+what HTML/CSS wraps it. No Anki template filter strips `[sound:...]` at all
+(checked the complete filter list: `text`, `furigana`/`kanji`/`kana`,
+`cloze`/`cloze-only`, `type*`, `hint`, `tts`) — so the only thing that can
+ever work is removing the marker from the *data* before a template can
+reference it, which is exactly what copy-time stripping does. This also
+means it doesn't matter if per-field audio detection (`llm/audio_safety.py`)
+misses a field, and a field that mixes real text with its own audio (e.g.
+`"Hund [sound:hund.mp3]"`) keeps its text — only the marker goes.
 `llm/audio_safety.py`'s older `{{text:Field}}`-forcing mechanism is still in
 the code and still harmless, but the actual guarantee no longer depends on
-it — it's now made structurally true by the copy, before any template gets a
-chance to reference anything.
-- Drop the demoted language's audio from the generated template **entirely** —
-  not renamed, not kept as a secondary field. (Mechanically this now falls out
-  of `llm/audio_safety.py` plus the model simply never being told the demoted
-  field is anything to speak — there is no separate "drop" step to get wrong.)
+it.
+
+- Drop the demoted language's audio from the generated template **entirely**
+  — not renamed, not kept as a secondary field. Falls out of
+  `llm/audio_safety.py` plus the model simply never being told the demoted
+  field is anything to speak.
 - **The newly-fronted language's audio always goes into field(s) the
-  conversion creates, never into a field the deck already had.** This is now
-  decided per source field, not per deck: `llm/direction.py`'s
-  `resolve_direction` gives one `AudioTarget(source_field, audio_field)` pair
-  for **every** real content field placed on the new front — commonly two (a
-  word/term and a full example sentence), not one. `core/audio_fields.py`'s
+  conversion creates, never into a field the deck already had**, decided per
+  source field: `llm/direction.py`'s `resolve_direction` gives one
+  `AudioTarget(source_field, audio_field)` pair for **every** real content
+  field placed on the new front — commonly two (a word/term and a full
+  example sentence), not one. `core/audio_fields.py`'s
   `generated_audio_field_name(source_field_name)` names each one
-  deterministically (`"ddc-audio-" + source_field_name`) and always returns
-  the same name for the same source field, so re-analyzing an already-
-  converted notetype proposes the exact same audio fields it already has,
-  rather than minting new ones. No collision-suffix logic is needed — Anki
-  field names are already unique per notetype, so prefixing by source field
-  name makes each generated name unique automatically. The old audio field
-  (the one the deck already had) keeps its contents; the model is simply
-  never told it exists as a place to write new audio, and `audio_safety.py`
-  ensures it can never be bare-referenced for playback either — hidden, not
-  deleted, and not overwritten.
-- This replaced an earlier design where the model itself picked a single
-  `speak_text_from` field to read aloud — removed once it became clear there
-  was nothing left to actually choose between: every field `direction.py`
-  places on the new front already passed the "confident, real target-language
-  content" bar, which is exactly what "worth generating audio for" means
-  anyway, so every one of them just gets its own field instead of the model
-  preferring one over another.
-- Why a new field rather than reuse: a reused field arrives at TTS time **already
-  holding the old language's audio**, so there is a window between conversion and
-  successful synthesis in which the card plays exactly the language the conversion
-  was meant to retire — and if synthesis fails, is interrupted, or is skipped for
-  that note, the window never closes. A field the addon just created is **empty**,
-  so the worst case becomes silence until the audio exists. The failure mode stops
-  being a matter of ordering and becomes structurally impossible.
-- Consequence worth knowing: there is no batch-end "turn audio on" step any
-  more (the old `finish_audio_batch`, which used to flip `include_audio` on
-  for the whole notetype at once, doesn't exist — deleted along with the
-  template-generator system it belonged to). The AI's Front HTML already has
-  `{{#field}}{{field}}{{/field}}` appended per audio target at analysis time
-  (`llm/analyze.py`'s `_append_audio_html`), each field starting empty, so it
-  renders as nothing until TTS actually fills it. Running a TTS batch
-  partially or cancelling it midway is therefore safe unconditionally: notes
-  the run never reached simply render no audio until their turn comes.
-- A deck with *no* audio field at all needs no special case: it's the same
-  path as every other deck, since a source field's own audio field is created
-  fresh regardless of whether the deck already had one for something else.
+  deterministically (`"ddc-audio-" + source_field_name`), so re-analyzing an
+  already-converted notetype proposes the exact same audio fields it already
+  has. Anki field names are already unique per notetype, so prefixing by
+  source field name makes each generated name unique automatically with no
+  collision-suffix logic needed. The old audio field (the one the deck
+  already had) keeps its contents; the model is simply never told it exists
+  as a place to write new audio, and `audio_safety.py` ensures it can never
+  be bare-referenced for playback either — hidden, not deleted, and not
+  overwritten.
+- Why a new field rather than reuse: a reused field arrives at TTS time
+  **already holding the old language's audio**, so there is a window between
+  conversion and successful synthesis in which the card plays exactly the
+  language the conversion was meant to retire. A field the addon just
+  created is **empty**, so the worst case becomes silence until the audio
+  exists — the failure mode becomes structurally impossible rather than a
+  matter of ordering.
+- Consequence worth knowing: there is no batch-end "turn audio on" step. The
+  AI's Front HTML already has `{{#field}}{{field}}{{/field}}` appended per
+  audio target at analysis time (`llm/analyze.py`'s `_append_audio_html`),
+  each field starting empty, so it renders as nothing until TTS actually
+  fills it. Running a TTS batch partially or cancelling it midway is
+  therefore safe unconditionally.
+- A deck with *no* audio field at all needs no special case: a source
+  field's own audio field is created fresh regardless of whether the deck
+  already had one for something else.
 
-Covered by `tests/test_llm_direction.py` (placement + audio-target
-computation), `tests/test_llm_audio_safety.py` (the pre-copy-stripping-era
-guarantee, still exercised even though it's no longer the primary defense),
-and `tests/test_notetype_manager.py::TestPreExistingAudioIsStrippedFromCopies`
-(the real, current guarantee) and `::TestGeneratedAudioFieldsAreCreatedOnTheClone`
-(naming and recognition via `tests/test_audio_fields.py`).
-
-Orphaned media cleanup (removing now-unreferenced original-language audio
-files after a conversion) was planned for the old Flip-in-place mode but
-never actually implemented, and no longer applies now that there is only one
-mode: New deck never orphans anything, since the source deck's notes still
-legitimately reference their own original media files forever.
+Covered by `tests/test_llm_direction.py`, `tests/test_notetype_manager.py`
+(`TestPreExistingAudioIsStrippedFromCopies`,
+`TestGeneratedAudioFieldsAreCreatedOnTheClone`), and `tests/test_audio_fields.py`.
 
 ## PIPER TTS IMPLEMENTATION (module group: /tts)
 
@@ -598,7 +535,7 @@ standalone CLI binary per OS/arch (GitHub releases:
 https://github.com/rhasspy/piper/releases — Windows/Linux/macOS,
 amd64/arm64), and (b) separate voice model files (.onnx + .onnx.json),
 hosted at https://huggingface.co/rhasspy/piper-voices, organized by
-locale/quality (e.g. en_US-lessac-medium).
+locale/quality (e.g. en_US-ljspeech-high).
 
 Design decision: invoke Piper as a **subprocess**, not via a bundled Python
 binding. Bundling `piper-tts`'s Python package would drag in onnxruntime's
@@ -620,13 +557,25 @@ piper_binary_manager.py responsibilities:
 
 piper_voice_manager.py responsibilities:
 
-- Ship a small curated list of known-good voice IDs (`addon/tts/piper_voice_manager.py`'s
-  `CURATED_VOICES`) rather than exposing Piper's entire enormous voice catalog by
-  default. **Known limitation, not a bug:** the curated list ships English voices
-  only (`en_US-lessac-medium`, `en_GB-alba-medium`) — so a deck whose *newly-fronted*
-  language is not English has no voice to generate with yet, even though everything
-  else about the pipeline (analysis, direction, conversion) already works for any
-  language pair. Widening the curated list is a data change, not a code one.
+- Ship a small curated list of known-good voice IDs
+  (`addon/tts/piper_voice_manager.py`'s `CURATED_VOICES`) rather than
+  exposing Piper's entire enormous voice catalog by default. **Known
+  limitation, not a bug:** the curated list ships English voices only
+  (`en_US-ljspeech-high`, `en_GB-alba-medium`) — so a deck whose
+  *newly-fronted* language is not English has no voice to generate with yet,
+  even though everything else about the pipeline (analysis, direction,
+  conversion) already works for any language pair. Widening the curated list
+  is a data change, not a code one.
+  **Check each voice's own license before adding it — Piper voices are not
+  uniformly licensed just because they ship from the same repo.**
+  `en_US-lessac-medium` was the original default and was removed once its
+  training corpus turned out to be licensed "Research Purposes only,"
+  explicitly excluding "the development, marketing, commercialisation, sale
+  or licencing of voice synthesis ... products" — wording broad enough to
+  cover a free open-source addon. Check a candidate voice's own `MODEL_CARD`
+  on `huggingface.co/rhasspy/piper-voices` before curating it; see
+  `docs/api-notes.md` for the full verification and `README.md`'s Licensing
+  section for the current audit.
 - Download the .onnx + .onnx.json pair for a chosen voice into the cache dir
   on first use, with a visible progress indicator (files can be tens of MB).
 - Cache checks so repeat use doesn't re-download.
@@ -649,42 +598,34 @@ piper_provider.py responsibilities:
   write `[sound:filename]` into the target field named by
   `llm.direction.AudioTarget.audio_field` — one call per `(audio_field,
   source_field)` pair returned by `resolve_direction`, so a note with both a
-  word and a sentence on its new front gets two separate audio fields filled,
-  not one. Per the audio section above, that field is one the **conversion
-  created** and left empty, so this is a first write rather than an
-  overwrite — nothing of the user's is at stake in it. It still happens
-  atomically per note: `ops/tts_batch.py`'s `generate_note_audio` aborts and
-  leaves the *whole note* untouched (nothing saved or tagged) on a real
-  synthesis failure partway through its targets, so a re-run retries cleanly
-  rather than leaving a note half-filled.
+  word and a sentence on its new front gets two separate audio fields
+  filled, not one. It happens atomically per note:
+  `ops/tts_batch.py`'s `generate_note_audio` aborts and leaves the *whole
+  note* untouched on a real synthesis failure partway through its targets,
+  so a re-run retries cleanly rather than leaving a note half-filled.
 - **Sanitize text before synthesis — this is mandatory, not a nicety.** Real
-  field data in Core 2000's `Vocabulary-English` contains `&nbsp;`, `<div>`,
-  `<br>`, `<!--anki-->` comments, and sometimes embedded Japanese (e.g.
-  `"processing (unlike 加工, a new thing is not created)"`). Feeding that raw to
-  Piper produces garbage. Strip HTML tags and comments, decode entities, strip
-  `[sound:…]` tags and `kanji[kana]` ruby brackets, and drop characters outside
-  the target language's script.
-  **Fixed** (was a known live gap): `PiperProvider` used to default to
-  `tts.sanitize.LATIN_RANGES` unconditionally regardless of the actual language —
-  harmless for an English target (Core 2000's case), silently destructive the moment
-  the fronted language is non-Latin, because the filter then deletes the text letter
-  by letter and "nothing left to synthesize" is indistinguishable from an empty field.
-  A whole deck could run in seconds, report zero failures, and produce no audio.
-  `allowed_ranges` now defaults to `None`, meaning *derive it from the voice* —
-  `tts/script_ranges.py` maps the voice id's locale to its script. Keyed off the
-  **voice**, not the deck's target language, because the voice is what is actually
-  going to pronounce it; a voice/deck mismatch then reports "nothing to say" honestly
-  instead of producing noise. An unlisted locale filters *nothing* rather than
-  guessing — letting a few odd characters through is a far smaller failure than
-  deleting an entire script.
-  **Second, related trap found while fixing it:** filtering to the wrong script rarely
-  leaves an *empty* string. Punctuation is kept regardless of script, so
-  `"저는 물을 마십니다."` under a Latin allowlist reduces to `"."` — which is truthy, so
-  it sails past the empty check and Piper is asked to speak a bare full stop, writing a
-  meaningless audio file that then counts as that note's audio. `sanitize_text` now
-  raises `EmptyTextError` when nothing but punctuation survived the script filter
-  (digits count as speakable; punctuation alone does not) — `ops/tts_batch.py` catches
-  this per-target and counts the field as skipped rather than a hard failure, so one
+  field data can contain `&nbsp;`, `<div>`, `<br>`, `<!--anki-->` comments,
+  and embedded text in another script. Feeding that raw to Piper produces
+  garbage. Strip HTML tags and comments, decode entities, strip `[sound:…]`
+  tags and `kanji[kana]` ruby brackets, and drop characters outside the
+  target language's script.
+  `allowed_ranges` defaults to `None`, meaning *derive it from the voice* —
+  `tts/script_ranges.py` maps the voice id's locale to its script. Keyed off
+  the **voice**, not the deck's target language, because the voice is what
+  is actually going to pronounce it; a voice/deck mismatch then reports
+  "nothing to say" honestly instead of producing noise. An unlisted locale
+  filters *nothing* rather than guessing — letting a few odd characters
+  through is a far smaller failure than deleting an entire script. (An
+  earlier version defaulted to Latin-only regardless of voice, which
+  silently produced zero audio for any non-Latin target — fixed for that
+  reason.)
+  Punctuation is kept regardless of script, so filtering to the wrong script
+  can leave a bare `"."` — truthy, so it passes an empty-string check and
+  Piper would synthesize a meaningless file that then counts as that note's
+  audio. `sanitize_text` raises `EmptyTextError` when nothing but
+  punctuation survives the script filter (digits count as speakable;
+  punctuation alone does not) — `ops/tts_batch.py` catches this per-target
+  and counts the field as skipped rather than a hard failure, so one
   unspeakable field on a note doesn't block the note's other targets. See
   `tests/test_script_ranges.py`.
 - Must support: sample generation for a single piece of text (used by the
@@ -693,75 +634,31 @@ piper_provider.py responsibilities:
   generation with progress reporting and skip-if-already-has-audio caching
   (`ops/tts_batch.py`'s `AUDIO_DONE_TAG` / `notes_needing_audio`).
 
-## BUILD ORDER / MILESTONES
+## STATUS
 
-**M1-M6 (role-mapping era) are complete history, not current architecture —
-every module they refer to has been deleted.** Kept below only because the
-constraints they discovered (cloning safety, undo-boundary rules, the
-mixed-audio-field trap, the wrong-script-filter trap) all still hold true for
-the system that replaced them; the specific code is gone.
+The core pipeline (Analyze → Convert → Generate TTS audio) is built,
+unit-tested, and confirmed working end-to-end against a real Anki profile.
+Licensed MIT; every dependency is permissive (MIT/Apache-2.0/public domain)
+— see `README.md`'s Licensing section before adding any new dependency or
+Piper voice. Known open issues are tracked in `TODO.md` — check there rather
+than here, so this file doesn't drift out of sync with what's actually still
+broken.
 
-M1 — Hardcoded proof of concept: manual Core-2000 role mapping constant,
-template_generator producing correct HTML, clone-notetype flow working,
-English-first cards visible with no audio yet.
-M2 — Piper integration end-to-end: binary + voice manager, subprocess
-synthesis, single-sentence sample playback working in isolation.
-M3 — Role Mapping UI: replace the hardcoded mapping from M1 with the real
-drag-and-drop/dropdown UI + live preview pane.
-M4 — Language auto-detection feeding suggested defaults into M3's UI.
-M5 — Batch apply: full deck run with progress, caching, resumability,
-backup prompt.
-M6 — Profiles system: save/load JSON field-mapping profiles; ship the Core
-2000 profile as the first example.
-M7 — Polish + open-source release prep: README, LICENSE, packaging via
-anki-addon-builder, contribution guide.
-
-**LLM overhaul (post-M7, current architecture)** — replaced the M1/M3/M4/M6
-machinery (role schema, role detection, template generation, the profiles
-system, the role-mapper UI) wholesale with the local-LLM pipeline described
-under "LOCAL LLM DECK ANALYSIS" above, and replaced the submenu of separate
-dialogs (Convert / Preview / Generate TTS audio) with the single screen
-`ui/main_screen.py` (Analyze → review/hand-edit, optionally via "Hide fields"
-→ Convert → Generate TTS audio, one flow). Also dropped the second
-conversion mode ("Flip in place") entirely — see "NOTETYPE CLONING / SAFE
-APPLY" for why; there is now exactly one mode (duplicate onto a new deck).
-**Status:** the core pipeline (Analyze, Convert, Generate TTS audio, live
-preview including right after Analyze/before Convert, the Hide-fields panel,
-and re-opening an already-converted deck to generate more audio without a
-fresh AI call) is built, unit-tested, and confirmed working end to end
-against a real Anki profile, including the audio-safety fix described under
-"NOTETYPE CLONING / SAFE APPLY" → "Audio" above. One item is open, tracked in
-`TODO.md`: extending `validate.py` for full placement compliance (the
-field-name-collision deck's remaining flakiness). Packaging
-(`tools/build_ankiaddon.py`, not `anki-addon-builder` — see below) and the
-Tools-menu consolidation carry forward unchanged from M7.
-**Deliberately still not done:** a LICENSE file, `manifest.json` license
-metadata, and a contribution guide — all need the MIT-vs-GPL decision, which
-is intentionally on hold ("I don't know anything about open source, leave it
-for later"). Nothing in the addon depends on that decision.
-
-**Packaging note:** in practice this addon uses `tools/build_ankiaddon.py`, a small local
-script, not `anki-addon-builder` (`aab`) — `aab` expects the addon to live under
-`src/<module_name>/` with a repo-root `addon.json` and is built around git-tag-based
-AnkiWeb publishing, which would mean restructuring this repo for a public-release
-workflow that's intentionally on hold.
-
-Work through changes deliberately. Do not jump ahead to UI polish
-or multi-provider TTS/LLM abstraction gold-plating before the core pipeline
-(Analyze → Convert → Generate TTS audio) is solid and actually running inside
-a real (test) Anki profile.
+Work through changes deliberately. Do not jump ahead to UI polish or
+multi-provider TTS/LLM abstraction gold-plating before the core pipeline is
+solid and actually running inside a real (test) Anki profile.
 
 ## DEV ENVIRONMENT
 
 - Two Anki profiles exist: **`User 1`** (the real collection, ~13.8k notes —
-  in-development code must never write to it) and **`test profile`**.
-  **Not Core 2000 only** — a Korean deck and a German deck belong alongside it
-  (the German deck specifically for the field-name-collision and mixed
-  text+audio field traps described above). Check `test profile` directly for
-  what's currently seeded rather than assuming Core 2000 is the only thing
-  there.
-- Run and iterate in `test profile`. To review results in the real collection,
-  export the generated deck to `.apkg` and import it manually.
+  in-development code must never write to it) and **`test profile`**
+  (iterate here), seeded with three decks: Core 2000, a Korean deck, and a
+  German deck (the German deck specifically for the field-name-collision and
+  mixed text+audio field traps described above). Check `test profile`
+  directly for what's currently seeded rather than assuming Core 2000 is the
+  only thing there.
+- To review results in the real collection, export the generated deck to
+  `.apkg` and import it manually — never write to `User 1` directly.
 - `core/` and `tts/` are pure Python and must be testable with stock Python, no Anki.
   `llm/` is *mostly* pure Python too — the one exception is the real subprocess
   call in `llm/client.py`/`llm/runtime.py`'s default `run`/`download_to`, which is
@@ -774,3 +671,8 @@ a real (test) Anki profile.
   verified llama.cpp/Qwen facts (invocation contract, asset names, stdout shape). Same
   "never guess" discipline applies to both — check there before assuming a flag or
   signature behaves the way its name suggests.
+- Packaging uses `tools/build_ankiaddon.py`, a small local script, not the
+  community `anki-addon-builder` (`aab`) — `aab` expects the addon to live
+  under `src/<module_name>/` with a repo-root `addon.json` and is built
+  around git-tag-based AnkiWeb publishing, which would mean restructuring
+  this repo for a public-release workflow that's intentionally on hold.
