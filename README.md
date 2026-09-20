@@ -65,8 +65,7 @@ quality of the original deck carries over, but now a much wider audience can act
 This addon's own code is **MIT-licensed** (see [`LICENSE`](LICENSE)) — free to use, modify, and
 share.
 
-Everything it downloads at runtime was individually checked for license compatibility rather
-than assumed:
+Everything it downloads at runtime was individually checked for license compatibility:
 
 | Component | License |
 |---|---|
