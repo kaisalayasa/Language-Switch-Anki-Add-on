@@ -161,6 +161,30 @@ class TestEnsureLlamaRuntime(unittest.TestCase):
                 )
 
 
+class TestEnsureLlamaRuntimeProgress(unittest.TestCase):
+    """``on_progress`` is only ever wired into the *default* downloader (see the module
+    docstring) -- an injected ``download_to``, exactly like every other test in this file uses,
+    must never receive it. Without this guard, passing ``on_progress`` here would crash every
+    other test's ``fake_download(url, dest)`` (it takes no such keyword)."""
+
+    def test_on_progress_is_not_forwarded_to_an_injected_download_to(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            calls = []
+
+            def fake_download(url, dest):  # deliberately takes no on_progress kwarg
+                calls.append(url)
+                _zip_with_exe(dest, "llama-completion.exe")
+
+            reports = []
+            ensure_llama_runtime(
+                cache_dir, system="Windows", machine="AMD64",
+                download_to=fake_download, run=_ok_run,
+                on_progress=lambda done, total: reports.append((done, total)),
+            )
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(reports, [])
+
+
 class TestRuntimeIsCached(unittest.TestCase):
     """Purely for UI messaging (e.g. "downloading now" vs. "already have it") -- a cheap
     existence check, never a subprocess run, so it must work with no injected ``run`` at all."""

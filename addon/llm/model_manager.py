@@ -89,28 +89,52 @@ def model_is_cached(cache_dir: Path) -> bool:
     )
 
 
-def ensure_model(cache_dir: Path, *, download_to: Optional[DownloadFn] = None) -> ModelFiles:
+def ensure_model(
+    cache_dir: Path,
+    *,
+    download_to: Optional[DownloadFn] = None,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> ModelFiles:
     """Return the cached (downloading if needed) split GGUF files for Qwen2.5-7B-Instruct.
 
     Every file is size-checked against :data:`MODEL_FILES`, whether it was just downloaded or
     already sat in the cache from a previous run -- catching a truncated transfer here, with a
     clear error naming the file, rather than as a confusing llama.cpp load failure much later.
+
+    ``on_progress``, if given, is called as ``on_progress(bytes_done, bytes_total)`` with a
+    running total across *both* split files, using their known, verified sizes -- not reset
+    back to zero between the two files -- so a caller can show one continuous "X of Y
+    downloaded" figure spanning the whole model. A file already sitting in the cache counts its
+    full size as immediately "done" without a download call. Only wired up when the default
+    downloader is used; an injected ``download_to`` (as tests use) never receives it.
     """
+    using_default_downloader = download_to is None
     download_to = download_to or _http_download_to
     model_dir = Path(cache_dir) / "model"
     model_dir.mkdir(parents=True, exist_ok=True)
 
+    total_all = sum(spec.size_bytes for spec in MODEL_FILES)
+    bytes_done_before = 0
     paths = []
     for spec in MODEL_FILES:
         path = model_dir / spec.filename
         if not path.exists():
-            download_to(HF_RESOLVE_BASE + spec.filename, path)
+            if on_progress is not None and using_default_downloader:
+                offset = bytes_done_before
+
+                def _report(done: int, _total: int, offset: int = offset) -> None:
+                    on_progress(offset + done, total_all)
+
+                download_to(HF_RESOLVE_BASE + spec.filename, path, on_progress=_report)
+            else:
+                download_to(HF_RESOLVE_BASE + spec.filename, path)
         actual_size = path.stat().st_size
         if actual_size != spec.size_bytes:
             raise ModelVerificationError(
                 "%s is %d bytes, expected %d -- likely an interrupted or corrupted download. "
                 "Delete it and try again." % (path, actual_size, spec.size_bytes)
             )
+        bytes_done_before += spec.size_bytes
         paths.append(path)
 
     return ModelFiles(primary_path=paths[0], all_paths=tuple(paths))

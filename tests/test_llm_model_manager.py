@@ -106,6 +106,80 @@ class TestEnsureModel(unittest.TestCase):
                 ensure_model(cache_dir, download_to=bad_download)
 
 
+class TestEnsureModelProgress(unittest.TestCase):
+    """``on_progress`` is only wired into the *default* downloader (see ``ensure_model``'s
+    docstring) -- it's exercised here by patching ``_http_download_to`` itself, since that's
+    the only way to reach the default-downloader code path without a real network call."""
+
+    @patch("addon.llm.model_manager.MODEL_FILES", _TINY_FILES)
+    def test_reports_a_running_total_across_both_files_not_reset_between_them(self):
+        def fake_http_download(url, dest, *, on_progress=None):
+            spec = next(s for s in _TINY_FILES if s.filename == dest.name)
+            if on_progress:
+                on_progress(0, spec.size_bytes)
+                on_progress(spec.size_bytes, spec.size_bytes)
+            dest.write_bytes(b"x" * spec.size_bytes)
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            reports = []
+            with patch("addon.llm.model_manager._http_download_to", fake_http_download):
+                ensure_model(
+                    cache_dir,
+                    on_progress=lambda done, total: reports.append((done, total)),
+                )
+
+            total_all = sum(f.size_bytes for f in _TINY_FILES)
+            self.assertEqual(
+                reports,
+                [
+                    (0, total_all),
+                    (_TINY_FILES[0].size_bytes, total_all),
+                    (_TINY_FILES[0].size_bytes, total_all),
+                    (_TINY_FILES[0].size_bytes + _TINY_FILES[1].size_bytes, total_all),
+                ],
+            )
+
+    @patch("addon.llm.model_manager.MODEL_FILES", _TINY_FILES)
+    def test_on_progress_is_not_forwarded_to_an_injected_download_to(self):
+        def fake_download(url, dest):  # deliberately takes no on_progress kwarg
+            spec = next(s for s in _TINY_FILES if s.filename == dest.name)
+            dest.write_bytes(b"x" * spec.size_bytes)
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            reports = []
+            ensure_model(
+                cache_dir,
+                download_to=fake_download,
+                on_progress=lambda done, total: reports.append((done, total)),
+            )
+            self.assertEqual(reports, [])
+
+    @patch("addon.llm.model_manager.MODEL_FILES", _TINY_FILES)
+    def test_an_already_cached_file_counts_its_full_size_as_done_without_downloading(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            model_dir = Path(cache_dir) / "model"
+            model_dir.mkdir(parents=True)
+            (model_dir / _TINY_FILES[0].filename).write_bytes(b"x" * _TINY_FILES[0].size_bytes)
+
+            def fake_http_download(url, dest, *, on_progress=None):
+                spec = next(s for s in _TINY_FILES if s.filename == dest.name)
+                if on_progress:
+                    on_progress(spec.size_bytes, spec.size_bytes)
+                dest.write_bytes(b"x" * spec.size_bytes)
+
+            reports = []
+            with patch("addon.llm.model_manager._http_download_to", fake_http_download):
+                ensure_model(
+                    cache_dir,
+                    on_progress=lambda done, total: reports.append((done, total)),
+                )
+
+            total_all = sum(f.size_bytes for f in _TINY_FILES)
+            # Only file 2 actually downloads; its offset must already include file 1's full
+            # size, since file 1 is sitting on disk and correctly-sized.
+            self.assertEqual(reports, [(total_all, total_all)])
+
+
 class TestModelIsCached(unittest.TestCase):
     """Purely for UI messaging (e.g. "downloading now" vs. "already have it") -- a cheap size
     check, same rule ensure_model itself applies, just without downloading anything missing."""

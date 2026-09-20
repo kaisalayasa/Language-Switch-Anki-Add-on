@@ -29,6 +29,7 @@ import platform
 import stat
 import subprocess
 import tarfile
+import time
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -112,6 +113,7 @@ def ensure_llama_runtime(
     machine: Optional[str] = None,
     download_to: Optional[DownloadFn] = None,
     run: Optional[RunFn] = None,
+    on_progress: Optional[Callable[[int, int], None]] = None,
 ) -> LlamaRuntime:
     """Return a verified, ready-to-run ``llama-completion`` binary under ``cache_dir``.
 
@@ -121,10 +123,17 @@ def ensure_llama_runtime(
     ``ensure_piper_binary``, re-run every call since this binary is small (tens of MB) and the
     check is cheap, unlike the multi-gigabyte model file ``model_manager.py`` manages, which
     gets a size check instead of a subprocess launch.
+
+    ``on_progress``, if given, is called as ``on_progress(bytes_done, bytes_total)`` while the
+    archive downloads (``bytes_total`` is whatever the server's ``Content-Length`` reports, 0 if
+    absent -- there's no hardcoded expected size for this archive, unlike the model's files, see
+    the module docstring on why). Only wired up when the default downloader is used; a
+    caller-injected ``download_to`` (as tests use) never receives it.
     """
     system = system or platform.system()
     machine = machine or platform.machine()
     asset = resolve_asset_name(system, machine)
+    using_default_downloader = download_to is None
     download_to = download_to or _http_download_to
     run = run or _run_subprocess
 
@@ -135,7 +144,10 @@ def ensure_llama_runtime(
     if existing is None:
         root.mkdir(parents=True, exist_ok=True)
         archive_path = root / asset
-        download_to(asset_url(asset), archive_path)
+        if on_progress is not None and using_default_downloader:
+            download_to(asset_url(asset), archive_path, on_progress=on_progress)
+        else:
+            download_to(asset_url(asset), archive_path)
         _extract(archive_path, root)
         archive_path.unlink(missing_ok=True)
         existing = _find_executable(root, exe_name)
@@ -200,15 +212,36 @@ def _verify(binary_path: Path, run: RunFn) -> str:
     return output
 
 
-def _http_download_to(url: str, dest: Path) -> None:
+#: Minimum real time between ``on_progress`` calls, regardless of chunk size or connection
+#: speed -- a 256KB read step alone would fire far more often than any UI needs, and each call
+#: costs a cross-thread ``run_on_main`` post on the caller's side.
+_PROGRESS_MIN_INTERVAL_SECONDS = 0.2
+
+
+def _http_download_to(
+    url: str, dest: Path, *, on_progress: Optional[Callable[[int, int], None]] = None
+) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     with urllib.request.urlopen(url) as response, open(tmp, "wb") as fh:
+        total = int(response.headers.get("Content-Length") or 0)
+        downloaded = 0
+        last_reported = 0.0
+        if on_progress is not None:
+            on_progress(0, total)
         while True:
             chunk = response.read(1024 * 256)
             if not chunk:
                 break
             fh.write(chunk)
+            downloaded += len(chunk)
+            if on_progress is not None:
+                now = time.monotonic()
+                if now - last_reported >= _PROGRESS_MIN_INTERVAL_SECONDS:
+                    on_progress(downloaded, total)
+                    last_reported = now
+        if on_progress is not None:
+            on_progress(downloaded, total)
     tmp.replace(dest)
 
 

@@ -101,6 +101,38 @@ def _cache_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "user_files"
 
 
+#: Wider than ``aqt.progress.ProgressManager``'s own 300px default -- the download-progress
+#: label ("Downloading the local AI model... 1.3 GB of 4.3 GB") is long enough to wrap
+#: awkwardly at the default width.
+_PROGRESS_DIALOG_WIDTH = 480
+
+
+def _format_bytes(n: int) -> str:
+    if n >= 1024 ** 3:
+        return "%.1f GB" % (n / (1024 ** 3))
+    return "%.0f MB" % (n / (1024 ** 2))
+
+
+def _format_download_progress(done: int, total: int) -> str:
+    """``total`` is 0 when the server didn't report a size (seen on some releases for the
+    llama.cpp runtime archive, which has no hardcoded expected size -- see runtime.py) -- fall
+    back to just showing what's downloaded so far rather than a nonsensical "of 0".
+    """
+    if total:
+        return "%s of %s" % (_format_bytes(done), _format_bytes(total))
+    return "%s downloaded" % _format_bytes(done)
+
+
+def _progress_permille(done: int, total: int) -> int:
+    """``mw.progress.update()`` sets a Qt ``QProgressBar``'s max/value, which are C ``int``s --
+    a raw byte count (the model is ~4.3 billion bytes) overflows that. Reporting in fixed
+    per-mille units instead keeps the bar's range tiny and file-size-independent.
+    """
+    if not total:
+        return 0
+    return max(0, min(1000, int(done * 1000 / total)))
+
+
 class _RawHtmlEditor(QWidget):
     """Front/Back/Styling tabs over one text editor -- mirrors ``aqt.clayout.CardLayout``'s
     own ``tform`` pattern, rebuilt here as a plain, standalone widget since this screen
@@ -800,13 +832,37 @@ class MainScreen(QDialog):
             )
         else:
             progress_label = "Analyzing deck… the AI model is already downloaded, usually done in under a minute."
-        mw.progress.start(parent=self, immediate=True, label=progress_label)
+        dialog = mw.progress.start(parent=self, immediate=True, label=progress_label)
+        if dialog is not None:
+            dialog.setMinimumWidth(_PROGRESS_DIALOG_WIDTH)
 
         result_holder: Dict[str, Any] = {}
 
+        # Called from the background download thread (task(), below) -- mw.progress.update()
+        # asserts it's on the main thread and silently no-ops otherwise (verified against real
+        # aqt source), so every call here has to be marshalled via run_on_main rather than
+        # calling mw.progress.update() directly.
+        def _report_runtime_progress(done: int, total: int) -> None:
+            mw.taskman.run_on_main(
+                lambda: mw.progress.update(
+                    label="Downloading the local AI runtime… %s" % _format_download_progress(done, total),
+                    value=_progress_permille(done, total),
+                    max=1000 if total else 0,
+                )
+            )
+
+        def _report_model_progress(done: int, total: int) -> None:
+            mw.taskman.run_on_main(
+                lambda: mw.progress.update(
+                    label="Downloading the local AI model… %s" % _format_download_progress(done, total),
+                    value=_progress_permille(done, total),
+                    max=1000 if total else 0,
+                )
+            )
+
         def task() -> None:
-            runtime = ensure_llama_runtime(_cache_dir())
-            model = ensure_model(_cache_dir())
+            runtime = ensure_llama_runtime(_cache_dir(), on_progress=_report_runtime_progress)
+            model = ensure_model(_cache_dir(), on_progress=_report_model_progress)
             call_fn = functools.partial(
                 call_model, runtime_path=runtime.path, model_path=model.primary_path
             )

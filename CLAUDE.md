@@ -158,6 +158,20 @@ given. Core 2000 is the proving ground, not the ceiling.
   therefore always renders as nothing regardless, it's simply removed from
   the HTML handed to `PreviewPanel` rather than made to "exist" some other
   way. Confirmed fixed in real Anki testing.
+- **`mw.progress.update(label=..., value=..., max=...)` must be called from
+  the main thread — confirmed against real `aqt` source
+  (`ProgressManager.update()` checks `self.mw.inMainThread()` and silently
+  no-ops, printing a warning, otherwise; it does not raise). A background
+  task (e.g. `ensure_llama_runtime`/`ensure_model`'s `on_progress` callback,
+  called from the download thread `mw.taskman.run_in_background` runs) must
+  marshal every call via `mw.taskman.run_on_main(lambda: mw.progress.update(...))`.
+  Separately, the progress bar's `max`/`value` are Qt `int`s (32-bit signed,
+  ~2.1 billion) — the model download alone is ~4.68 billion bytes, well past
+  that, so `ui/main_screen.py` reports progress in fixed per-mille units
+  (0–1000) rather than raw byte counts; only the label text shows real GB
+  figures. `mw.progress.start(...)` returns the `ProgressDialog` itself (or
+  `None` if one's already running), which is how its width is widened past
+  the 300px default for the longer download-progress label.
 
 ## LOCAL LLM DECK ANALYSIS (module group: addon/llm/)
 
@@ -196,7 +210,12 @@ heuristic pipeline.
   right "downloading…" vs. "already have it" UI message before the real,
   authoritative `ensure_llama_runtime` (which does download-if-missing,
   extract, chmod on Unix, and an actual `--version` run to prove the binary
-  works) runs regardless.
+  works) runs regardless. Both `ensure_llama_runtime` and `ensure_model`
+  (below) take an optional `on_progress(bytes_done, bytes_total)` callback,
+  wired up in `ui/main_screen.py`'s Analyze flow to show real download
+  progress instead of a static "downloading…" label — see the
+  `mw.progress.update()` gotcha under "ANKI DATA MODEL" for why that's not
+  as simple as just calling it from the download thread.
 - **`llm/model_manager.py`** — same shape for the model file itself:
   Qwen2.5-7B-Instruct, Q4_K_M quantization, downloaded from HuggingFace as a
   split two-file GGUF (HuggingFace's own convention once a GGUF exceeds
@@ -206,7 +225,12 @@ heuristic pipeline.
   warrants a cheap size comparison against a known-good value on every call,
   cache-hit included, so a truncated download from an interrupted run is
   never silently trusted. `model_is_cached` is the equivalent cheap,
-  no-download presence check for UI messaging.
+  no-download presence check for UI messaging. `ensure_model`'s
+  `on_progress` reports one running total across *both* split files (not
+  reset to zero between them), using their already-known, verified sizes —
+  a file already sitting in the cache from a previous run counts its full
+  size as immediately "done" rather than jumping the displayed total
+  backwards.
 - **`llm/client.py`** — runs one `llama-completion` call and returns the raw
   response text. System/user prompts go into temp files (`-sysf`/`-f`, not
   inline `-sys`/`-p` text) because a real prompt embeds a whole deck's field
@@ -633,6 +657,14 @@ piper_provider.py responsibilities:
   target-language text rather than a canned phrase), and full-batch
   generation with progress reporting and skip-if-already-has-audio caching
   (`ops/tts_batch.py`'s `AUDIO_DONE_TAG` / `notes_needing_audio`).
+
+`ui/piper_test_dialog.py` — a standalone dialog for sampling a voice in
+isolation, sharing no code with the main screen — is **not wired to the
+Tools menu** (removed 2026-09-20, ahead of the AnkiWeb release: it was a
+dev/debug convenience, not something end users need). The file itself is
+untouched and still importable for local debugging
+(`from addon.ui.piper_test_dialog import show_piper_test_dialog`);
+`entrypoint.py` now registers exactly one Tools-menu action.
 
 ## STATUS
 
